@@ -21,7 +21,7 @@ use crate::search::{
     FitBounds, OverlayFitRequest, OverlayPairRequest, PairConstraints, Search, cvd_greedy_order,
     round6,
 };
-use crate::syntax::{build_syntax, contrast_floor};
+use crate::syntax::{SyntaxContexts, build_syntax, contrast_floor, overlay_contrast_floor};
 use crate::{Error, Result};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
@@ -1722,7 +1722,10 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     let syntax = build_syntax(
         &mut search,
         palette,
-        &syntax_contexts,
+        SyntaxContexts {
+            ordinary: std::slice::from_ref(&canvas),
+            rendered: &syntax_contexts,
+        },
         &editor_primary,
         &statuses["predictive"],
         [&diff_green_seed, &diff_yellow_seed, &diff_red_seed],
@@ -2333,20 +2336,32 @@ fn validate_theme(
             actual_syntax.len()
         ));
     }
+    let syntax_normal_contexts = [style_color(style, "editor.background")?.to_owned()];
     let mut syntax_minimum = f64::INFINITY;
+    let mut syntax_overlay_minimum = f64::INFINITY;
     for (name, spec) in syntax {
         let value = spec
             .get("color")
             .and_then(Value::as_str)
             .ok_or_else(|| Error(format!("syntax role {name} has no color")))?;
-        let actual = minimum_contrast(value, syntax_contexts)?;
-        syntax_minimum = syntax_minimum.min(actual);
-        let target = contrast_floor(name)
+        let normal_actual = minimum_contrast(value, &syntax_normal_contexts)?;
+        syntax_minimum = syntax_minimum.min(normal_actual);
+        let normal_target = contrast_floor(name)
             .ok_or_else(|| Error(format!("syntax role {name} has no capture policy")))?
             - 0.02;
-        if actual < target - 1e-9 {
+        if normal_actual < normal_target - 1e-9 {
             errors.push(format!(
-                "syntax.{name} reaches only {actual:.3}:1; floor is {target:.2}:1"
+                "syntax.{name} reaches only {normal_actual:.3}:1 on the ordinary editor background; floor is {normal_target:.2}:1"
+            ));
+        }
+        let overlay_actual = minimum_contrast(value, syntax_contexts)?;
+        syntax_overlay_minimum = syntax_overlay_minimum.min(overlay_actual);
+        let overlay_target = overlay_contrast_floor(name)
+            .ok_or_else(|| Error(format!("syntax role {name} has no overlay policy")))?
+            - 0.02;
+        if overlay_actual < overlay_target - 1e-9 {
+            errors.push(format!(
+                "syntax.{name} reaches only {overlay_actual:.3}:1 on rendered editor overlays; floor is {overlay_target:.2}:1"
             ));
         }
     }
@@ -2357,7 +2372,7 @@ fn validate_theme(
             .and_then(Value::as_str)
             .ok_or_else(|| Error("syntax.primary has no color".into()))?,
         editor_foreground,
-        syntax_contexts,
+        &syntax_normal_contexts,
     )?;
     let syntax_subdued_saliency = crate::saliency::relative_saliency(
         syntax
@@ -2366,7 +2381,7 @@ fn validate_theme(
             .and_then(Value::as_str)
             .ok_or_else(|| Error("syntax.comment has no color".into()))?,
         editor_foreground,
-        syntax_contexts,
+        &syntax_normal_contexts,
     )?;
     if syntax_subdued_saliency + 0.03 > syntax_primary_saliency {
         errors.push(format!(
@@ -2407,6 +2422,10 @@ fn validate_theme(
     audit.minimums.insert(
         "syntax".into(),
         (syntax_minimum * 10_000.0).round() / 10_000.0,
+    );
+    audit.minimums.insert(
+        "syntax_overlay".into(),
+        (syntax_overlay_minimum * 10_000.0).round() / 10_000.0,
     );
 
     let terminal_names: Vec<_> = TERMINAL_FIELDS

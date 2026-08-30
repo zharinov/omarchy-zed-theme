@@ -4,6 +4,12 @@ use super::plan::SemanticRole;
 pub const SYNTAX_PRIMARY_FLOOR: f64 = 4.52;
 pub const SYNTAX_SEMANTIC_FLOOR: f64 = 3.52;
 pub const SYNTAX_SUBDUED_FLOOR: f64 = 3.02;
+pub const SYNTAX_ADAPTIVE_OVERLAY_FLOOR: f64 = 2.00;
+pub const SYNTAX_SUBDUED_OVERLAY_FLOOR: f64 = 1.30;
+const _: () = {
+    assert!(SYNTAX_ADAPTIVE_OVERLAY_FLOOR < SYNTAX_SEMANTIC_FLOOR);
+    assert!(SYNTAX_SUBDUED_OVERLAY_FLOOR < SYNTAX_SUBDUED_FLOOR);
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapturePolicy {
@@ -254,6 +260,15 @@ pub fn contrast_floor(capture: &str) -> Option<f64> {
     })
 }
 
+pub fn overlay_contrast_floor(capture: &str) -> Option<f64> {
+    capture_policy(capture).map(|policy| match policy.role {
+        Base | Predictive => SYNTAX_PRIMARY_FLOOR,
+        DiffChange | DiffAdd | DiffDelete => SYNTAX_SEMANTIC_FLOOR,
+        Subdued | Metadata => SYNTAX_SUBDUED_OVERLAY_FLOOR,
+        _ => SYNTAX_ADAPTIVE_OVERLAY_FLOOR,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +288,29 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(actual, expected);
         assert_eq!(CAPTURE_POLICIES.len(), actual.len());
+    }
+
+    #[test]
+    fn overlay_floors_only_relax_adaptive_tones() {
+        assert_eq!(
+            overlay_contrast_floor("primary"),
+            Some(SYNTAX_PRIMARY_FLOOR)
+        );
+        assert_eq!(
+            overlay_contrast_floor("diff.plus"),
+            Some(SYNTAX_SEMANTIC_FLOOR)
+        );
+        assert_eq!(
+            overlay_contrast_floor("function"),
+            Some(SYNTAX_ADAPTIVE_OVERLAY_FLOOR)
+        );
+        assert_eq!(
+            overlay_contrast_floor("comment"),
+            Some(SYNTAX_SUBDUED_OVERLAY_FLOOR)
+        );
+        assert_eq!(
+            overlay_contrast_floor("warning"),
+            Some(SYNTAX_SUBDUED_OVERLAY_FLOOR)
+        );
     }
 }

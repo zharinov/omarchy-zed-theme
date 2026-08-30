@@ -1,8 +1,8 @@
 //! Measures the authored Omarchy palette's syntax character.
 //!
 //! Breadth and intensity are independent continuous signals. Provenance decides
-//! which colors are evidence; the descriptive baseline kind is never consumed by
-//! construction or validation.
+//! which colors are evidence, and the hue strategy only admits authored hues with
+//! enough measured support.
 
 use crate::Result;
 use crate::color::{lab, oklab_to_oklch};
@@ -17,23 +17,23 @@ const HUE_CLUSTER_LIMIT: f64 = 35.0 * PI / 180.0;
 const HUE_SIMILARITY_FULL: f64 = 25.0 * PI / 180.0;
 const HUE_SIMILARITY_ZERO: f64 = 45.0 * PI / 180.0;
 const ALLOCATION_CHROMA_FLOOR: f64 = 0.005;
+const AUTHORED_HUE_MINIMUM_INTENSITY: f64 = 0.10;
 const NEUTRAL_MEDIAN_CHROMA: f64 = 0.035;
 const NEUTRAL_MAXIMUM_CHROMA: f64 = 0.055;
-pub const SCAFFOLD_MAXIMUM_CHROMA: f64 = NEUTRAL_MAXIMUM_CHROMA;
 
 const EVIDENCE_KEYS: [&str; 8] = [
     "green", "blue", "magenta", "yellow", "red", "cyan", "orange", "accent",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BaselineKind {
+pub enum HueStrategy {
     Neutral,
     AccentLed,
     PaletteNative,
 }
 
-impl BaselineKind {
-    fn as_str(self) -> &'static str {
+impl HueStrategy {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Neutral => "neutral",
             Self::AccentLed => "accent_led",
@@ -73,11 +73,9 @@ pub struct SyntaxProfile {
     pub effective_hue_families: f64,
     pub source_median_chroma: f64,
     pub source_q90_chroma: f64,
-    pub requested_family_count: usize,
+    pub requested_hue_family_count: usize,
     pub chroma_envelope: ChromaEnvelope,
-    pub scaffold_weight: f64,
-    pub scaffold_phase: f64,
-    baseline_kind: BaselineKind,
+    pub hue_strategy: HueStrategy,
     pub authored_colors: Vec<EvidenceColor>,
     pub evidence: Vec<EvidenceColor>,
     pub clusters: Vec<HueCluster>,
@@ -278,46 +276,34 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
     let ordinary_maximum = (NEUTRAL_MAXIMUM_CHROMA
         + envelope_support * (native_maximum - NEUTRAL_MAXIMUM_CHROMA))
         .max(target_median);
-    let requested_family_count = (4.0 + 4.0 * authored_breadth).round() as usize;
-    let scaffold_weight = 1.0 - palette_native_weight;
-
-    let baseline_kind = if effective_hue_families <= 1e-12 {
-        BaselineKind::Neutral
-    } else if effective_hue_families < 2.5 {
-        BaselineKind::AccentLed
+    let hue_strategy = if effective_hue_families <= 1e-12
+        || authored_intensity < AUTHORED_HUE_MINIMUM_INTENSITY - 1e-12
+    {
+        HueStrategy::Neutral
+    } else if effective_hue_families < 2.5 || clusters.len() < 3 {
+        HueStrategy::AccentLed
     } else {
-        BaselineKind::PaletteNative
+        HueStrategy::PaletteNative
     };
-    let scaffold_phase = authored_colors
-        .iter()
-        .max_by(|left, right| {
-            left.chroma
-                .total_cmp(&right.chroma)
-                .then_with(|| right.value.cmp(&left.value))
-        })
-        .map(|color| color.hue)
-        .or_else(|| {
-            ["accent", "background"].into_iter().find_map(|key| {
-                let [_, chroma, hue] = oklab_to_oklch(lab(&palette.colors[key]).ok()?);
-                (chroma >= 0.005).then_some(hue)
-            })
-        })
-        .unwrap_or(if palette.mode == "dark" { 35.0 } else { 215.0 } * PI / 180.0);
-
+    let requested_hue_family_count = match hue_strategy {
+        HueStrategy::Neutral => 0,
+        HueStrategy::AccentLed => 1,
+        HueStrategy::PaletteNative => (effective_hue_families.round() as usize)
+            .clamp(3, 8)
+            .min(clusters.len()),
+    };
     Ok(SyntaxProfile {
         authored_breadth,
         authored_intensity,
         effective_hue_families,
         source_median_chroma,
         source_q90_chroma,
-        requested_family_count,
+        requested_hue_family_count,
         chroma_envelope: ChromaEnvelope {
             target_median,
             ordinary_maximum,
         },
-        scaffold_weight,
-        scaffold_phase,
-        baseline_kind,
+        hue_strategy,
         authored_colors,
         evidence,
         clusters,
@@ -358,6 +344,7 @@ impl SyntaxProfile {
         json!({
             "thresholds": {
                 "chroma_evidence": CHROMA_EVIDENCE,
+                "authored_hue_minimum_intensity": AUTHORED_HUE_MINIMUM_INTENSITY,
                 "complete_link_hue_degrees": 35.0,
                 "continuous_hue_similarity_full_degrees": 25.0,
                 "continuous_hue_similarity_zero_degrees": 45.0,
@@ -377,10 +364,8 @@ impl SyntaxProfile {
                 "target_median_chroma": round6(self.chroma_envelope.target_median),
                 "maximum_ordinary_chroma": round6(self.chroma_envelope.ordinary_maximum),
             },
-            "requested_family_count": self.requested_family_count,
-            "scaffold_weight": round6(self.scaffold_weight),
-            "baseline_kind": self.baseline_kind.as_str(),
-            "baseline_kind_authoritative": false,
+            "requested_hue_family_count": self.requested_hue_family_count,
+            "hue_strategy": self.hue_strategy.as_str(),
             "authored_colors": authored_colors,
             "evidence": evidence,
             "hue_clusters": clusters,
@@ -513,6 +498,53 @@ mod tests {
             .abs()
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn hue_strategy_requires_supported_authored_color() {
+        let neutral = measure(&palette(&[])).unwrap();
+        assert_eq!(neutral.hue_strategy, HueStrategy::Neutral);
+        assert_eq!(neutral.requested_hue_family_count, 0);
+
+        let weak = measure(&palette(&[(
+            "accent",
+            CHROMA_EVIDENCE + 0.005,
+            0.2,
+            Provenance::Direct,
+        )]))
+        .unwrap();
+        assert!(!weak.evidence.is_empty());
+        assert!(weak.authored_intensity < AUTHORED_HUE_MINIMUM_INTENSITY);
+        assert_eq!(weak.hue_strategy, HueStrategy::Neutral);
+        assert_eq!(weak.requested_hue_family_count, 0);
+
+        let accent = measure(&palette(&[("accent", 0.14, 0.2, Provenance::Direct)])).unwrap();
+        assert_eq!(accent.hue_strategy, HueStrategy::AccentLed);
+        assert_eq!(accent.requested_hue_family_count, 1);
+    }
+
+    #[test]
+    fn palette_native_hue_budget_never_exceeds_evidenced_clusters() {
+        let native = measure(&palette(&[
+            ("red", 0.12, 0.2, Provenance::Direct),
+            ("green", 0.12, 2.1, Provenance::Direct),
+            ("blue", 0.12, 4.0, Provenance::Direct),
+        ]))
+        .unwrap();
+        assert_eq!(native.hue_strategy, HueStrategy::PaletteNative);
+        assert_eq!(native.requested_hue_family_count, 3);
+        assert_eq!(native.requested_hue_family_count, native.clusters.len());
+
+        let two_clusters = measure(&palette(&[
+            ("red", 0.12, 0.0, Provenance::Direct),
+            ("orange", 0.12, 34.0 * PI / 180.0, Provenance::Direct),
+            ("green", 0.12, PI, Provenance::Direct),
+            ("cyan", 0.12, 214.0 * PI / 180.0, Provenance::Direct),
+        ]))
+        .unwrap();
+        assert_eq!(two_clusters.clusters.len(), 2);
+        assert_eq!(two_clusters.hue_strategy, HueStrategy::AccentLed);
+        assert_eq!(two_clusters.requested_hue_family_count, 1);
     }
 
     #[test]

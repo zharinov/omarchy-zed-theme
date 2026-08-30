@@ -21,6 +21,39 @@ pub enum SemanticRole {
     DiffDelete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ToneBand {
+    Primary,
+    Secondary,
+    Subdued,
+}
+
+impl ToneBand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+            Self::Subdued => "subdued",
+        }
+    }
+
+    pub fn saliency(self) -> f64 {
+        match self {
+            Self::Primary => 0.90,
+            Self::Secondary => 0.75,
+            Self::Subdued => 0.55,
+        }
+    }
+
+    pub fn single_hue_saliency(self) -> f64 {
+        match self {
+            Self::Primary => 1.00,
+            Self::Secondary => 0.65,
+            Self::Subdued => 0.40,
+        }
+    }
+}
+
 impl SemanticRole {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -44,17 +77,23 @@ impl SemanticRole {
 
     pub fn saliency(self) -> f64 {
         match self {
-            Self::Declaration => 0.95,
-            Self::Control => 0.88,
-            Self::Type => 0.82,
-            Self::Special => 0.74,
-            Self::Value => 0.65,
-            Self::String => 0.55,
-            Self::Link => 0.50,
-            Self::Member => 0.45,
-            Self::Metadata => 0.35,
             Self::Base | Self::DiffChange | Self::DiffAdd | Self::DiffDelete => 1.0,
-            Self::Subdued | Self::Predictive => 0.20,
+            _ => self.tone_band().saliency(),
+        }
+    }
+
+    pub fn tone_band(self) -> ToneBand {
+        match self {
+            Self::Base
+            | Self::Declaration
+            | Self::Type
+            | Self::Control
+            | Self::Special
+            | Self::DiffChange
+            | Self::DiffAdd
+            | Self::DiffDelete => ToneBand::Primary,
+            Self::Member | Self::Value | Self::String | Self::Link => ToneBand::Secondary,
+            Self::Metadata | Self::Subdued | Self::Predictive => ToneBand::Subdued,
         }
     }
 }
@@ -85,23 +124,27 @@ pub struct MergePlan {
 
 fn anchor_for(role: SemanticRole, family_count: usize) -> SemanticRole {
     match role {
-        SemanticRole::Member => SemanticRole::Declaration,
-        SemanticRole::String if family_count < 5 => SemanticRole::Value,
-        SemanticRole::Link if family_count < 6 => SemanticRole::Declaration,
-        SemanticRole::Metadata if family_count < 7 => SemanticRole::Type,
-        SemanticRole::Special if family_count < 8 => SemanticRole::Control,
+        SemanticRole::Declaration | SemanticRole::Member | SemanticRole::Metadata => role,
+        SemanticRole::Type | SemanticRole::Control | SemanticRole::Special if family_count < 4 => {
+            SemanticRole::Declaration
+        }
+        SemanticRole::Control | SemanticRole::Special if family_count < 5 => SemanticRole::Type,
+        SemanticRole::Special if family_count < 7 => SemanticRole::Control,
+        SemanticRole::Value | SemanticRole::String if family_count < 6 => SemanticRole::Member,
+        SemanticRole::String if family_count < 8 => SemanticRole::Value,
+        SemanticRole::Link => SemanticRole::Member,
         _ => role,
     }
 }
 
 impl MergePlan {
     pub fn from_breadth(authored_breadth: f64) -> Self {
-        let family_count = (4.0 + 4.0 * authored_breadth.clamp(0.0, 1.0)).round() as usize;
+        let family_count = (3.0 + 5.0 * authored_breadth.clamp(0.0, 1.0)).round() as usize;
         Self::with_family_count(family_count)
     }
 
     pub fn with_family_count(family_count: usize) -> Self {
-        let family_count = family_count.clamp(4, 8);
+        let family_count = family_count.clamp(3, 8);
         let mut families = Vec::<Family>::new();
         for role in ORDINARY_ROLES {
             let anchor = anchor_for(role, family_count);
@@ -144,6 +187,7 @@ impl MergePlan {
                     "id": index,
                     "anchor": family.anchor.as_str(),
                     "roles": family.roles.iter().map(|role| role.as_str()).collect::<Vec<_>>(),
+                    "tone_band": family.anchor.tone_band().as_str(),
                     "saliency_preference": family.roles.iter().map(|role| role.saliency()).fold(0.0, f64::max),
                 })
             })
@@ -162,9 +206,10 @@ impl MergePlan {
             .collect::<Vec<_>>();
         json!({
             "family_count": self.family_count,
-            "selection": "round(4 + 4 * authored_breadth)",
+            "selection": "palette-native hue-family budget",
             "families": families,
             "intentional_merges": intentional_merges,
+            "tone_safe": true,
             "nested": true,
         })
     }
@@ -177,7 +222,7 @@ mod tests {
 
     #[test]
     fn plans_cover_every_ordinary_role_once() {
-        for count in 4..=8 {
+        for count in 3..=8 {
             let plan = MergePlan::with_family_count(count);
             assert_eq!(plan.families.len(), count);
             let roles = plan
@@ -195,7 +240,7 @@ mod tests {
 
     #[test]
     fn each_plan_only_splits_the_previous_plan() {
-        for count in 4..8 {
+        for count in 3..8 {
             let current = MergePlan::with_family_count(count);
             let next = MergePlan::with_family_count(count + 1);
             for family in &next.families {
@@ -209,8 +254,45 @@ mod tests {
     }
 
     #[test]
+    fn merges_never_cross_tone_bands() {
+        for count in 3..=8 {
+            let plan = MergePlan::with_family_count(count);
+            for family in plan.families {
+                assert!(
+                    family
+                        .roles
+                        .iter()
+                        .all(|role| role.tone_band() == family.anchor.tone_band())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_tone_map_is_independent_of_merge_count() {
+        let expected = [
+            (ToneBand::Primary, 4),
+            (ToneBand::Secondary, 4),
+            (ToneBand::Subdued, 1),
+        ];
+        for count in 3..=8 {
+            let plan = MergePlan::with_family_count(count);
+            for (band, expected_count) in expected {
+                assert_eq!(
+                    plan.families
+                        .iter()
+                        .flat_map(|family| family.roles.iter())
+                        .filter(|role| role.tone_band() == band)
+                        .count(),
+                    expected_count
+                );
+            }
+        }
+    }
+
+    #[test]
     fn breadth_selection_is_bounded_and_deterministic() {
-        assert_eq!(MergePlan::from_breadth(-1.0).family_count, 4);
+        assert_eq!(MergePlan::from_breadth(-1.0).family_count, 3);
         assert_eq!(MergePlan::from_breadth(0.0), MergePlan::from_breadth(0.0));
         assert_eq!(MergePlan::from_breadth(1.0).family_count, 8);
         assert_eq!(MergePlan::from_breadth(2.0).family_count, 8);

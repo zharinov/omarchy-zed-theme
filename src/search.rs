@@ -35,6 +35,7 @@ type TransformTable = Arc<TransformTableData>;
 struct ColorQuery {
     seed: String,
     backgrounds: Vec<String>,
+    preference_backgrounds: Vec<String>,
     target: u64,
     avoid: Vec<String>,
     lower_lightness: u64,
@@ -970,9 +971,29 @@ impl Search {
         avoid: &[String],
         bounds: FitBounds,
     ) -> Result<String> {
+        self.fit_color_bounded_with_preference_backgrounds(
+            seed,
+            backgrounds,
+            backgrounds,
+            target,
+            avoid,
+            bounds,
+        )
+    }
+
+    pub fn fit_color_bounded_with_preference_backgrounds(
+        &mut self,
+        seed: &str,
+        backgrounds: &[String],
+        preference_backgrounds: &[String],
+        target: f64,
+        avoid: &[String],
+        bounds: FitBounds,
+    ) -> Result<String> {
         let query = ColorQuery {
             seed: seed.to_owned(),
             backgrounds: backgrounds.to_vec(),
+            preference_backgrounds: preference_backgrounds.to_vec(),
             target: target.to_bits(),
             avoid: avoid.to_vec(),
             lower_lightness: bounds.lower_lightness.to_bits(),
@@ -985,7 +1006,14 @@ impl Search {
         if let Some(result) = self.color_results.get(&query) {
             return result.clone().map_err(Error);
         }
-        let result = self.fit_color_bounded_uncached(seed, backgrounds, target, avoid, bounds);
+        let result = self.fit_color_bounded_uncached(
+            seed,
+            backgrounds,
+            preference_backgrounds,
+            target,
+            avoid,
+            bounds,
+        );
         self.color_results.insert(
             query,
             result
@@ -1000,11 +1028,12 @@ impl Search {
         &mut self,
         seed: &str,
         backgrounds: &[String],
+        preference_backgrounds: &[String],
         target: f64,
         avoid: &[String],
         bounds: FitBounds,
     ) -> Result<String> {
-        if backgrounds.is_empty() {
+        if backgrounds.is_empty() || preference_backgrounds.is_empty() {
             return Err(Error("fit_color requires at least one background".into()));
         }
 
@@ -1015,15 +1044,19 @@ impl Search {
             .iter()
             .map(|value| ColorMetrics::from_hex(value))
             .collect::<Result<Vec<_>>>()?;
+        let preference_background_metrics = preference_backgrounds
+            .iter()
+            .map(|value| ColorMetrics::from_hex(value))
+            .collect::<Result<Vec<_>>>()?;
         let avoid_metrics = avoid
             .iter()
             .map(|value| ColorMetrics::from_hex(value))
             .collect::<Result<Vec<_>>>()?;
-        let background_lightness = background_metrics
+        let background_lightness = preference_background_metrics
             .iter()
             .map(|metrics| metrics.lab[0])
             .sum::<f64>()
-            / backgrounds.len() as f64;
+            / preference_background_metrics.len() as f64;
         let passes = |candidate: ColorMetrics| {
             if candidate.lab[0] < bounds.lower_lightness - 1e-12
                 || candidate.lab[0] > bounds.upper_lightness + 1e-12
@@ -1097,11 +1130,11 @@ impl Search {
                     if !passes(metrics) {
                         return;
                     }
-                    let mean_log_contrast = background_metrics
+                    let mean_log_contrast = preference_background_metrics
                         .iter()
                         .map(|background| metrics.contrast(*background).ln())
                         .sum::<f64>()
-                        / background_metrics.len() as f64;
+                        / preference_background_metrics.len() as f64;
                     let primary = (mean_log_contrast - preferred_log).abs();
                     let secondary = if bounds.prefer_background {
                         (metrics.lab[0] - background_lightness).abs()
@@ -2058,6 +2091,43 @@ mod tests {
             contrast_ratio(&subtle, &backgrounds[0]).unwrap()
                 < contrast_ratio(&focal, &backgrounds[0]).unwrap()
         );
+        assert_eq!(search.color_results.len(), 2);
+    }
+
+    #[test]
+    fn required_and_preference_backgrounds_are_independent_and_cached() {
+        let mut search = Search::default();
+        let required = vec!["#777777".to_owned()];
+        let dark_preference = vec!["#101010".to_owned()];
+        let light_preference = vec!["#f0f0f0".to_owned()];
+        let bounds = FitBounds {
+            preferred_contrast: Some(8.0),
+            ..FitBounds::default()
+        };
+        let dark = search
+            .fit_color_bounded_with_preference_backgrounds(
+                "#cccccc",
+                &required,
+                &dark_preference,
+                1.05,
+                &[],
+                bounds,
+            )
+            .unwrap();
+        let light = search
+            .fit_color_bounded_with_preference_backgrounds(
+                "#cccccc",
+                &required,
+                &light_preference,
+                1.05,
+                &[],
+                bounds,
+            )
+            .unwrap();
+
+        assert_ne!(dark, light);
+        assert!(contrast_ratio(&dark, &dark_preference[0]).unwrap() >= 7.5);
+        assert!(contrast_ratio(&light, &light_preference[0]).unwrap() >= 7.5);
         assert_eq!(search.color_results.len(), 2);
     }
 
