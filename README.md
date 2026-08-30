@@ -4,7 +4,7 @@
   <img width="256" src="logo.png" />
 </p>
 
-<h1><p align="center">Zed theme switcher for Omarchy Quattro</p></h1>
+<h1><p align="center">Zed theme switcher for Omarchy</p></h1>
 
 <br/>
 
