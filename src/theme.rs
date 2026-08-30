@@ -1119,7 +1119,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         OverlayFitRequest::new(backgrounds, DIFF_FILL_CONTRAST, DIFF_NORMAL_FLOOR_DELTA_E)
             .with_readable_foregrounds(&readable_diff_text)
     };
-    let [diff_added, diff_deleted] = search
+    let [constraint_diff_added, constraint_diff_deleted] = search
         .fit_overlay_pair(
             &diff_green_seed,
             &diff_red_seed,
@@ -1130,7 +1130,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             ),
         )
         .map_err(|error| Error(format!("solid diff hunks: {error}")))?;
-    let [diff_added_hollow, diff_deleted_hollow] = search
+    let [constraint_diff_added_hollow, constraint_diff_deleted_hollow] = search
         .fit_overlay_pair(
             &diff_green_seed,
             &diff_red_seed,
@@ -1142,24 +1142,13 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         )
         .map_err(|error| Error(format!("hollow diff hunks: {error}")))?;
 
-    let added_hunk_scenes = render_on_bases(&editor_bases, &[&diff_added])?;
-    let deleted_hunk_scenes = render_on_bases(&editor_bases, &[&diff_deleted])?;
-    let added_hollow_scenes = render_on_bases(&editor_bases, &[&diff_added_hollow])?;
-    let deleted_hollow_scenes = render_on_bases(&editor_bases, &[&diff_deleted_hollow])?;
-    let border_request =
-        |backgrounds| OverlayFitRequest::new(backgrounds, CONTROL_CONTRAST, STATE_HOVER_DELTA_E);
-    let [diff_added_hollow_border, diff_deleted_hollow_border] = search
-        .fit_overlay_pair(
-            &diff_green_seed,
-            &diff_red_seed,
-            OverlayPairRequest::new(
-                border_request(&added_hollow_scenes),
-                border_request(&deleted_hollow_scenes),
-                diff_constraints.with_foreground_contrast(CONTROL_CONTRAST),
-            ),
-        )
-        .map_err(|error| Error(format!("diff hollow borders: {error}")))?;
-
+    let constraint_added_hunk_scenes = render_on_bases(&editor_bases, &[&constraint_diff_added])?;
+    let constraint_deleted_hunk_scenes =
+        render_on_bases(&editor_bases, &[&constraint_diff_deleted])?;
+    let constraint_added_hollow_scenes =
+        render_on_bases(&editor_bases, &[&constraint_diff_added_hollow])?;
+    let constraint_deleted_hollow_scenes =
+        render_on_bases(&editor_bases, &[&constraint_diff_deleted_hollow])?;
     let [conflict_ours, conflict_theirs] = search
         .fit_overlay_pair(
             &diff_green_seed,
@@ -1173,6 +1162,27 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             ),
         )
         .map_err(|error| Error(format!("conflict backgrounds: {error}")))?;
+
+    let (hunk_filled_opacity, hunk_hollow_opacity, hunk_border_opacity) = if palette.mode == "light"
+    {
+        (
+            LIGHT_DIFF_HUNK_FILLED_OPACITY,
+            LIGHT_DIFF_HUNK_HOLLOW_BACKGROUND_OPACITY,
+            LIGHT_DIFF_HUNK_HOLLOW_BORDER_OPACITY,
+        )
+    } else {
+        (
+            DARK_DIFF_HUNK_FILLED_OPACITY,
+            DARK_DIFF_HUNK_HOLLOW_BACKGROUND_OPACITY,
+            DARK_DIFF_HUNK_HOLLOW_BORDER_OPACITY,
+        )
+    };
+    let diff_added = apply_opacity(&version_control_added, hunk_filled_opacity)?;
+    let diff_deleted = apply_opacity(&version_control_deleted, hunk_filled_opacity)?;
+    let diff_added_hollow = apply_opacity(&version_control_added, hunk_hollow_opacity)?;
+    let diff_deleted_hollow = apply_opacity(&version_control_deleted, hunk_hollow_opacity)?;
+    let diff_added_hollow_border = apply_opacity(&version_control_added, hunk_border_opacity)?;
+    let diff_deleted_hollow_border = apply_opacity(&version_control_deleted, hunk_border_opacity)?;
 
     let yank = fit_highlight_with_alpha_fallback(
         &mut search,
@@ -1204,32 +1214,34 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         }),
     );
 
-    let word_added_bases = added_hunk_scenes
+    let constraint_word_added_bases = constraint_added_hunk_scenes
         .iter()
         .cloned()
-        .chain(added_hollow_scenes.iter().cloned())
+        .chain(constraint_added_hollow_scenes.iter().cloned())
         .collect::<Vec<_>>();
-    let word_deleted_bases = deleted_hunk_scenes
+    let constraint_word_deleted_bases = constraint_deleted_hunk_scenes
         .iter()
         .cloned()
-        .chain(deleted_hollow_scenes.iter().cloned())
+        .chain(constraint_deleted_hollow_scenes.iter().cloned())
         .collect::<Vec<_>>();
-    let word_added_underlays =
-        render_with_bounded_generic_highlights(&word_added_bases, &generic_highlights)?;
-    let word_deleted_underlays =
-        render_with_bounded_generic_highlights(&word_deleted_bases, &generic_highlights)?;
-    let readable_word_text = [(editor_primary.clone(), WORD_TEXT_CONTRAST)];
-    let word_request = |backgrounds| {
+    let constraint_word_added_underlays =
+        render_with_bounded_generic_highlights(&constraint_word_added_bases, &generic_highlights)?;
+    let constraint_word_deleted_underlays = render_with_bounded_generic_highlights(
+        &constraint_word_deleted_bases,
+        &generic_highlights,
+    )?;
+    let constraint_readable_word_text = [(editor_primary.clone(), WORD_TEXT_CONTRAST)];
+    let constraint_word_request = |backgrounds| {
         OverlayFitRequest::new(backgrounds, WORD_DIFF_CONTRAST, STATE_HOVER_DELTA_E)
-            .with_readable_foregrounds(&readable_word_text)
+            .with_readable_foregrounds(&constraint_readable_word_text)
     };
-    let word_pair = search
+    let constraint_word_pair = search
         .fit_overlay_pair_with_fallback(
             &diff_green_seed,
             &diff_red_seed,
             OverlayPairRequest::new(
-                word_request(&word_added_underlays),
-                word_request(&word_deleted_underlays),
+                constraint_word_request(&constraint_word_added_underlays),
+                constraint_word_request(&constraint_word_deleted_underlays),
                 diff_constraints
                     .with_foreground_contrast(WORD_DIFF_CONTRAST)
                     .with_minimum_chroma(0.0),
@@ -1243,19 +1255,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         )
         .map_err(|error| Error(format!("word diff backgrounds: {error}")))?;
 
-    if let Some(strong_error) = word_pair.strong_error {
-        audit.degradation(
-            "version_control.word_pair".into(),
-            "strong_rendered_separation",
-            json!({
-                "reason": strong_error,
-                "strong_frontier_limit": 128,
-                "weak_frontier_limit": 512,
-            }),
-        );
-    }
-
-    let [word_added, word_deleted] = word_pair.colors;
+    let [constraint_word_added, constraint_word_deleted] = constraint_word_pair.colors;
+    let word_added = apply_opacity(&version_control_added, hunk_filled_opacity)?;
+    let word_deleted = apply_opacity(&version_control_deleted, hunk_filled_opacity)?;
     let rendered_editor_overlays = [
         &search_match,
         &search_active,
@@ -1274,24 +1276,30 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         .flatten()
         .collect::<Vec<_>>();
 
-    let word_added_scenes = render_on_bases(&word_added_underlays, &[&word_added])?;
-    let word_deleted_scenes = render_on_bases(&word_deleted_underlays, &[&word_deleted])?;
+    let constraint_word_added_scenes =
+        render_on_bases(&constraint_word_added_underlays, &[&constraint_word_added])?;
+    let constraint_word_deleted_scenes = render_on_bases(
+        &constraint_word_deleted_underlays,
+        &[&constraint_word_deleted],
+    )?;
+    // Downstream fitting keeps the former conservative diff scenes so the quieter
+    // emitted treatment cannot retune unrelated syntax, status, or player roles.
     let base_overlay_backgrounds = unique(
         editor_bases
             .iter()
             .cloned()
-            .chain(added_hunk_scenes.iter().cloned())
-            .chain(deleted_hunk_scenes.iter().cloned())
-            .chain(added_hollow_scenes.iter().cloned())
-            .chain(deleted_hollow_scenes.iter().cloned())
+            .chain(constraint_added_hunk_scenes.iter().cloned())
+            .chain(constraint_deleted_hunk_scenes.iter().cloned())
+            .chain(constraint_added_hollow_scenes.iter().cloned())
+            .chain(constraint_deleted_hollow_scenes.iter().cloned())
             .chain(rendered_editor_overlay_contexts.iter().cloned()),
     );
     let editor_text_backgrounds = unique(
         base_overlay_backgrounds
             .iter()
             .cloned()
-            .chain(word_added_scenes.iter().cloned())
-            .chain(word_deleted_scenes.iter().cloned()),
+            .chain(constraint_word_added_scenes.iter().cloned())
+            .chain(constraint_word_deleted_scenes.iter().cloned()),
     );
 
     let player_seed_values = [
@@ -2070,6 +2078,9 @@ fn validate_theme(
         terminal_backgrounds,
     } = contexts;
     let style = style(document)?;
+    let appearance = document["themes"][0]["appearance"]
+        .as_str()
+        .ok_or_else(|| Error("theme appearance is not a string".into()))?;
     let fixed_expected: BTreeSet<String> = FOUNDATION_FIELDS
         .iter()
         .chain(CHROME_FIELDS)
@@ -2487,16 +2498,6 @@ fn validate_theme(
             "scrollbar.track.border",
             "surface.background",
             HARD_PASSIVE_CONTRAST,
-        ),
-        (
-            "editor.diff_hunk.added.hollow_border",
-            "editor.background",
-            HARD_CONTROL_CONTRAST,
-        ),
-        (
-            "editor.diff_hunk.deleted.hollow_border",
-            "editor.background",
-            HARD_CONTROL_CONTRAST,
         ),
     ];
     for (foreground, background, target) in structural {
@@ -2916,48 +2917,83 @@ fn validate_theme(
         &[style_color(style, "version_control.word_deleted")?],
     )?;
 
-    let mut diff_fill_minimum = f64::INFINITY;
-    for (name, target, bases, rendered) in [
+    let (expected_filled_opacity, expected_hollow_opacity, expected_border_opacity) =
+        if appearance == "light" {
+            (
+                LIGHT_DIFF_HUNK_FILLED_OPACITY,
+                LIGHT_DIFF_HUNK_HOLLOW_BACKGROUND_OPACITY,
+                LIGHT_DIFF_HUNK_HOLLOW_BORDER_OPACITY,
+            )
+        } else {
+            (
+                DARK_DIFF_HUNK_FILLED_OPACITY,
+                DARK_DIFF_HUNK_HOLLOW_BACKGROUND_OPACITY,
+                DARK_DIFF_HUNK_HOLLOW_BORDER_OPACITY,
+            )
+        };
+    for (family, marker, filled, hollow, border, word) in [
         (
+            "added",
+            "version_control.added",
             "editor.diff_hunk.added.background",
-            DIFF_FILL_CONTRAST,
-            editor_bases,
-            &added_solid,
-        ),
-        (
-            "editor.diff_hunk.deleted.background",
-            DIFF_FILL_CONTRAST,
-            editor_bases,
-            &deleted_solid,
-        ),
-        (
             "editor.diff_hunk.added.hollow_background",
-            DIFF_HOLLOW_CONTRAST,
-            editor_bases,
-            &added_hollow,
+            "editor.diff_hunk.added.hollow_border",
+            "version_control.word_added",
         ),
         (
+            "deleted",
+            "version_control.deleted",
+            "editor.diff_hunk.deleted.background",
             "editor.diff_hunk.deleted.hollow_background",
-            DIFF_HOLLOW_CONTRAST,
-            editor_bases,
-            &deleted_hollow,
-        ),
-        (
-            "version_control.conflict_marker.ours",
-            DIFF_FILL_CONTRAST,
-            editor_bases,
-            &conflict_ours,
-        ),
-        (
-            "version_control.conflict_marker.theirs",
-            DIFF_FILL_CONTRAST,
-            editor_bases,
-            &conflict_theirs,
+            "editor.diff_hunk.deleted.hollow_border",
+            "version_control.word_deleted",
         ),
     ] {
-        let actual = minimum_pairwise(bases, rendered, contrast_ratio)?;
+        let marker_rgb = parse_hex(style_color(style, marker)?)?.opaque_hex();
+        for (role, expected_opacity) in [
+            (filled, expected_filled_opacity),
+            (hollow, expected_hollow_opacity),
+            (border, expected_border_opacity),
+        ] {
+            let value = parse_hex(style_color(style, role)?)?;
+            let expected_alpha = (expected_opacity * 255.0).round();
+            let actual_alpha = (value.a * 255.0).round();
+            if value.opaque_hex() != marker_rgb || actual_alpha != expected_alpha {
+                errors.push(format!(
+                    "{role} must reuse {marker} RGB at {:.0}% opacity",
+                    expected_opacity * 100.0
+                ));
+            }
+        }
+        let word_value = parse_hex(style_color(style, word)?)?;
+        let expected_word_alpha = (expected_filled_opacity * 255.0).round();
+        let actual_word_alpha = (word_value.a * 255.0).round();
+        if word_value.opaque_hex() != marker_rgb || actual_word_alpha != expected_word_alpha {
+            errors.push(format!(
+                "{word} must reuse the {family} version-control RGB at {:.0}% opacity",
+                expected_filled_opacity * 100.0
+            ));
+        }
+    }
+
+    let mut diff_fill_minimum = f64::INFINITY;
+    for rendered in [
+        &added_solid,
+        &deleted_solid,
+        &added_hollow,
+        &deleted_hollow,
+        &conflict_ours,
+        &conflict_theirs,
+    ] {
+        let actual = minimum_pairwise(editor_bases, rendered, contrast_ratio)?;
         diff_fill_minimum = diff_fill_minimum.min(actual);
-        if actual < target - 1e-9 {
+    }
+    for (name, rendered) in [
+        ("version_control.conflict_marker.ours", &conflict_ours),
+        ("version_control.conflict_marker.theirs", &conflict_theirs),
+    ] {
+        let actual = minimum_pairwise(editor_bases, rendered, contrast_ratio)?;
+        if actual < DIFF_FILL_CONTRAST - 1e-9 {
             errors.push(format!("diff fill {name} reaches only {actual:.3}:1"));
         }
     }
@@ -2975,7 +3011,7 @@ fn validate_theme(
         ),
     ] {
         let actual = minimum_pairwise(bases, rendered, contrast_ratio)?;
-        if actual < WORD_DIFF_CONTRAST - 1e-9 {
+        if actual < PRESENTATION_WORD_DIFF_CONTRAST - 1e-9 {
             errors.push(format!("word diff {name} reaches only {actual:.3}:1"));
         }
     }
@@ -3000,11 +3036,6 @@ fn validate_theme(
     {
         errors.push(format!("diff added/deleted pair is ambiguous: contrast {pair_contrast:.3}, delta E {pair_delta:.3}, delta L {pair_lightness:.3}, CVD {pair_cvd:.3}"));
     }
-    let degraded_word_pair = audit.degradations.iter().any(|degradation| {
-        degradation.get("role").and_then(Value::as_str) == Some("version_control.word_pair")
-            && degradation.get("invariant").and_then(Value::as_str)
-                == Some("strong_rendered_separation")
-    });
     for (family, first_role, second_role, first_scenes, second_scenes) in [
         (
             "hunk.solid",
@@ -3057,35 +3088,15 @@ fn validate_theme(
             "cvd_delta_e": round6(cvd),
             "pair_contrast": round6(contrast),
         }));
-        let strong_separation = (family == "word" && degraded_word_pair)
-            || contrast >= DIFF_LUMINANCE_SEPARATION_CONTRAST - 1e-9
+        let strong_separation = contrast >= DIFF_LUMINANCE_SEPARATION_CONTRAST - 1e-9
             || (normal >= DIFF_NORMAL_DELTA_E - 1e-9 && cvd >= DIFF_CVD_DELTA_E - 1e-9);
-        if normal < DIFF_NORMAL_FLOOR_DELTA_E - 1e-9
-            || cvd < DIFF_CVD_FLOOR_DELTA_E - 1e-9
-            || contrast < DIFF_PAIR_CONTRAST - 1e-9
-            || !strong_separation
+        if family == "conflict"
+            && (normal < DIFF_NORMAL_FLOOR_DELTA_E - 1e-9
+                || cvd < DIFF_CVD_FLOOR_DELTA_E - 1e-9
+                || contrast < DIFF_PAIR_CONTRAST - 1e-9
+                || !strong_separation)
         {
             errors.push(format!("diff {family} pair is ambiguous: contrast {contrast:.3}, delta E {normal:.3}, CVD {cvd:.3}"));
-        }
-    }
-
-    for (border, fills, borders) in [
-        (
-            "editor.diff_hunk.added.hollow_border",
-            &added_hollow,
-            &added_border,
-        ),
-        (
-            "editor.diff_hunk.deleted.hollow_border",
-            &deleted_hollow,
-            &deleted_border,
-        ),
-    ] {
-        let actual = minimum_pairwise(fills, borders, contrast_ratio)?;
-        if actual < HARD_CONTROL_CONTRAST - 1e-9 {
-            errors.push(format!(
-                "{border} reaches only {actual:.3}:1 after composition"
-            ));
         }
     }
     for (family, hollow, border, word) in [

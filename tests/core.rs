@@ -364,6 +364,40 @@ fn representative_palettes_generate_valid_themes() {
 }
 
 #[test]
+fn diff_line_roles_follow_zeds_opacity_ladder() {
+    for (name, palette, expected_alpha) in [
+        ("dark", synthetic_palette(), [31_u8, 15, 92]),
+        ("light", venice_like_palette(), [41_u8, 20, 122]),
+    ] {
+        let (document, _) = build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let style = style(&document);
+        for family in ["added", "deleted"] {
+            let marker = role(style, &format!("version_control.{family}"));
+            for (suffix, alpha) in [
+                ("background", expected_alpha[0]),
+                ("hollow_background", expected_alpha[1]),
+                ("hollow_border", expected_alpha[2]),
+            ] {
+                let hunk = role(style, &format!("editor.diff_hunk.{family}.{suffix}"));
+                assert_eq!(rgb(hunk), rgb(marker), "{name}: {family}.{suffix}");
+                assert_eq!(
+                    (parse_hex(hunk).unwrap().a * 255.0).round() as u8,
+                    alpha,
+                    "{name}: {family}.{suffix}"
+                );
+            }
+            let word = role(style, &format!("version_control.word_{family}"));
+            assert_eq!(rgb(word), rgb(marker), "{name}: word_{family}");
+            assert_eq!(
+                (parse_hex(word).unwrap().a * 255.0).round() as u8,
+                expected_alpha[0],
+                "{name}: word_{family}"
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires the pinned Zed source checkout"]
 fn pinned_zed_color_schema_matches_the_manifest() {
     let root = required_env_path("OMARCHY_ZED_THEME_ZED_SOURCE");
