@@ -1,0 +1,21 @@
+[package]
+name = "omarchy-zed-theme"
+version = "0.1.0"
+edition = "2024"
+authors = ["zharinov"]
+license = "MIT"
+description = "Generate a complete Zed theme from the active Omarchy palette"
+repository = "https://github.com/zharinov/omarchy-zed-theme"
+
+[dependencies]
+fs2 = "0.4"
+jsonc-parser = { version = "0.33.1", features = ["cst", "serde_json"] }
+libc = "0.2"
+rayon = "1.11"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+strip = true
