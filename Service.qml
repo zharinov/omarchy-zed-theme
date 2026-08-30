@@ -97,6 +97,19 @@ Item {
     activationProcess.running = true
   }
 
+  function binaryVersionIsCurrent(exitCode, output) {
+    return exitCode === 0
+      && String(output || "").trim() === "omarchy-zed-theme " + pluginVersion
+  }
+
+  function acceptBinary() {
+    binaryReady = true
+    initialSyncCheckProcess.command = [
+      "test", "-f", syncMarkerPath, "-a", "-s", generatedThemePath
+    ]
+    initialSyncCheckProcess.running = true
+  }
+
   function expectedChecksumFrom(text) {
     var lines = String(text || "").split("\n")
     for (var i = 0; i < lines.length; i++) {
@@ -196,13 +209,8 @@ Item {
       waitForEnd: true
     }
     onExited: function(exitCode) {
-      var expected = "omarchy-zed-theme " + root.pluginVersion
-      if (exitCode === 0 && String(installedVersionOutput.text || "").trim() === expected) {
-        root.binaryReady = true
-        initialSyncCheckProcess.command = [
-          "test", "-f", root.syncMarkerPath, "-a", "-s", root.generatedThemePath
-        ]
-        initialSyncCheckProcess.running = true
+      if (root.binaryVersionIsCurrent(exitCode, installedVersionOutput.text)) {
+        root.acceptBinary()
         return
       }
       createRuntimeProcess.command = ["mkdir", "-p", root.runtimeDirectory]
@@ -228,7 +236,7 @@ Item {
   Process {
     id: initialSyncCheckProcess
     onExited: function(exitCode) {
-      if (exitCode === 0) {
+      if (exitCode === 0 && !root.syncPending) {
         root.beginActivation()
         return
       }
@@ -334,6 +342,22 @@ Item {
         root.fail("cannot make its release binary executable")
         return
       }
+      candidateVersionProcess.command = [root.downloadPath, "--version"]
+      candidateVersionProcess.running = true
+    }
+  }
+
+  Process {
+    id: candidateVersionProcess
+    stdout: StdioCollector {
+      id: candidateVersionOutput
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (!root.binaryVersionIsCurrent(exitCode, candidateVersionOutput.text)) {
+        root.fail("release binary has an unexpected version")
+        return
+      }
       publishBinaryProcess.command = ["mv", "-f", root.downloadPath, root.binaryPath]
       publishBinaryProcess.running = true
     }
@@ -346,6 +370,8 @@ Item {
         root.fail("cannot publish its release binary")
         return
       }
+      root.downloadPath = ""
+      root.acceptBinary()
     }
   }
 
