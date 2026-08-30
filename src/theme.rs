@@ -3,6 +3,10 @@
 //! Omarchy supplies every UI color. Built-in colors may repair syntax roles only.
 //! Search can record an unmet preference, but it cannot downgrade a failed validation.
 
+use self::tokens::{
+    ContentTokens, DerivedTokens, InteractionTokens, OpaqueColor, OverlayColor, PaintColor,
+    RoleColor, RoleColorKind, StatusChannel, StatusTokens, SurfaceTokens, ThemeTokens,
+};
 use crate::color::{
     apply_opacity, contrast_ratio, delta_e, gamut_map_oklch, gpui_blend, lab, lightness,
     oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
@@ -14,16 +18,15 @@ use crate::saliency::{
     fit_relative,
 };
 use crate::search::{
-    FillRequest, FitBounds, OverlayPairRequest, PairConstraints, Search, cvd_greedy_order, round6,
+    FitBounds, OverlayFitRequest, OverlayPairRequest, PairConstraints, Search, cvd_greedy_order,
+    round6,
 };
 use crate::syntax::{build_syntax, contrast_floor};
-use crate::theme_tokens::{
-    ContentTokens, DerivedTokens, InteractionTokens, OpaqueColor, OverlayColor, PaintColor,
-    RoleColor, RoleColorKind, StatusChannel, StatusTokens, SurfaceTokens, ThemeTokens,
-};
 use crate::{Error, Result};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod tokens;
 
 #[derive(Clone, Debug)]
 pub struct Audit {
@@ -35,7 +38,7 @@ pub struct Audit {
     pub minimums: BTreeMap<String, f64>,
     pub warnings: Vec<String>,
     pub saliency: Vec<Value>,
-    pub syntax_policy: Value,
+    pub syntax_analysis: Value,
     pub syntax_roles: Vec<Value>,
     pub syntax_collapses: Vec<Value>,
     pub diff_metrics: Vec<Value>,
@@ -57,7 +60,7 @@ impl Audit {
                 .into_iter()
                 .collect(),
             saliency: Vec::new(),
-            syntax_policy: Value::Null,
+            syntax_analysis: Value::Null,
             syntax_roles: Vec::new(),
             syntax_collapses: Vec::new(),
             diff_metrics: Vec::new(),
@@ -89,7 +92,7 @@ impl Audit {
             "repairs": self.repairs, "degradations": self.degradations,
             "minimums": self.minimums, "warnings": self.warnings,
             "saliency": self.saliency,
-            "syntax_policy": self.syntax_policy, "syntax_roles": self.syntax_roles,
+            "syntax_analysis": self.syntax_analysis, "syntax_roles": self.syntax_roles,
             "syntax_collapses": self.syntax_collapses, "diff_metrics": self.diff_metrics,
             "interaction_ladders": self.interaction_ladders, "fidelity_deviations": self.fidelity_deviations,
         })
@@ -128,34 +131,34 @@ fn render_with_bounded_generic_highlights(
     Ok(scenes)
 }
 
-fn fit_preserving_highlight(
+fn fit_highlight_with_alpha_fallback(
     search: &mut Search,
     audit: &mut Audit,
     role: &str,
     seed: &str,
-    request: FillRequest<'_>,
+    request: OverlayFitRequest<'_>,
 ) -> Result<String> {
-    let preserving_error =
-        match search.fit_fill_readable_bounded(seed, request, PRESERVING_HIGHLIGHT_MAX_ALPHA) {
+    let preferred_cap_error =
+        match search.fit_readable_overlay_bounded(seed, request, PREFERRED_HIGHLIGHT_MAX_ALPHA) {
             Ok(output) => return Ok(output),
             Err(error) => error,
         };
     let output = search
-        .fit_fill_readable_bounded(seed, request, OVERLAY_MAX_ALPHA)
+        .fit_readable_overlay_bounded(seed, request, OVERLAY_MAX_ALPHA)
         .map_err(|fallback_error| {
             Error(format!(
-                "{role}: preferred alpha cap failed: {preserving_error}; relaxed alpha cap failed: {fallback_error}"
+                "{role}: preferred alpha cap failed: {preferred_cap_error}; relaxed alpha cap failed: {fallback_error}"
             ))
         })?;
 
     audit.degradation(
         role.into(),
-        "highlight_alpha_preservation",
+        "highlight_alpha_cap_relaxed",
         json!({
-            "preferred_maximum_alpha": PRESERVING_HIGHLIGHT_MAX_ALPHA,
+            "preferred_maximum_alpha": PREFERRED_HIGHLIGHT_MAX_ALPHA,
             "fallback_maximum_alpha": OVERLAY_MAX_ALPHA,
             "actual_alpha": round6(parse_hex(&output)?.a),
-            "reason": preserving_error.to_string(),
+            "reason": preferred_cap_error.to_string(),
         }),
     );
     Ok(output)
@@ -484,7 +487,7 @@ fn terminal_triplet(
     Ok([dim, normal, bright])
 }
 
-struct SemanticPalette {
+struct SemanticColors {
     primary: String,
     secondary: String,
     disabled: String,
@@ -526,7 +529,7 @@ fn derive_semantics(
     text_backgrounds: &[String],
     semantic_backgrounds: &[String],
     audit: &mut Audit,
-) -> Result<SemanticPalette> {
+) -> Result<SemanticColors> {
     let primary = search.fit_color(
         color(palette, "foreground"),
         text_backgrounds,
@@ -585,7 +588,7 @@ fn derive_semantics(
             yellow
         }
     };
-    Ok(SemanticPalette {
+    Ok(SemanticColors {
         primary,
         secondary,
         disabled,
@@ -702,9 +705,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     )?;
     let readable_interaction_foreground = [(interaction_ui_text, TEXT_CONTRAST)];
     let element_hover = search
-        .fit_fill_readable(
+        .fit_readable_overlay(
             &surface,
-            FillRequest::new(
+            OverlayFitRequest::new(
                 &interaction_bases,
                 LAYER_HOVER_CONTRAST,
                 STATE_HOVER_DELTA_E,
@@ -714,9 +717,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         )
         .map_err(|error| Error(format!("element hover: {error}")))?;
     let element_active = search
-        .fit_fill_readable(
+        .fit_readable_overlay(
             &surface,
-            FillRequest::new(
+            OverlayFitRequest::new(
                 &interaction_bases,
                 LAYER_ACTIVE_CONTRAST,
                 STATE_ACTIVE_DELTA_E,
@@ -737,9 +740,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         )
         .map_err(|error| Error(format!("element active: {error}")))?;
     let ghost_hover = search
-        .fit_fill_readable(
+        .fit_readable_overlay(
             &canvas,
-            FillRequest::new(
+            OverlayFitRequest::new(
                 &interaction_bases,
                 LAYER_HOVER_CONTRAST,
                 STATE_HOVER_DELTA_E,
@@ -748,9 +751,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         )
         .map_err(|error| Error(format!("ghost hover: {error}")))?;
     let ghost_active = search
-        .fit_fill_readable(
+        .fit_readable_overlay(
             &canvas,
-            FillRequest::new(
+            OverlayFitRequest::new(
                 &interaction_bases,
                 LAYER_ACTIVE_CONTRAST,
                 STATE_ACTIVE_DELTA_E,
@@ -814,9 +817,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
 
     let content_accent = search.fit_color(&semantic.accent, &ui_backgrounds, TEXT_CONTRAST)?;
     let element_selection = search
-        .fit_fill_readable(
+        .fit_readable_overlay(
             color(palette, "selection"),
-            FillRequest::new(
+            OverlayFitRequest::new(
                 &interaction_bases,
                 FOCUSED_SELECTION_CONTRAST,
                 FOCUSED_SELECTION_DELTA_E,
@@ -827,9 +830,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         .map_err(|error| Error(format!("UI selection: {error}")))?;
 
     let editor_active_line = search
-        .fit_fill_readable(
+        .fit_readable_overlay(
             &canvas,
-            FillRequest::new(
+            OverlayFitRequest::new(
                 std::slice::from_ref(&canvas),
                 STATE_HOVER_CONTRAST,
                 STATE_HOVER_DELTA_E,
@@ -853,9 +856,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
 
     let rendered_editor_active_line = gpui_blend(&canvas, &editor_active_line)?.opaque_hex();
     let editor_highlighted_line = search
-        .fit_fill_readable(
+        .fit_readable_overlay(
             &surface,
-            FillRequest::new(
+            OverlayFitRequest::new(
                 std::slice::from_ref(&canvas),
                 STATE_ACTIVE_CONTRAST,
                 STATE_ACTIVE_DELTA_E,
@@ -874,9 +877,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     let rendered_editor_highlighted_line =
         gpui_blend(&canvas, &editor_highlighted_line)?.opaque_hex();
     let debugger_active = search
-        .fit_fill_readable(
+        .fit_readable_overlay(
             &semantic.red,
-            FillRequest::new(
+            OverlayFitRequest::new(
                 std::slice::from_ref(&canvas),
                 STATE_SELECTED_CONTRAST,
                 STATE_SELECTED_DELTA_E,
@@ -949,22 +952,22 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
 
     let readable_editor_overlay_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
     let search_match_request =
-        FillRequest::new(&editor_bases, SEARCH_MATCH_CONTRAST, STATE_HOVER_DELTA_E)
+        OverlayFitRequest::new(&editor_bases, SEARCH_MATCH_CONTRAST, STATE_HOVER_DELTA_E)
             .with_readable_foregrounds(&readable_editor_overlay_text);
-    let initial_search_match = fit_preserving_highlight(
+    let initial_search_match = fit_highlight_with_alpha_fallback(
         &mut search,
         &mut audit,
         "search.match_background",
         &semantic.yellow,
         search_match_request,
     )?;
-    let search_active_request = FillRequest::new(
+    let search_active_request = OverlayFitRequest::new(
         &editor_bases,
         SEARCH_ACTIVE_CONTRAST,
         STATE_SELECTED_DELTA_E,
     )
     .with_readable_foregrounds(&readable_editor_overlay_text);
-    let (search_match, search_active) = match fit_preserving_highlight(
+    let (search_match, search_active) = match fit_highlight_with_alpha_fallback(
         &mut search,
         &mut audit,
         "search.active_match_background",
@@ -991,7 +994,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                             0.0,
                         ),
                     )
-                    .with_limits(PRESERVING_HIGHLIGHT_MAX_ALPHA, 512),
+                    .with_limits(PREFERRED_HIGHLIGHT_MAX_ALPHA, 512),
                 )
                 .map_err(|joint_error| {
                     Error(format!(
@@ -1011,12 +1014,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         }
     };
 
-    let document_read = fit_preserving_highlight(
+    let document_read = fit_highlight_with_alpha_fallback(
         &mut search,
         &mut audit,
         "editor.document_highlight.read_background",
         &semantic.accent,
-        FillRequest::new(
+        OverlayFitRequest::new(
             &editor_bases,
             STATE_SELECTED_CONTRAST,
             STATE_SELECTED_DELTA_E,
@@ -1034,24 +1037,24 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         }));
     }
 
-    let document_write = fit_preserving_highlight(
+    let document_write = fit_highlight_with_alpha_fallback(
         &mut search,
         &mut audit,
         "editor.document_highlight.write_background",
         &semantic.orange,
-        FillRequest::new(
+        OverlayFitRequest::new(
             &editor_bases,
             STATE_SELECTED_CONTRAST,
             STATE_SELECTED_DELTA_E,
         )
         .with_readable_foregrounds(&readable_editor_overlay_text),
     )?;
-    let document_bracket = fit_preserving_highlight(
+    let document_bracket = fit_highlight_with_alpha_fallback(
         &mut search,
         &mut audit,
         "editor.document_highlight.bracket_background",
         &semantic.cyan,
-        FillRequest::new(
+        OverlayFitRequest::new(
             &editor_bases,
             STATE_SELECTED_CONTRAST,
             STATE_SELECTED_DELTA_E,
@@ -1100,7 +1103,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
 
     let readable_diff_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
     let diff_fill_request = |backgrounds| {
-        FillRequest::new(backgrounds, DIFF_FILL_CONTRAST, DIFF_NORMAL_FLOOR_DELTA_E)
+        OverlayFitRequest::new(backgrounds, DIFF_FILL_CONTRAST, DIFF_NORMAL_FLOOR_DELTA_E)
             .with_readable_foregrounds(&readable_diff_text)
     };
     let [diff_added, diff_deleted] = search
@@ -1131,7 +1134,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     let added_hollow_scenes = render_on_bases(&editor_bases, &[&diff_added_hollow])?;
     let deleted_hollow_scenes = render_on_bases(&editor_bases, &[&diff_deleted_hollow])?;
     let border_request =
-        |backgrounds| FillRequest::new(backgrounds, CONTROL_CONTRAST, STATE_HOVER_DELTA_E);
+        |backgrounds| OverlayFitRequest::new(backgrounds, CONTROL_CONTRAST, STATE_HOVER_DELTA_E);
     let [diff_added_hollow_border, diff_deleted_hollow_border] = search
         .fit_overlay_pair(
             &diff_green_seed,
@@ -1158,12 +1161,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         )
         .map_err(|error| Error(format!("conflict backgrounds: {error}")))?;
 
-    let yank = fit_preserving_highlight(
+    let yank = fit_highlight_with_alpha_fallback(
         &mut search,
         &mut audit,
         "vim.yank.background",
         &semantic.yellow,
-        FillRequest::new(
+        OverlayFitRequest::new(
             &editor_bases,
             STATE_SELECTED_CONTRAST,
             STATE_SELECTED_DELTA_E,
@@ -1204,7 +1207,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         render_with_bounded_generic_highlights(&word_deleted_bases, &generic_highlights)?;
     let readable_word_text = [(editor_primary.clone(), WORD_TEXT_CONTRAST)];
     let word_request = |backgrounds| {
-        FillRequest::new(backgrounds, WORD_DIFF_CONTRAST, STATE_HOVER_DELTA_E)
+        OverlayFitRequest::new(backgrounds, WORD_DIFF_CONTRAST, STATE_HOVER_DELTA_E)
             .with_readable_foregrounds(&readable_word_text)
     };
     let word_pair = search
@@ -1293,7 +1296,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
 
     let selection_readable = [(editor_primary.clone(), TEXT_CONTRAST)];
     let selection_request = || {
-        FillRequest::new(
+        OverlayFitRequest::new(
             &base_overlay_backgrounds,
             FOCUSED_SELECTION_CONTRAST,
             FOCUSED_SELECTION_DELTA_E,
@@ -1301,7 +1304,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         .with_runtime_state((0.5, 1.08, 0.020))
         .with_readable_foregrounds(&selection_readable)
     };
-    let selection = match search.fit_fill_readable_alpha_range(
+    let selection = match search.fit_readable_overlay_alpha_range(
         color(palette, "selection"),
         selection_request(),
         u8::MAX,
@@ -1309,7 +1312,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     ) {
         Ok(selection) => selection,
         Err(source_error) => {
-            match search.fit_fill_readable_alpha_range(
+            match search.fit_readable_overlay_alpha_range(
                 &semantic.accent,
                 selection_request(),
                 u8::MAX,
@@ -1321,7 +1324,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                         "selection_seed_substitution",
                         json!({
                             "requested": color(palette, "selection"),
-                            "fallback": semantic.accent,
+                            "fallback_seed": semantic.accent,
                             "reason": source_error.to_string(),
                         }),
                     );
@@ -1329,22 +1332,22 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                 }
                 Err(accent_error) => {
                     let mut fallback_errors = Vec::new();
-                    let mut fallback = None;
+                    let mut fallback_candidate = None;
                     for seed in player_seeds.iter().skip(1) {
-                        match search.fit_fill_readable_alpha_range(
+                        match search.fit_readable_overlay_alpha_range(
                             seed,
                             selection_request(),
                             u8::MAX,
                             u8::MAX,
                         ) {
                             Ok(selection) => {
-                                fallback = Some((seed, selection));
+                                fallback_candidate = Some((seed, selection));
                                 break;
                             }
                             Err(error) => fallback_errors.push(format!("{seed}: {error}")),
                         }
                     }
-                    let (fallback_seed, selection) = fallback.ok_or_else(|| {
+                    let (fallback_seed, selection) = fallback_candidate.ok_or_else(|| {
                         Error(format!(
                             "focused selection failed for source ({source_error}), accent ({accent_error}), and player seeds ({})",
                             fallback_errors.join("; ")
@@ -1355,7 +1358,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                         "selection_seed_substitution",
                         json!({
                             "requested": color(palette, "selection"),
-                            "fallback": fallback_seed,
+                            "fallback_seed": fallback_seed,
                             "reason": source_error.to_string(),
                         }),
                     );
@@ -1388,7 +1391,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             .map(|selection| (selection.clone(), 1.0, PLAYER_SELECTION_DELTA_E))
             .collect::<Vec<_>>();
         let request = || {
-            FillRequest::new(
+            OverlayFitRequest::new(
                 &base_overlay_backgrounds,
                 FOCUSED_SELECTION_CONTRAST,
                 FOCUSED_SELECTION_DELTA_E,
@@ -1398,7 +1401,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             .with_rendered_references(&references)
         };
         let fitted = if let Ok(fitted) =
-            search.fit_fill_readable_alpha_range(cursor, request(), u8::MAX, u8::MAX)
+            search.fit_readable_overlay_alpha_range(cursor, request(), u8::MAX, u8::MAX)
         {
             fitted
         } else {
@@ -1741,9 +1744,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         "accents",
     )?;
 
-    let drop_target = search.fit_fill_readable_bounded(
+    let drop_target = search.fit_readable_overlay_bounded(
         &semantic.accent,
-        FillRequest::new(
+        OverlayFitRequest::new(
             std::slice::from_ref(&surface),
             STATE_SELECTED_CONTRAST,
             STATE_SELECTED_DELTA_E,
@@ -1758,14 +1761,14 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     )?;
 
     let thumb_contexts = unique([chrome.clone(), surface.clone(), canvas.clone()]);
-    let thumb_base = search.fit_fill_readable_bounded(
+    let thumb_base = search.fit_readable_overlay_bounded(
         &semantic.primary,
-        FillRequest::new(&thumb_contexts, CONTROL_CONTRAST, STATE_SELECTED_DELTA_E),
+        OverlayFitRequest::new(&thumb_contexts, CONTROL_CONTRAST, STATE_SELECTED_DELTA_E),
         OVERLAY_MAX_ALPHA,
     )?;
-    let thumb_hover = search.fit_fill_readable_bounded(
+    let thumb_hover = search.fit_readable_overlay_bounded(
         &semantic.primary,
-        FillRequest::new(
+        OverlayFitRequest::new(
             &thumb_contexts,
             THUMB_HOVER_CONTRAST,
             STATE_SELECTED_DELTA_E,
@@ -1777,9 +1780,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         )]),
         OVERLAY_MAX_ALPHA,
     )?;
-    let thumb_active = search.fit_fill_readable_bounded(
+    let thumb_active = search.fit_readable_overlay_bounded(
         &semantic.primary,
-        FillRequest::new(
+        OverlayFitRequest::new(
             &thumb_contexts,
             THUMB_ACTIVE_CONTRAST,
             STATE_SELECTED_DELTA_E,

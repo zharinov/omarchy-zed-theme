@@ -484,7 +484,7 @@ pub fn build_syntax(
         .collect::<Vec<_>>();
     let (full_normal, full_cvd) = pair_matrices(&full_colors)?;
     let (plan, allocations, normal_matrix, cvd_matrix) = select_separated_plan(
-        profile.target_families,
+        profile.requested_family_count,
         &full_allocations,
         &full_normal,
         &full_cvd,
@@ -570,16 +570,16 @@ pub fn build_syntax(
     if let Some(object) = merge_plan_audit.as_object_mut() {
         object.insert(
             "requested_family_count".into(),
-            profile.target_families.into(),
+            profile.requested_family_count.into(),
         );
         object.insert("effective_family_count".into(), plan.family_count.into());
         object.insert(
             "separation_fallback".into(),
-            (plan.family_count < profile.target_families).into(),
+            (plan.family_count < profile.requested_family_count).into(),
         );
     }
 
-    audit.syntax_policy = json!({
+    audit.syntax_analysis = json!({
         "version": 1,
         "profile": profile.audit(),
         "merge_plan": merge_plan_audit,

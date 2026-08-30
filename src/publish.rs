@@ -1,7 +1,7 @@
 //! Publishes a theme only from a stable source palette.
 //!
-//! Generation holds one lock, verifies source identity after validation, rejects a
-//! symlink at the destination, and atomically replaces changed output.
+//! A theme update holds one lock, verifies source identity after validation,
+//! rejects a symlink at the destination, and atomically replaces changed output.
 
 use crate::palette::resolve_palette;
 use crate::theme::{Audit, build_theme};
@@ -163,7 +163,7 @@ pub fn atomic_write_file_if_unchanged(
     atomic_write_file_inner(target, content, ExpectedContent::Exact(expected))
 }
 
-pub struct Generation {
+pub struct ThemeUpdate {
     pub target: PathBuf,
     pub audit: Audit,
     pub changed: bool,
@@ -183,12 +183,12 @@ fn publish_if_source_unchanged(
     Ok(Some(changed))
 }
 
-pub fn generate(
+pub fn generate_and_publish(
     colors_file: &Path,
     output_directory: Option<&Path>,
     resolver: Option<&Path>,
     appearance_assertion: Option<&str>,
-) -> Result<Generation> {
+) -> Result<ThemeUpdate> {
     let destination =
         output_directory.unwrap_or_else(|| colors_file.parent().unwrap_or_else(|| Path::new(".")));
     let target = destination.join("omarchy.json");
@@ -248,7 +248,7 @@ pub fn generate(
             continue;
         };
 
-        return Ok(Generation {
+        return Ok(ThemeUpdate {
             target,
             audit,
             changed,

@@ -73,7 +73,7 @@ pub struct SyntaxProfile {
     pub effective_hue_families: f64,
     pub source_median_chroma: f64,
     pub source_q90_chroma: f64,
-    pub target_families: usize,
+    pub requested_family_count: usize,
     pub chroma_envelope: ChromaEnvelope,
     pub scaffold_weight: f64,
     pub scaffold_phase: f64,
@@ -278,7 +278,7 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
     let ordinary_maximum = (NEUTRAL_MAXIMUM_CHROMA
         + envelope_support * (native_maximum - NEUTRAL_MAXIMUM_CHROMA))
         .max(target_median);
-    let target_families = (4.0 + 4.0 * authored_breadth).round() as usize;
+    let requested_family_count = (4.0 + 4.0 * authored_breadth).round() as usize;
     let scaffold_weight = 1.0 - palette_native_weight;
 
     let baseline_kind = if effective_hue_families <= 1e-12 {
@@ -310,7 +310,7 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
         effective_hue_families,
         source_median_chroma,
         source_q90_chroma,
-        target_families,
+        requested_family_count,
         chroma_envelope: ChromaEnvelope {
             target_median,
             ordinary_maximum,
@@ -377,7 +377,7 @@ impl SyntaxProfile {
                 "target_median_chroma": round6(self.chroma_envelope.target_median),
                 "maximum_ordinary_chroma": round6(self.chroma_envelope.ordinary_maximum),
             },
-            "target_families": self.target_families,
+            "requested_family_count": self.requested_family_count,
             "scaffold_weight": round6(self.scaffold_weight),
             "baseline_kind": self.baseline_kind.as_str(),
             "baseline_kind_authoritative": false,

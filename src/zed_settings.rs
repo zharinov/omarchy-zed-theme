@@ -11,7 +11,7 @@ const MANAGED_THEME: &str = "Omarchy";
 const STATE_VERSION: u64 = 1;
 
 #[derive(Debug)]
-struct State {
+struct ActivationState {
     active: bool,
     previous_theme: Option<Value>,
 }
@@ -188,7 +188,7 @@ fn set_theme(source: &str, theme: Option<&Value>) -> Result<String> {
     Ok(root.to_string())
 }
 
-fn state_content(state: &State) -> Result<Vec<u8>> {
+fn state_content(state: &ActivationState) -> Result<Vec<u8>> {
     let mut object = Map::new();
     object.insert("version".into(), Value::from(STATE_VERSION));
     object.insert("active".into(), Value::from(state.active));
@@ -200,7 +200,7 @@ fn state_content(state: &State) -> Result<Vec<u8>> {
     Ok(content.into_bytes())
 }
 
-fn parse_state(content: &[u8]) -> Result<State> {
+fn parse_state(content: &[u8]) -> Result<ActivationState> {
     let value: Value = serde_json::from_slice(content)
         .map_err(|error| Error(format!("invalid saved Zed theme state: {error}")))?;
     let object = value
@@ -213,7 +213,7 @@ fn parse_state(content: &[u8]) -> Result<State> {
         .get("active")
         .and_then(Value::as_bool)
         .ok_or_else(|| Error("saved Zed theme state has no active flag".into()))?;
-    Ok(State {
+    Ok(ActivationState {
         active,
         previous_theme: object.get("previous_theme").cloned(),
     })
@@ -232,7 +232,7 @@ fn activate_settings(
     state_path: &Path,
     claim_path: &Path,
     owner: &str,
-    state: &mut State,
+    state: &mut ActivationState,
     mut needs_initial_snapshot: bool,
 ) -> Result<bool> {
     let managed = Value::String(MANAGED_THEME.into());
@@ -316,7 +316,7 @@ pub fn config_home(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".config"))
 }
 
-fn state_lock(state_path: &Path) -> Result<File> {
+fn activation_directory_lock(state_path: &Path) -> Result<File> {
     let root = state_path
         .parent()
         .and_then(Path::parent)
@@ -353,14 +353,14 @@ fn activate_paths(
         return Err(Error("activation owner cannot be empty".into()));
     }
 
-    let _lock = state_lock(state_path)?;
+    let _lock = activation_directory_lock(state_path)?;
     if !claim_matches(claim_path, owner)? {
         return Ok(());
     }
     let (mut state, needs_initial_snapshot) = match read_regular_nofollow(state_path)? {
         Some(content) => (parse_state(&content)?, false),
         None => (
-            State {
+            ActivationState {
                 active: false,
                 previous_theme: None,
             },
@@ -399,7 +399,7 @@ fn restore_paths(
         return Err(Error("activation owner cannot be empty".into()));
     }
 
-    let _lock = state_lock(state_path)?;
+    let _lock = activation_directory_lock(state_path)?;
     if !claim_matches(claim_path, owner)? {
         return Ok(());
     }
@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn activation_state_contains_a_json_value() {
-        let state = State {
+        let state = ActivationState {
             active: true,
             previous_theme: Some(serde_json::json!({
                 "mode": "system",
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn missing_and_null_themes_remain_distinct() {
-        let missing = State {
+        let missing = ActivationState {
             active: true,
             previous_theme: None,
         };
@@ -592,7 +592,7 @@ mod tests {
                 .contains_key("previous_theme")
         );
 
-        let null = State {
+        let null = ActivationState {
             active: true,
             previous_theme: Some(Value::Null),
         };
@@ -753,7 +753,7 @@ mod tests {
         let state_path = home.join("state/omarchy-zed-theme/zed-settings.json");
         fs::create_dir_all(state_path.parent().unwrap()).unwrap();
         fs::write(&settings, "{\"theme\":\"Omarchy\"}\n").unwrap();
-        let state = State {
+        let state = ActivationState {
             active: false,
             previous_theme: Some(Value::String("One Dark".into())),
         };
@@ -778,7 +778,7 @@ mod tests {
         let claim = state_path.parent().unwrap().join("owner");
         fs::create_dir_all(state_path.parent().unwrap()).unwrap();
         fs::write(&settings, "{\"theme\":\"Ayu\"}\n").unwrap();
-        let state = State {
+        let state = ActivationState {
             active: false,
             previous_theme: Some(Value::String("One Dark".into())),
         };

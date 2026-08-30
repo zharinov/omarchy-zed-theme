@@ -30,7 +30,7 @@ fn temporary(name: &str) -> PathBuf {
     ))
 }
 
-fn required_path(variable: &str) -> PathBuf {
+fn required_env_path(variable: &str) -> PathBuf {
     PathBuf::from(
         std::env::var_os(variable)
             .unwrap_or_else(|| panic!("{variable} is required for this integration test")),
@@ -159,7 +159,7 @@ fn venice_like_palette() -> ResolvedPalette {
     palette
 }
 
-fn fixture_palette(value: &Value) -> (String, ResolvedPalette) {
+fn parse_palette_fixture(value: &Value) -> (String, ResolvedPalette) {
     let object = value
         .as_object()
         .expect("palette fixture must be an object");
@@ -212,7 +212,7 @@ fn fixture_palette(value: &Value) -> (String, ResolvedPalette) {
     )
 }
 
-fn renamed_fields(source: &str, structure: &str) -> BTreeSet<String> {
+fn serialized_field_names(source: &str, structure: &str) -> BTreeSet<String> {
     let start_marker = format!("pub struct {structure} {{");
     let body = source
         .split_once(&start_marker)
@@ -312,13 +312,13 @@ pub struct Fixture {
 }
 "#;
     assert_eq!(
-        renamed_fields(fixture, "Fixture"),
+        serialized_field_names(fixture, "Fixture"),
         BTreeSet::from(["implicit".to_owned(), "optional".to_owned()])
     );
 }
 
 #[test]
-fn representative_palette_fixtures_meet_the_rust_contract() {
+fn representative_palettes_generate_valid_themes() {
     let fixtures: Value =
         serde_json::from_str(include_str!("fixtures/resolved-palettes.json")).unwrap();
     assert_eq!(fixtures["version"].as_u64(), Some(1));
@@ -344,7 +344,7 @@ fn representative_palette_fixtures_meet_the_rust_contract() {
     assert_eq!(palettes.len(), expected_names.len());
     let mut actual_names = BTreeSet::new();
     for fixture in palettes {
-        let (name, palette) = fixture_palette(fixture);
+        let (name, palette) = parse_palette_fixture(fixture);
         let (document, audit) =
             build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
         let syntax = style(&document)["syntax"].as_object().unwrap();
@@ -366,7 +366,7 @@ fn representative_palette_fixtures_meet_the_rust_contract() {
 #[test]
 #[ignore = "requires the pinned Zed source checkout"]
 fn pinned_zed_color_schema_matches_the_manifest() {
-    let root = required_path("OMARCHY_ZED_THEME_ZED_SOURCE");
+    let root = required_env_path("OMARCHY_ZED_THEME_ZED_SOURCE");
     let source_path = root.join("crates/settings_content/src/theme.rs");
     let source = fs::read_to_string(&source_path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", source_path.display()));
@@ -381,7 +381,7 @@ fn pinned_zed_color_schema_matches_the_manifest() {
         .map(|field| (*field).to_owned())
         .collect();
     assert_eq!(
-        renamed_fields(&source, "ThemeColorsContent"),
+        serialized_field_names(&source, "ThemeColorsContent"),
         expected_colors
     );
 
@@ -396,7 +396,7 @@ fn pinned_zed_color_schema_matches_the_manifest() {
         })
         .collect();
     assert_eq!(
-        renamed_fields(&source, "StatusColorsContent"),
+        serialized_field_names(&source, "StatusColorsContent"),
         expected_status
     );
 }
@@ -431,8 +431,8 @@ fn syntax_profile_does_not_reassign_diff_source_families() {
     let (authored_document, authored_audit) = build_theme(&authored).unwrap();
     let (neutral_document, neutral_audit) = build_theme(&neutral_profile).unwrap();
     assert_ne!(
-        authored_audit.syntax_policy["profile"]["target_families"],
-        neutral_audit.syntax_policy["profile"]["target_families"]
+        authored_audit.syntax_analysis["profile"]["requested_family_count"],
+        neutral_audit.syntax_analysis["profile"]["requested_family_count"]
     );
 
     let authored_syntax = style(&authored_document)["syntax"].as_object().unwrap();
@@ -444,7 +444,7 @@ fn syntax_profile_does_not_reassign_diff_source_families() {
         );
     }
 
-    let diff_audit = &authored_audit.syntax_policy["diff"];
+    let diff_audit = &authored_audit.syntax_analysis["diff"];
     assert_eq!(diff_audit["profile_budgeted"].as_bool(), Some(false));
     assert_eq!(diff_audit["added_source_key"].as_str(), Some("green"));
     assert_eq!(diff_audit["deleted_source_key"].as_str(), Some("red"));
@@ -471,7 +471,7 @@ fn syntax_profile_does_not_reassign_diff_source_families() {
 #[test]
 fn narrow_olive_palette_uses_scaffold_and_generates() {
     let (_, audit) = build_theme(&venice_like_palette()).unwrap();
-    let allocations = audit.syntax_policy["saliency"]["allocations"]
+    let allocations = audit.syntax_analysis["saliency"]["allocations"]
         .as_array()
         .unwrap();
     assert!(
@@ -808,9 +808,9 @@ fn atomic_writer_rejects_final_symlink() {
 
 #[test]
 #[ignore = "requires the pinned Omarchy source checkout"]
-fn all_builtin_themes_meet_the_rust_contract() {
-    let root = required_path("OMARCHY_THEMES_DIR");
-    let resolver = required_path("OMARCHY_ZED_THEME_COLOR");
+fn pinned_builtin_themes_generate_valid_themes() {
+    let root = required_env_path("OMARCHY_THEMES_DIR");
+    let resolver = required_env_path("OMARCHY_ZED_THEME_COLOR_RESOLVER");
     assert!(root.is_dir(), "configured Omarchy theme root is missing");
     assert!(resolver.is_file(), "configured resolver is missing");
 
@@ -853,28 +853,28 @@ fn all_builtin_themes_meet_the_rust_contract() {
         let (document, audit) =
             build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
 
-        let profile = &audit.syntax_policy["profile"];
+        let profile = &audit.syntax_analysis["profile"];
         profile_summary.insert(
             name,
             (
                 profile["scores"]["authored_breadth"].as_f64().unwrap(),
                 profile["scores"]["authored_intensity"].as_f64().unwrap(),
                 profile["baseline_kind"].as_str().unwrap().to_owned(),
-                profile["target_families"].as_u64().unwrap(),
+                profile["requested_family_count"].as_u64().unwrap(),
             ),
         );
-        let family_count = audit.syntax_policy["merge_plan"]["family_count"]
+        let family_count = audit.syntax_analysis["merge_plan"]["family_count"]
             .as_u64()
             .unwrap();
-        let requested_family_count = profile["target_families"].as_u64().unwrap();
+        let requested_family_count = profile["requested_family_count"].as_u64().unwrap();
         assert!(family_count <= requested_family_count, "{name}");
         assert_eq!(
-            audit.syntax_policy["merge_plan"]["requested_family_count"].as_u64(),
+            audit.syntax_analysis["merge_plan"]["requested_family_count"].as_u64(),
             Some(requested_family_count),
             "{name}"
         );
         assert!((4..=8).contains(&family_count), "{name}");
-        let family_colors = audit.syntax_policy["saliency"]["ordinary_pair_metrics"]["colors"]
+        let family_colors = audit.syntax_analysis["saliency"]["ordinary_pair_metrics"]["colors"]
             .as_array()
             .unwrap();
         assert_eq!(family_colors.len(), family_count as usize, "{name}");
@@ -936,7 +936,7 @@ fn all_builtin_themes_meet_the_rust_contract() {
             "{name}"
         );
         assert_eq!(
-            audit.syntax_policy["saliency"]["measured_order_verified"].as_bool(),
+            audit.syntax_analysis["saliency"]["measured_order_verified"].as_bool(),
             Some(true),
             "{name}"
         );
@@ -1035,7 +1035,7 @@ fn all_builtin_themes_meet_the_rust_contract() {
                 "{name} inflated the neutral chroma envelope"
             );
             assert!(
-                audit.syntax_policy["saliency"]["allocations"]
+                audit.syntax_analysis["saliency"]["allocations"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1054,7 +1054,7 @@ fn all_builtin_themes_meet_the_rust_contract() {
         }
 
         assert!(
-            audit.syntax_policy["saliency"]["allocations"]
+            audit.syntax_analysis["saliency"]["allocations"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -1091,9 +1091,9 @@ fn all_builtin_themes_meet_the_rust_contract() {
 
 #[test]
 #[ignore = "requires the pinned external theme corpus"]
-fn pinned_external_corpus_meets_the_rust_contract() {
-    let root = required_path("OMARCHY_ZED_THEME_EXTERNAL_CORPUS");
-    let resolver = required_path("OMARCHY_ZED_THEME_COLOR");
+fn pinned_external_themes_generate_valid_themes() {
+    let root = required_env_path("OMARCHY_ZED_THEME_EXTERNAL_CORPUS");
+    let resolver = required_env_path("OMARCHY_ZED_THEME_COLOR_RESOLVER");
     let manifest = include_str!("external-corpus.tsv");
     let mut tested = 0;
     let mut errors = Vec::new();

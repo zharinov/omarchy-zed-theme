@@ -158,7 +158,7 @@ impl PairConstraints {
 }
 
 #[derive(Clone, Copy)]
-pub struct FillRequest<'a> {
+pub struct OverlayFitRequest<'a> {
     pub backgrounds: &'a [String],
     pub target: f64,
     pub minimum_delta_e: f64,
@@ -168,7 +168,7 @@ pub struct FillRequest<'a> {
     pub runtime_rendered_references: &'a [(String, f64, f64, f64)],
 }
 
-impl<'a> FillRequest<'a> {
+impl<'a> OverlayFitRequest<'a> {
     pub const fn new(backgrounds: &'a [String], target: f64, minimum_delta_e: f64) -> Self {
         Self {
             backgrounds,
@@ -217,8 +217,8 @@ impl<'a> FillRequest<'a> {
 }
 
 pub struct OverlayPairRequest<'a> {
-    pub first: FillRequest<'a>,
-    pub second: FillRequest<'a>,
+    pub first: OverlayFitRequest<'a>,
+    pub second: OverlayFitRequest<'a>,
     pub constraints: PairConstraints,
     pub maximum_alpha: u8,
     pub frontier_limit: usize,
@@ -226,8 +226,8 @@ pub struct OverlayPairRequest<'a> {
 
 impl<'a> OverlayPairRequest<'a> {
     pub const fn new(
-        first: FillRequest<'a>,
-        second: FillRequest<'a>,
+        first: OverlayFitRequest<'a>,
+        second: OverlayFitRequest<'a>,
         constraints: PairConstraints,
     ) -> Self {
         Self {
@@ -360,7 +360,7 @@ impl PreparedFill {
         values
     }
 
-    fn new(request: FillRequest<'_>) -> Result<Self> {
+    fn new(request: OverlayFitRequest<'_>) -> Result<Self> {
         let backgrounds = request
             .backgrounds
             .iter()
@@ -1188,23 +1188,27 @@ impl Search {
         })
     }
 
-    pub fn fit_fill_readable(&mut self, seed: &str, request: FillRequest<'_>) -> Result<String> {
-        self.fit_fill_readable_bounded(seed, request, OVERLAY_MAX_ALPHA)
-    }
-
-    pub fn fit_fill_readable_bounded(
+    pub fn fit_readable_overlay(
         &mut self,
         seed: &str,
-        request: FillRequest<'_>,
+        request: OverlayFitRequest<'_>,
+    ) -> Result<String> {
+        self.fit_readable_overlay_bounded(seed, request, OVERLAY_MAX_ALPHA)
+    }
+
+    pub fn fit_readable_overlay_bounded(
+        &mut self,
+        seed: &str,
+        request: OverlayFitRequest<'_>,
         maximum_alpha: u8,
     ) -> Result<String> {
-        self.fit_fill_readable_alpha_range(seed, request, 1, maximum_alpha)
+        self.fit_readable_overlay_alpha_range(seed, request, 1, maximum_alpha)
     }
 
-    pub fn fit_fill_readable_alpha_range(
+    pub fn fit_readable_overlay_alpha_range(
         &mut self,
         seed: &str,
-        request: FillRequest<'_>,
+        request: OverlayFitRequest<'_>,
         minimum_alpha: u8,
         maximum_alpha: u8,
     ) -> Result<String> {
@@ -1246,10 +1250,10 @@ impl Search {
             .ok_or_else(|| Error(format!("no candidate for fill {seed}")))
     }
 
-    pub fn fit_exact_fill_readable(
+    pub fn fit_exact_readable_overlay(
         &self,
         seed: &str,
-        request: FillRequest<'_>,
+        request: OverlayFitRequest<'_>,
     ) -> Result<Option<String>> {
         let prepared = PreparedFill::new(request)?;
         let metrics = ColorMetrics::from_hex(seed)?;
@@ -1263,8 +1267,8 @@ impl Search {
         &mut self,
         first_seed: &str,
         second_seed: &str,
-        first_request: FillRequest<'_>,
-        second_request: FillRequest<'_>,
+        first_request: OverlayFitRequest<'_>,
+        second_request: OverlayFitRequest<'_>,
         maximum_alpha: u8,
     ) -> Result<PreparedOverlayPair> {
         let first = PreparedFill::new(first_request)?;
@@ -2035,8 +2039,8 @@ mod tests {
         let backgrounds = vec!["#16181d".to_owned(), "#242730".to_owned()];
         let request = || {
             OverlayPairRequest::new(
-                FillRequest::new(&backgrounds, 1.10, 0.025),
-                FillRequest::new(&backgrounds, 1.10, 0.025),
+                OverlayFitRequest::new(&backgrounds, 1.10, 0.025),
+                OverlayFitRequest::new(&backgrounds, 1.10, 0.025),
                 PairConstraints::new(1.10, 1.01, 0.030, 0.020).prefer_background(),
             )
             .with_limits(198, 512)
@@ -2071,8 +2075,8 @@ mod tests {
         let constraints = PairConstraints::new(1.10, 1.01, 0.030, 0.020).prefer_background();
         let request = |constraints| {
             OverlayPairRequest::new(
-                FillRequest::new(&backgrounds, 1.10, 0.025),
-                FillRequest::new(&backgrounds, 1.10, 0.025),
+                OverlayFitRequest::new(&backgrounds, 1.10, 0.025),
+                OverlayFitRequest::new(&backgrounds, 1.10, 0.025),
                 constraints,
             )
             .with_limits(198, 128)

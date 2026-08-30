@@ -6,7 +6,6 @@ pub mod saliency;
 pub mod search;
 pub mod syntax;
 pub mod theme;
-mod theme_tokens;
 pub mod zed_settings;
 
 use std::fmt;

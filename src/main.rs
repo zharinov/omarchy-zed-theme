@@ -1,4 +1,4 @@
-use omarchy_zed_theme::publish::{Generation, generate};
+use omarchy_zed_theme::publish::{ThemeUpdate, generate_and_publish};
 use omarchy_zed_theme::zed_settings;
 use omarchy_zed_theme::{Error, Result};
 use std::path::{Path, PathBuf};
@@ -16,35 +16,35 @@ fn current_paths(home: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
-fn print_generation(generation: Generation) {
+fn print_update(update: ThemeUpdate) {
     println!(
         "{}: {}",
-        if generation.changed {
+        if update.changed {
             "generated"
         } else {
             "unchanged"
         },
-        generation.target.display()
+        update.target.display()
     );
 
     eprintln!(
         "audit: mode={} repairs={} extras={} degradations={} syntax_min={:.2} terminal_min={:.2}",
-        generation.audit.mode,
-        generation.audit.repairs.len(),
-        generation.audit.extras.len(),
-        generation.audit.degradations.len(),
-        generation.audit.minimums.get("syntax").unwrap_or(&0.0),
-        generation.audit.minimums.get("terminal").unwrap_or(&0.0),
+        update.audit.mode,
+        update.audit.repairs.len(),
+        update.audit.extras.len(),
+        update.audit.degradations.len(),
+        update.audit.minimums.get("syntax").unwrap_or(&0.0),
+        update.audit.minimums.get("terminal").unwrap_or(&0.0),
     );
     if std::env::var("OMARCHY_ZED_THEME_AUDIT").as_deref() == Ok("1") {
-        eprintln!("audit-detail: {}", generation.audit.detail());
+        eprintln!("audit-detail: {}", update.audit.detail());
     }
 
-    for warning in generation.audit.warnings {
+    for warning in update.audit.warnings {
         eprintln!("omarchy-zed-theme: resolver warning: {warning}");
     }
 
-    for degradation in generation.audit.degradations {
+    for degradation in update.audit.degradations {
         eprintln!("omarchy-zed-theme: degradation: {degradation}");
     }
 }
@@ -52,9 +52,9 @@ fn print_generation(generation: Generation) {
 fn sync() -> Result<()> {
     let home = home()?;
     let (colors, output) = current_paths(&home);
-    let generation = generate(&colors, Some(&output), None, None)?;
+    let update = generate_and_publish(&colors, Some(&output), None, None)?;
 
-    print_generation(generation);
+    print_update(update);
     Ok(())
 }
 

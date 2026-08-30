@@ -40,10 +40,10 @@ checkout_at() {
   git -C "$checkout" fetch --quiet --depth=1 --filter=blob:none origin "$commit"
   git -C "$checkout" checkout --quiet --detach FETCH_HEAD
 
-  local actual
-  actual=$(git -C "$checkout" rev-parse HEAD)
-  if [[ $actual != "$commit" ]]; then
-    echo "$name: expected $commit, checked out $actual" >&2
+  local actual_commit
+  actual_commit=$(git -C "$checkout" rev-parse HEAD)
+  if [[ $actual_commit != "$commit" ]]; then
+    echo "$name: expected $commit, checked out $actual_commit" >&2
     exit 1
   fi
 }
@@ -67,24 +67,24 @@ while IFS=$'\t' read -r name repository commit; do
   esac
 done < "$repository_root/tests/upstream-repositories.tsv"
 
-while IFS=$'\t' read -r name repository commit palette; do
+while IFS=$'\t' read -r name repository commit palette_path; do
   [[ -z $name || $name == \#* ]] && continue
 
-  if [[ $palette == */* ]]; then
-    light_mode="${palette%/*}/light.mode"
+  if [[ $palette_path == */* ]]; then
+    light_mode_path="${palette_path%/*}/light.mode"
   else
-    light_mode="light.mode"
+    light_mode_path="light.mode"
   fi
   checkout_at "$name" "$repository" "$commit" "$destination/external/$name" \
-    "/$palette" "/$light_mode"
+    "/$palette_path" "/$light_mode_path"
 
-  if [[ ! -f $destination/external/$name/$palette ]]; then
-    echo "$name: missing palette $palette" >&2
+  if [[ ! -f $destination/external/$name/$palette_path ]]; then
+    echo "$name: missing palette $palette_path" >&2
     exit 1
   fi
 done < "$repository_root/tests/external-corpus.tsv"
 
 printf 'OMARCHY_THEMES_DIR=%s\n' "$destination/upstream/omarchy/themes"
-printf 'OMARCHY_ZED_THEME_COLOR=%s\n' "$destination/upstream/omarchy/bin/omarchy-theme-color"
+printf 'OMARCHY_ZED_THEME_COLOR_RESOLVER=%s\n' "$destination/upstream/omarchy/bin/omarchy-theme-color"
 printf 'OMARCHY_ZED_THEME_EXTERNAL_CORPUS=%s\n' "$destination/external"
 printf 'OMARCHY_ZED_THEME_ZED_SOURCE=%s\n' "$destination/upstream/zed"

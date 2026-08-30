@@ -56,7 +56,7 @@ jobs:
           test "$package_version" = "$plugin_version"
           test -f "$(jq -r '.entryPoints.service' manifest.json)"
 
-  upstream-integration:
+  pinned-integration:
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -72,13 +72,13 @@ jobs:
         with:
           cache-all-crates: "true"
           cache-on-failure: "true"
-          prefix-key: v0-rust-upstream-integration
+          prefix-key: v0-rust-pinned-integration
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Provision pinned upstream inputs
+      - name: Provision pinned test inputs
         run: |
-          inputs=$(mktemp -d "$RUNNER_TEMP/omazed-test-inputs.XXXXXX")
+          inputs=$(mktemp -d "$RUNNER_TEMP/omarchy-zed-theme-test-inputs.XXXXXX")
           scripts/prepare-test-inputs "$inputs" >> "$GITHUB_ENV"
 
-      - name: Test pinned upstream inputs
+      - name: Run pinned integration tests
         run: cargo test --test core --all-features --locked -- --ignored --nocapture
