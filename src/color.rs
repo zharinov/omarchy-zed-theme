@@ -99,7 +99,7 @@ impl Rgb24 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Rgba32(u32);
 
 impl Rgba32 {
@@ -125,7 +125,7 @@ impl Rgba32 {
         }
     }
 
-    fn rgb24(self) -> Rgb24 {
+    pub(crate) fn rgb24(self) -> Rgb24 {
         Rgb24(self.0 >> 8)
     }
 
@@ -135,6 +135,10 @@ impl Rgba32 {
         } else {
             format!("#{:08x}", self.0)
         }
+    }
+
+    pub(crate) fn alpha(self) -> u8 {
+        self.0 as u8
     }
 
     pub(crate) fn hex_cmp(self, other: Self) -> std::cmp::Ordering {
@@ -555,6 +559,14 @@ pub fn gpui_blend(base: &str, overlay: &str) -> Result<Rgba> {
         b: base.b * (1.0 - overlay.a) + overlay.b * overlay.a,
         a: base.a,
     })
+}
+
+pub fn render_layers(base: &str, overlays: &[&str]) -> Result<String> {
+    overlays
+        .iter()
+        .try_fold(base.to_owned(), |rendered, overlay| {
+            Ok(gpui_blend(&rendered, overlay)?.opaque_hex())
+        })
 }
 
 pub fn with_alpha(value: &str, alpha: f64) -> Result<String> {

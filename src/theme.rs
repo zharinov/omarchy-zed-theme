@@ -5,7 +5,7 @@
 
 use crate::color::{
     apply_opacity, contrast_ratio, delta_e, gamut_map_oklch, gpui_blend, lab, lightness,
-    oklab_to_oklch, tone,
+    oklab_to_oklch, render_layers, tone,
 };
 use crate::constants::*;
 use crate::palette::ResolvedPalette;
@@ -13,7 +13,9 @@ use crate::saliency::{
     HOVER_LINE_NUMBER_SALIENCY, INACTIVE_LINE_NUMBER_SALIENCY, PRIMARY_SALIENCY, SaliencyRequest,
     fit_relative,
 };
-use crate::search::{FillRequest, FitBounds, PairConstraints, Search, cvd_greedy_order, round6};
+use crate::search::{
+    FillRequest, FitBounds, OverlayPairRequest, PairConstraints, Search, cvd_greedy_order, round6,
+};
 use crate::syntax::{build_syntax, contrast_floor};
 use crate::{Error, Result};
 use serde_json::{Map, Value, json};
@@ -100,6 +102,72 @@ fn unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .into_iter()
         .filter(|value| seen.insert(value.clone()))
         .collect()
+}
+
+fn render_on_bases(bases: &[String], overlays: &[&str]) -> Result<Vec<String>> {
+    bases
+        .iter()
+        .map(|base| render_layers(base, overlays))
+        .collect()
+}
+
+fn render_with_bounded_generic_highlights(
+    bases: &[String],
+    highlights: &[&str],
+) -> Result<Vec<String>> {
+    // Zed permits several unordered generic highlights. Depth one is the largest
+    // bounded stage for which every built-in palette can preserve all text contracts.
+    let mut scenes = bases.to_vec();
+    for first in highlights {
+        scenes.extend(render_on_bases(bases, &[*first])?);
+    }
+    Ok(scenes)
+}
+
+struct OpaqueRole(&'static str);
+struct OverlayRole(&'static str);
+struct StrokeRole(&'static str);
+
+#[derive(Default)]
+struct StyleBuilder(BTreeMap<String, String>);
+
+impl StyleBuilder {
+    fn set_opaque(&mut self, role: OpaqueRole, color: String) -> Result<()> {
+        if crate::color::parse_hex(&color)?.a < 1.0 {
+            return Err(Error(format!(
+                "opaque role {} received translucent color {color}",
+                role.0
+            )));
+        }
+        self.0.insert(role.0.into(), color);
+        Ok(())
+    }
+
+    fn set_overlay(&mut self, role: OverlayRole, color: String) -> Result<()> {
+        if crate::color::parse_hex(&color)?.a >= 1.0 {
+            return Err(Error(format!(
+                "layered overlay role {} received opaque color {color}",
+                role.0
+            )));
+        }
+        self.0.insert(role.0.into(), color);
+        Ok(())
+    }
+
+    fn set_stroke(&mut self, role: StrokeRole, color: String) -> Result<()> {
+        if crate::color::parse_hex(&color)?.a >= 1.0 {
+            return Err(Error(format!(
+                "layered stroke role {} received opaque color {color}",
+                role.0
+            )));
+        }
+        self.0.insert(role.0.into(), color);
+        Ok(())
+    }
+
+    fn into_inner(self) -> BTreeMap<String, String> {
+        self.0
+    }
 }
 
 fn derive_surfaces(
@@ -858,69 +926,84 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             "911-theme active median",
         ),
     ]);
+    let readable_editor_overlay_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
     let search_match = search
-        .fit_state(
+        .fit_fill_readable_bounded(
             &semantic.yellow,
-            std::slice::from_ref(&canvas),
-            SEARCH_MATCH_CONTRAST,
-            STATE_HOVER_DELTA_E,
-            &[(
-                editor_primary.clone(),
-                EDITOR_OVERLAY_TEXT_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )],
+            FillRequest {
+                backgrounds: &editor_bases,
+                target: SEARCH_MATCH_CONTRAST,
+                minimum_delta_e: STATE_HOVER_DELTA_E,
+                runtime_state: None,
+                readable_foregrounds: &readable_editor_overlay_text,
+                rendered_references: &[],
+                runtime_rendered_references: &[],
+            },
+            PRESERVING_HIGHLIGHT_MAX_ALPHA,
         )
         .map_err(|error| Error(format!("search match: {error}")))?;
     let search_active = search
-        .fit_state(
+        .fit_fill_readable_bounded(
             &semantic.accent,
-            std::slice::from_ref(&canvas),
-            SEARCH_ACTIVE_CONTRAST,
-            STATE_SELECTED_DELTA_E,
-            &[(
-                editor_primary.clone(),
-                EDITOR_OVERLAY_TEXT_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )],
+            FillRequest {
+                backgrounds: &editor_bases,
+                target: SEARCH_ACTIVE_CONTRAST,
+                minimum_delta_e: STATE_SELECTED_DELTA_E,
+                runtime_state: None,
+                readable_foregrounds: &readable_editor_overlay_text,
+                rendered_references: &[(
+                    search_match.clone(),
+                    STATE_CONSECUTIVE_CONTRAST,
+                    STATE_CONSECUTIVE_DELTA_E,
+                )],
+                runtime_rendered_references: &[],
+            },
+            PRESERVING_HIGHLIGHT_MAX_ALPHA,
         )
         .map_err(|error| Error(format!("active search match: {error}")))?;
     let document_read = search
-        .fit_state(
+        .fit_fill_readable_bounded(
             &semantic.accent,
-            std::slice::from_ref(&canvas),
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
-            &[(
-                editor_primary.clone(),
-                EDITOR_OVERLAY_TEXT_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )],
+            FillRequest {
+                backgrounds: &editor_bases,
+                target: STATE_SELECTED_CONTRAST,
+                minimum_delta_e: STATE_SELECTED_DELTA_E,
+                runtime_state: None,
+                readable_foregrounds: &readable_editor_overlay_text,
+                rendered_references: &[],
+                runtime_rendered_references: &[],
+            },
+            PRESERVING_HIGHLIGHT_MAX_ALPHA,
         )
         .map_err(|error| Error(format!("document read highlight: {error}")))?;
     let document_write = search
-        .fit_state(
+        .fit_fill_readable_bounded(
             &semantic.orange,
-            std::slice::from_ref(&canvas),
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
-            &[(
-                editor_primary.clone(),
-                EDITOR_OVERLAY_TEXT_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )],
+            FillRequest {
+                backgrounds: &editor_bases,
+                target: STATE_SELECTED_CONTRAST,
+                minimum_delta_e: STATE_SELECTED_DELTA_E,
+                runtime_state: None,
+                readable_foregrounds: &readable_editor_overlay_text,
+                rendered_references: &[],
+                runtime_rendered_references: &[],
+            },
+            PRESERVING_HIGHLIGHT_MAX_ALPHA,
         )
         .map_err(|error| Error(format!("document write highlight: {error}")))?;
     let document_bracket = search
-        .fit_state(
+        .fit_fill_readable_bounded(
             &semantic.cyan,
-            std::slice::from_ref(&canvas),
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
-            &[(
-                editor_primary.clone(),
-                EDITOR_OVERLAY_TEXT_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )],
+            FillRequest {
+                backgrounds: &editor_bases,
+                target: STATE_SELECTED_CONTRAST,
+                minimum_delta_e: STATE_SELECTED_DELTA_E,
+                runtime_state: None,
+                readable_foregrounds: &readable_editor_overlay_text,
+                rendered_references: &[],
+                runtime_rendered_references: &[],
+            },
+            PRESERVING_HIGHLIGHT_MAX_ALPHA,
         )
         .map_err(|error| Error(format!("document bracket highlight: {error}")))?;
 
@@ -971,99 +1054,265 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         prefer_background: true,
     };
     let readable_diff_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
+    let diff_fill_request = |backgrounds| FillRequest {
+        backgrounds,
+        target: DIFF_FILL_CONTRAST,
+        minimum_delta_e: DIFF_NORMAL_FLOOR_DELTA_E,
+        runtime_state: None,
+        readable_foregrounds: &readable_diff_text,
+        rendered_references: &[],
+        runtime_rendered_references: &[],
+    };
     let [diff_added, diff_deleted] = search
-        .fit_pair_on_backgrounds_readable(
+        .fit_overlay_pair(
             &diff_green_seed,
-            &editor_bases,
             &diff_red_seed,
-            &editor_bases,
-            diff_constraints,
-            &readable_diff_text,
+            OverlayPairRequest {
+                first: diff_fill_request(&editor_bases),
+                second: diff_fill_request(&editor_bases),
+                constraints: diff_constraints,
+                maximum_alpha: OVERLAY_MAX_ALPHA,
+                frontier_limit: 512,
+            },
         )
         .map_err(|error| Error(format!("solid diff hunks: {error}")))?;
     let [diff_added_hollow, diff_deleted_hollow] = search
-        .fit_pair_on_backgrounds_readable(
+        .fit_overlay_pair(
             &diff_green_seed,
-            &editor_bases,
             &diff_red_seed,
-            &editor_bases,
-            PairConstraints {
-                foreground_contrast: DIFF_HOLLOW_CONTRAST,
-                ..diff_constraints
+            OverlayPairRequest {
+                first: FillRequest {
+                    target: DIFF_HOLLOW_CONTRAST,
+                    ..diff_fill_request(&editor_bases)
+                },
+                second: FillRequest {
+                    target: DIFF_HOLLOW_CONTRAST,
+                    ..diff_fill_request(&editor_bases)
+                },
+                constraints: PairConstraints {
+                    foreground_contrast: DIFF_HOLLOW_CONTRAST,
+                    ..diff_constraints
+                },
+                maximum_alpha: OVERLAY_MAX_ALPHA,
+                frontier_limit: 512,
             },
-            &readable_diff_text,
         )
         .map_err(|error| Error(format!("hollow diff hunks: {error}")))?;
-    let [word_added, word_deleted] = search
-        .fit_pair_on_backgrounds_readable(
+    let added_hunk_scenes = render_on_bases(&editor_bases, &[&diff_added])?;
+    let deleted_hunk_scenes = render_on_bases(&editor_bases, &[&diff_deleted])?;
+    let added_hollow_scenes = render_on_bases(&editor_bases, &[&diff_added_hollow])?;
+    let deleted_hollow_scenes = render_on_bases(&editor_bases, &[&diff_deleted_hollow])?;
+    let border_request = |backgrounds| FillRequest {
+        backgrounds,
+        target: CONTROL_CONTRAST,
+        minimum_delta_e: STATE_HOVER_DELTA_E,
+        runtime_state: None,
+        readable_foregrounds: &[],
+        rendered_references: &[],
+        runtime_rendered_references: &[],
+    };
+    let [diff_added_hollow_border, diff_deleted_hollow_border] = search
+        .fit_overlay_pair(
             &diff_green_seed,
-            std::slice::from_ref(&diff_added),
             &diff_red_seed,
-            std::slice::from_ref(&diff_deleted),
-            PairConstraints {
-                foreground_contrast: DIFF_FILL_CONTRAST,
-                ..diff_constraints
+            OverlayPairRequest {
+                first: border_request(&added_hollow_scenes),
+                second: border_request(&deleted_hollow_scenes),
+                constraints: PairConstraints {
+                    foreground_contrast: CONTROL_CONTRAST,
+                    ..diff_constraints
+                },
+                maximum_alpha: OVERLAY_MAX_ALPHA,
+                frontier_limit: 512,
             },
-            &readable_diff_text,
         )
-        .map_err(|error| Error(format!("word diff backgrounds: {error}")))?;
+        .map_err(|error| Error(format!("diff hollow borders: {error}")))?;
     let [conflict_ours, conflict_theirs] = search
-        .fit_pair_on_backgrounds_readable(
+        .fit_overlay_pair(
+            &diff_green_seed,
             color(palette, "blue"),
-            &editor_bases,
-            color(palette, "magenta"),
-            &editor_bases,
-            PairConstraints {
-                foreground_contrast: DIFF_FILL_CONTRAST,
-                minimum_chroma: 0.0,
-                ..diff_constraints
+            OverlayPairRequest {
+                first: diff_fill_request(&editor_bases),
+                second: diff_fill_request(&editor_bases),
+                constraints: PairConstraints {
+                    foreground_contrast: DIFF_FILL_CONTRAST,
+                    minimum_chroma: 0.0,
+                    ..diff_constraints
+                },
+                maximum_alpha: OVERLAY_MAX_ALPHA,
+                frontier_limit: 512,
             },
-            &readable_diff_text,
         )
         .map_err(|error| Error(format!("conflict backgrounds: {error}")))?;
     let yank = search
-        .fit_state(
+        .fit_fill_readable_bounded(
             &semantic.yellow,
-            std::slice::from_ref(&canvas),
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
-            &[(
-                editor_primary.clone(),
-                EDITOR_OVERLAY_TEXT_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )],
-        )
-        .map_err(|error| Error(format!("Vim yank highlight: {error}")))?;
-    let editor_text_backgrounds = unique(editor_bases.iter().cloned().chain([
-        search_match.clone(),
-        search_active.clone(),
-        document_read.clone(),
-        document_write.clone(),
-        document_bracket.clone(),
-        yank.clone(),
-        diff_added.clone(),
-        diff_added_hollow.clone(),
-        diff_deleted.clone(),
-        diff_deleted_hollow.clone(),
-        word_added.clone(),
-        word_deleted.clone(),
-        conflict_ours.clone(),
-        conflict_theirs.clone(),
-    ]));
-    let selection = search
-        .fit_fill_readable(
-            color(palette, "selection"),
             FillRequest {
-                backgrounds: &editor_text_backgrounds,
-                target: FOCUSED_SELECTION_CONTRAST,
-                minimum_delta_e: FOCUSED_SELECTION_DELTA_E,
-                runtime_state: Some((0.5, 1.08, 0.020)),
-                readable_foregrounds: &[(editor_primary.clone(), TEXT_CONTRAST)],
+                backgrounds: &editor_bases,
+                target: STATE_SELECTED_CONTRAST,
+                minimum_delta_e: STATE_SELECTED_DELTA_E,
+                runtime_state: None,
+                readable_foregrounds: &readable_editor_overlay_text,
                 rendered_references: &[],
                 runtime_rendered_references: &[],
             },
+            PRESERVING_HIGHLIGHT_MAX_ALPHA,
         )
-        .map_err(|error| Error(format!("focused selection: {error}")))?;
+        .map_err(|error| Error(format!("Vim yank highlight: {error}")))?;
+    let generic_highlights = [
+        search_match.as_str(),
+        search_active.as_str(),
+        document_read.as_str(),
+        document_write.as_str(),
+        document_bracket.as_str(),
+        yank.as_str(),
+    ];
+    audit.degradation(
+        "editor.generic_highlight_stack".into(),
+        "bounded_overlap_depth",
+        json!({
+            "validated_generic_highlight_depth": 1,
+            "reason": "Zed permits multiple unordered highlights, but deeper stacks cannot preserve every palette's text contract"
+        }),
+    );
+    let word_added_bases = added_hunk_scenes
+        .iter()
+        .cloned()
+        .chain(added_hollow_scenes.iter().cloned())
+        .collect::<Vec<_>>();
+    let word_deleted_bases = deleted_hunk_scenes
+        .iter()
+        .cloned()
+        .chain(deleted_hollow_scenes.iter().cloned())
+        .collect::<Vec<_>>();
+    let word_added_underlays =
+        render_with_bounded_generic_highlights(&word_added_bases, &generic_highlights)?;
+    let word_deleted_underlays =
+        render_with_bounded_generic_highlights(&word_deleted_bases, &generic_highlights)?;
+    let readable_word_text = [(editor_primary.clone(), WORD_TEXT_CONTRAST)];
+    let word_request = |backgrounds| FillRequest {
+        backgrounds,
+        target: WORD_DIFF_CONTRAST,
+        minimum_delta_e: STATE_HOVER_DELTA_E,
+        runtime_state: None,
+        readable_foregrounds: &readable_word_text,
+        rendered_references: &[],
+        runtime_rendered_references: &[],
+    };
+    let word_pair = search
+        .fit_overlay_pair_with_fallback(
+            &diff_green_seed,
+            &diff_red_seed,
+            OverlayPairRequest {
+                first: word_request(&word_added_underlays),
+                second: word_request(&word_deleted_underlays),
+                constraints: PairConstraints {
+                    foreground_contrast: WORD_DIFF_CONTRAST,
+                    minimum_chroma: 0.0,
+                    ..diff_constraints
+                },
+                maximum_alpha: WORD_OVERLAY_MAX_ALPHA,
+                frontier_limit: 128,
+            },
+            PairConstraints {
+                foreground_contrast: WORD_DIFF_CONTRAST,
+                minimum_chroma: 0.0,
+                separation_alternative: None,
+                ..diff_constraints
+            },
+            512,
+        )
+        .map_err(|error| Error(format!("word diff backgrounds: {error}")))?;
+    if let Some(strong_error) = word_pair.strong_error {
+        audit.degradation(
+            "version_control.word_pair".into(),
+            "strong_rendered_separation",
+            json!({
+                "reason": strong_error,
+                "strong_frontier_limit": 128,
+                "weak_frontier_limit": 512,
+            }),
+        );
+    }
+    let [word_added, word_deleted] = word_pair.colors;
+    let rendered_editor_overlays = [
+        &search_match,
+        &search_active,
+        &document_read,
+        &document_write,
+        &document_bracket,
+        &yank,
+        &conflict_ours,
+        &conflict_theirs,
+    ]
+    .into_iter()
+    .map(|overlay| render_on_bases(&editor_bases, &[overlay]))
+    .collect::<Result<Vec<_>>>()?;
+    let rendered_editor_overlay_contexts = rendered_editor_overlays
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let word_added_scenes = render_on_bases(&word_added_underlays, &[&word_added])?;
+    let word_deleted_scenes = render_on_bases(&word_deleted_underlays, &[&word_deleted])?;
+    let base_overlay_backgrounds = unique(
+        editor_bases
+            .iter()
+            .cloned()
+            .chain(added_hunk_scenes.iter().cloned())
+            .chain(deleted_hunk_scenes.iter().cloned())
+            .chain(added_hollow_scenes.iter().cloned())
+            .chain(deleted_hollow_scenes.iter().cloned())
+            .chain(rendered_editor_overlay_contexts.iter().cloned()),
+    );
+    let editor_text_backgrounds = unique(
+        base_overlay_backgrounds
+            .iter()
+            .cloned()
+            .chain(word_added_scenes.iter().cloned())
+            .chain(word_deleted_scenes.iter().cloned()),
+    );
+    let selection_readable = [(editor_primary.clone(), TEXT_CONTRAST)];
+    let selection_request = || FillRequest {
+        backgrounds: &base_overlay_backgrounds,
+        target: FOCUSED_SELECTION_CONTRAST,
+        minimum_delta_e: FOCUSED_SELECTION_DELTA_E,
+        runtime_state: Some((0.5, 1.08, 0.020)),
+        readable_foregrounds: &selection_readable,
+        rendered_references: &[],
+        runtime_rendered_references: &[],
+    };
+    let selection = match search.fit_fill_readable_alpha_range(
+        color(palette, "selection"),
+        selection_request(),
+        u8::MAX,
+        u8::MAX,
+    ) {
+        Ok(selection) => selection,
+        Err(primary_error) => {
+            let fallback = search
+                .fit_fill_readable_alpha_range(
+                    &semantic.accent,
+                    selection_request(),
+                    u8::MAX,
+                    u8::MAX,
+                )
+                .map_err(|fallback_error| {
+                    Error(format!(
+                        "focused selection: {primary_error}; accent fallback: {fallback_error}"
+                    ))
+                })?;
+            audit.degradation(
+                "element.selection_background".into(),
+                "overlay_seed_substitution",
+                json!({
+                    "requested": color(palette, "selection"),
+                    "fallback": semantic.accent,
+                    "reason": primary_error.to_string(),
+                }),
+            );
+            fallback
+        }
+    };
     let player_seed_values = [
         semantic.accent.clone(),
         semantic.orange.clone(),
@@ -1098,7 +1347,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             .map(|selection| (selection.clone(), 1.0, PLAYER_SELECTION_DELTA_E))
             .collect::<Vec<_>>();
         let request = || FillRequest {
-            backgrounds: &editor_text_backgrounds,
+            backgrounds: &base_overlay_backgrounds,
             target: FOCUSED_SELECTION_CONTRAST,
             minimum_delta_e: FOCUSED_SELECTION_DELTA_E,
             runtime_state: Some((0.5, 1.08, 0.020)),
@@ -1106,9 +1355,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             rendered_references: &references,
             runtime_rendered_references: &[],
         };
-        let fitted = if let Some(exact) = search.fit_exact_fill_readable(cursor, request())? {
-            exact
-        } else if let Ok(fitted) = search.fit_fill_readable(cursor, request()) {
+        let fitted = if let Ok(fitted) =
+            search.fit_fill_readable_alpha_range(cursor, request(), u8::MAX, u8::MAX)
+        {
             fitted
         } else {
             audit.degradation(
@@ -1355,23 +1604,8 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         vim.insert(format!("vim.{name}.background"), background);
     }
 
-    let overlay_contexts = unique([
-        search_match.clone(),
-        search_active.clone(),
-        document_read.clone(),
-        document_write.clone(),
-        document_bracket.clone(),
-        diff_added.clone(),
-        diff_added_hollow.clone(),
-        diff_deleted.clone(),
-        diff_deleted_hollow.clone(),
-        word_added.clone(),
-        word_deleted.clone(),
-        conflict_ours.clone(),
-        conflict_theirs.clone(),
-        yank.clone(),
-    ]);
-    let focused_selections: Vec<_> = editor_bases
+    let overlay_contexts = editor_text_backgrounds.clone();
+    let focused_selections: Vec<_> = editor_text_backgrounds
         .iter()
         .flat_map(|base| {
             players
@@ -1379,23 +1613,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                 .map(|player| gpui_blend(base, &player["selection"]).unwrap().opaque_hex())
         })
         .collect();
-    let local_unfocused: Vec<_> = editor_bases
+    let local_unfocused: Vec<_> = editor_text_backgrounds
         .iter()
-        .chain(&overlay_contexts)
         .map(|base| {
             gpui_blend(base, &apply_opacity(&players[0]["selection"], 0.5).unwrap())
                 .unwrap()
                 .opaque_hex()
-        })
-        .collect();
-    let chained: Vec<_> = overlay_contexts
-        .iter()
-        .flat_map(|overlay| {
-            players.iter().map(|player| {
-                gpui_blend(overlay, &player["selection"])
-                    .unwrap()
-                    .opaque_hex()
-            })
         })
         .collect();
     let syntax_contexts = unique(
@@ -1404,8 +1627,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             .cloned()
             .chain(overlay_contexts.iter().cloned())
             .chain(focused_selections)
-            .chain(local_unfocused)
-            .chain(chained),
+            .chain(local_unfocused),
     );
 
     let syntax = build_syntax(
@@ -1439,43 +1661,98 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         "accents",
     )?;
 
-    let drop_target = search.fit_state(
+    let drop_target = search.fit_fill_readable_bounded(
         &semantic.accent,
-        std::slice::from_ref(&surface),
-        STATE_SELECTED_CONTRAST,
-        STATE_SELECTED_DELTA_E,
-        &[],
+        FillRequest {
+            backgrounds: std::slice::from_ref(&surface),
+            target: STATE_SELECTED_CONTRAST,
+            minimum_delta_e: STATE_SELECTED_DELTA_E,
+            runtime_state: None,
+            readable_foregrounds: &[],
+            rendered_references: &[],
+            runtime_rendered_references: &[],
+        },
+        OVERLAY_MAX_ALPHA,
     )?;
+    let rendered_drop_target = render_layers(&surface, &[&drop_target])?;
     let drop_target_border = search.fit_color(
         &semantic.accent,
-        &[surface.clone(), drop_target.clone()],
+        &[surface.clone(), rendered_drop_target],
         CONTROL_CONTRAST,
     )?;
     let thumb_contexts = unique([chrome.clone(), surface.clone(), canvas.clone()]);
-    let thumb_ladder = search.fit_state_ladder(
+    let thumb_base = search.fit_fill_readable_bounded(
         &semantic.primary,
-        &thumb_contexts,
-        &[
-            (CONTROL_CONTRAST, STATE_SELECTED_DELTA_E),
-            (THUMB_HOVER_CONTRAST, STATE_SELECTED_DELTA_E),
-            (THUMB_ACTIVE_CONTRAST, STATE_SELECTED_DELTA_E),
-        ],
-        &[],
+        FillRequest {
+            backgrounds: &thumb_contexts,
+            target: CONTROL_CONTRAST,
+            minimum_delta_e: STATE_SELECTED_DELTA_E,
+            runtime_state: None,
+            readable_foregrounds: &[],
+            rendered_references: &[],
+            runtime_rendered_references: &[],
+        },
+        OVERLAY_MAX_ALPHA,
     )?;
+    let thumb_hover = search.fit_fill_readable_bounded(
+        &semantic.primary,
+        FillRequest {
+            backgrounds: &thumb_contexts,
+            target: THUMB_HOVER_CONTRAST,
+            minimum_delta_e: STATE_SELECTED_DELTA_E,
+            runtime_state: None,
+            readable_foregrounds: &[],
+            rendered_references: &[(
+                thumb_base.clone(),
+                STATE_CONSECUTIVE_CONTRAST,
+                STATE_CONSECUTIVE_DELTA_E,
+            )],
+            runtime_rendered_references: &[],
+        },
+        OVERLAY_MAX_ALPHA,
+    )?;
+    let thumb_active = search.fit_fill_readable_bounded(
+        &semantic.primary,
+        FillRequest {
+            backgrounds: &thumb_contexts,
+            target: THUMB_ACTIVE_CONTRAST,
+            minimum_delta_e: STATE_SELECTED_DELTA_E,
+            runtime_state: None,
+            readable_foregrounds: &[],
+            rendered_references: &[(
+                thumb_hover.clone(),
+                STATE_CONSECUTIVE_CONTRAST,
+                STATE_CONSECUTIVE_DELTA_E,
+            )],
+            runtime_rendered_references: &[],
+        },
+        OVERLAY_MAX_ALPHA,
+    )?;
+    let thumb_ladder = [thumb_base, thumb_hover, thumb_active];
     let thumb_border = semantic.structural.clone();
     let track_border = search.fit_color(&semantic.passive, &thumb_contexts, PASSIVE_CONTRAST)?;
 
-    let mut fixed = BTreeMap::<String, String>::new();
+    let mut fixed = StyleBuilder::default();
     macro_rules! put {
         ($name:expr, $value:expr) => {
-            fixed.insert($name.into(), $value);
+            fixed.set_opaque(OpaqueRole($name), $value)?;
+        };
+    }
+    macro_rules! put_overlay {
+        ($name:expr, $value:expr) => {
+            fixed.set_overlay(OverlayRole($name), $value)?;
+        };
+    }
+    macro_rules! put_stroke {
+        ($name:expr, $value:expr) => {
+            fixed.set_stroke(StrokeRole($name), $value)?;
         };
     }
     put!("border", semantic.structural.clone());
     put!("border.variant", semantic.structural.clone());
     put!("border.focused", semantic.accent.clone());
     put!("border.selected", semantic.accent.clone());
-    put!(
+    put_overlay!(
         "border.transparent",
         apply_opacity(&semantic.structural, 0.0)?
     );
@@ -1484,17 +1761,17 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     put!("surface.background", surface.clone());
     put!("background", canvas.clone());
     put!("element.background", surface.clone());
-    put!("element.hover", element_hover);
-    put!("element.active", element_active);
-    put!("element.selected", element_selected);
+    put_overlay!("element.hover", element_hover);
+    put_overlay!("element.active", element_active);
+    put_overlay!("element.selected", element_selected);
     put!("element.disabled", chrome.clone());
-    put!("element.selection_background", element_selection);
-    put!("drop_target.background", drop_target);
+    put_overlay!("element.selection_background", element_selection);
+    put_overlay!("drop_target.background", drop_target);
     put!("drop_target.border", drop_target_border);
-    put!("ghost_element.background", apply_opacity(&canvas, 0.0)?);
-    put!("ghost_element.hover", ghost_hover);
-    put!("ghost_element.active", ghost_active);
-    put!("ghost_element.selected", ghost_selected);
+    put_overlay!("ghost_element.background", apply_opacity(&canvas, 0.0)?);
+    put_overlay!("ghost_element.hover", ghost_hover);
+    put_overlay!("ghost_element.active", ghost_active);
+    put_overlay!("ghost_element.selected", ghost_selected);
     put!("ghost_element.disabled", chrome.clone());
     put!("text", semantic.primary.clone());
     put!("text.muted", semantic.secondary.clone());
@@ -1530,8 +1807,8 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     put!("tab_bar.background", chrome.clone());
     put!("tab.inactive_background", chrome.clone());
     put!("tab.active_background", tab_active);
-    put!("search.match_background", search_match);
-    put!("search.active_match_background", search_active);
+    put_overlay!("search.match_background", search_match);
+    put_overlay!("search.active_match_background", search_active);
     put!("panel.background", surface.clone());
     put!("panel.focused_border", semantic.accent.clone());
     put!("panel.indent_guide", panel_guide_ladder[0].clone());
@@ -1541,26 +1818,26 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     put!("panel.overlay_hover", panel_overlay_hover);
     put!("pane.focused_border", semantic.accent.clone());
     put!("pane_group.border", semantic.structural.clone());
-    put!("scrollbar.thumb.background", thumb_ladder[0].clone());
-    put!("scrollbar.thumb.hover_background", thumb_ladder[1].clone());
-    put!("scrollbar.thumb.active_background", thumb_ladder[2].clone());
+    put_overlay!("scrollbar.thumb.background", thumb_ladder[0].clone());
+    put_overlay!("scrollbar.thumb.hover_background", thumb_ladder[1].clone());
+    put_overlay!("scrollbar.thumb.active_background", thumb_ladder[2].clone());
     put!("scrollbar.thumb.border", thumb_border.clone());
-    put!("scrollbar.track.background", apply_opacity(&chrome, 0.0)?);
+    put_overlay!("scrollbar.track.background", apply_opacity(&chrome, 0.0)?);
     put!("scrollbar.track.border", track_border);
-    put!("minimap.thumb.background", thumb_ladder[0].clone());
-    put!("minimap.thumb.hover_background", thumb_ladder[1].clone());
-    put!("minimap.thumb.active_background", thumb_ladder[2].clone());
+    put_overlay!("minimap.thumb.background", thumb_ladder[0].clone());
+    put_overlay!("minimap.thumb.hover_background", thumb_ladder[1].clone());
+    put_overlay!("minimap.thumb.active_background", thumb_ladder[2].clone());
     put!("minimap.thumb.border", thumb_border);
     put!("editor.foreground", editor_primary);
     put!("editor.background", canvas.clone());
     put!("editor.gutter.background", canvas.clone());
     put!("editor.subheader.background", chrome);
-    put!("editor.active_line.background", editor_active_line);
-    put!(
+    put_overlay!("editor.active_line.background", editor_active_line);
+    put_overlay!(
         "editor.highlighted_line.background",
         editor_highlighted_line
     );
-    put!("editor.debugger_active_line.background", debugger_active);
+    put_overlay!("editor.debugger_active_line.background", debugger_active);
     put!("editor.line_number", editor_line_number.output);
     put!(
         "editor.active_line_number",
@@ -1607,39 +1884,31 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             CONTROL_CONTRAST
         )?
     );
-    put!("editor.document_highlight.read_background", document_read);
-    put!("editor.document_highlight.write_background", document_write);
-    put!(
+    put_overlay!("editor.document_highlight.read_background", document_read);
+    put_overlay!("editor.document_highlight.write_background", document_write);
+    put_overlay!(
         "editor.document_highlight.bracket_background",
         document_bracket
     );
-    put!("editor.diff_hunk.added.background", diff_added);
-    put!(
+    put_overlay!("editor.diff_hunk.added.background", diff_added);
+    put_overlay!(
         "editor.diff_hunk.added.hollow_background",
         diff_added_hollow.clone()
     );
-    put!(
+    put_stroke!(
         "editor.diff_hunk.added.hollow_border",
-        search.fit_color(
-            &diff_green_seed,
-            &[canvas.clone(), diff_added_hollow.clone()],
-            CONTROL_CONTRAST
-        )?
+        diff_added_hollow_border
     );
-    put!("editor.diff_hunk.deleted.background", diff_deleted);
-    put!(
+    put_overlay!("editor.diff_hunk.deleted.background", diff_deleted);
+    put_overlay!(
         "editor.diff_hunk.deleted.hollow_background",
         diff_deleted_hollow.clone()
     );
-    put!(
+    put_stroke!(
         "editor.diff_hunk.deleted.hollow_border",
-        search.fit_color(
-            &diff_red_seed,
-            &[canvas.clone(), diff_deleted_hollow.clone()],
-            CONTROL_CONTRAST
-        )?
+        diff_deleted_hollow_border
     );
-    fixed.extend(terminal);
+    fixed.0.extend(terminal);
     put!(
         "link_text.hover",
         search.fit_color(&semantic.accent, &ui_backgrounds, TEXT_CONTRAST)?
@@ -1650,15 +1919,24 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     put!("version_control.renamed", semantic.blue.clone());
     put!("version_control.conflict", semantic.orange.clone());
     put!("version_control.ignored", semantic.secondary.clone());
-    put!("version_control.word_added", word_added);
-    put!("version_control.word_deleted", word_deleted);
-    put!("version_control.conflict_marker.ours", conflict_ours);
-    put!("version_control.conflict_marker.theirs", conflict_theirs);
-    fixed.extend(vim);
+    put_overlay!("version_control.word_added", word_added);
+    put_overlay!("version_control.word_deleted", word_deleted);
+    put_overlay!("version_control.conflict_marker.ours", conflict_ours);
+    put_overlay!("version_control.conflict_marker.theirs", conflict_theirs);
+    let vim_yank = vim
+        .remove("vim.yank.background")
+        .ok_or_else(|| Error("missing generated Vim yank highlight".into()))?;
+    fixed.set_overlay(OverlayRole("vim.yank.background"), vim_yank)?;
+    fixed.0.extend(vim);
 
     let mut style = Map::new();
     style.insert("background.appearance".into(), "opaque".into());
-    style.extend(fixed.into_iter().map(|(key, value)| (key, value.into())));
+    style.extend(
+        fixed
+            .into_inner()
+            .into_iter()
+            .map(|(key, value)| (key, value.into())),
+    );
     style.extend(statuses.into_iter().map(|(key, value)| (key, value.into())));
     style.insert(
         "accents".into(),
@@ -1692,6 +1970,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             interaction_bases: &interaction_bases,
             syntax_contexts: &syntax_contexts,
             editor_bases: &editor_bases,
+            selection_visibility_backgrounds: &base_overlay_backgrounds,
             editor_text_backgrounds: &editor_text_backgrounds,
             terminal_backgrounds: &terminal_backgrounds,
         },
@@ -1724,6 +2003,7 @@ struct ValidationContexts<'a> {
     interaction_bases: &'a [String],
     syntax_contexts: &'a [String],
     editor_bases: &'a [String],
+    selection_visibility_backgrounds: &'a [String],
     editor_text_backgrounds: &'a [String],
     terminal_backgrounds: &'a [String],
 }
@@ -1738,6 +2018,7 @@ fn validate_theme(
         interaction_bases,
         syntax_contexts,
         editor_bases,
+        selection_visibility_backgrounds,
         editor_text_backgrounds,
         terminal_backgrounds,
     } = contexts;
@@ -1883,9 +2164,9 @@ fn validate_theme(
             "editor.foreground reserve on base surfaces is only {editor_base_minimum:.3}:1"
         ));
     }
-    if editor_foreground_minimum < EDITOR_OVERLAY_TEXT_CONTRAST - 1e-9 {
+    if editor_foreground_minimum < TEXT_CONTRAST - 1e-9 {
         errors.push(format!(
-            "editor.foreground reserve on editor overlays is only {editor_foreground_minimum:.3}:1"
+            "editor.foreground on rendered editor overlays is only {editor_foreground_minimum:.3}:1"
         ));
     }
 
@@ -2423,48 +2704,151 @@ fn validate_theme(
         }
     }
 
-    // Diff validation is intentionally redundant with general validation: these roles
-    // are too important to be weakened accidentally by future projection changes.
-    let diff_fills = [
-        ("editor.diff_hunk.added.background", DIFF_FILL_CONTRAST),
+    // Diff roles are paint layers. Validate the pixels Zed renders rather than the
+    // uncomposited RGBA source channels.
+    let added_solid = render_on_bases(
+        editor_bases,
+        &[style_color(style, "editor.diff_hunk.added.background")?],
+    )?;
+    let deleted_solid = render_on_bases(
+        editor_bases,
+        &[style_color(style, "editor.diff_hunk.deleted.background")?],
+    )?;
+    let added_hollow = render_on_bases(
+        editor_bases,
+        &[style_color(
+            style,
+            "editor.diff_hunk.added.hollow_background",
+        )?],
+    )?;
+    let deleted_hollow = render_on_bases(
+        editor_bases,
+        &[style_color(
+            style,
+            "editor.diff_hunk.deleted.hollow_background",
+        )?],
+    )?;
+    let added_border = render_on_bases(
+        &added_hollow,
+        &[style_color(style, "editor.diff_hunk.added.hollow_border")?],
+    )?;
+    let deleted_border = render_on_bases(
+        &deleted_hollow,
+        &[style_color(
+            style,
+            "editor.diff_hunk.deleted.hollow_border",
+        )?],
+    )?;
+    let conflict_ours = render_on_bases(
+        editor_bases,
+        &[style_color(style, "version_control.conflict_marker.ours")?],
+    )?;
+    let conflict_theirs = render_on_bases(
+        editor_bases,
+        &[style_color(
+            style,
+            "version_control.conflict_marker.theirs",
+        )?],
+    )?;
+    let generic_highlights = [
+        style_color(style, "search.match_background")?,
+        style_color(style, "search.active_match_background")?,
+        style_color(style, "editor.document_highlight.read_background")?,
+        style_color(style, "editor.document_highlight.write_background")?,
+        style_color(style, "editor.document_highlight.bracket_background")?,
+        style_color(style, "vim.yank.background")?,
+    ];
+    let added_word_bases = added_solid
+        .iter()
+        .cloned()
+        .chain(added_hollow.iter().cloned())
+        .collect::<Vec<_>>();
+    let deleted_word_bases = deleted_solid
+        .iter()
+        .cloned()
+        .chain(deleted_hollow.iter().cloned())
+        .collect::<Vec<_>>();
+    let added_word_underlays =
+        render_with_bounded_generic_highlights(&added_word_bases, &generic_highlights)?;
+    let deleted_word_underlays =
+        render_with_bounded_generic_highlights(&deleted_word_bases, &generic_highlights)?;
+    let word_added = render_on_bases(
+        &added_word_underlays,
+        &[style_color(style, "version_control.word_added")?],
+    )?;
+    let word_deleted = render_on_bases(
+        &deleted_word_underlays,
+        &[style_color(style, "version_control.word_deleted")?],
+    )?;
+
+    let mut diff_fill_minimum = f64::INFINITY;
+    for (name, target, bases, rendered) in [
+        (
+            "editor.diff_hunk.added.background",
+            DIFF_FILL_CONTRAST,
+            editor_bases,
+            &added_solid,
+        ),
+        (
+            "editor.diff_hunk.deleted.background",
+            DIFF_FILL_CONTRAST,
+            editor_bases,
+            &deleted_solid,
+        ),
         (
             "editor.diff_hunk.added.hollow_background",
             DIFF_HOLLOW_CONTRAST,
+            editor_bases,
+            &added_hollow,
         ),
-        ("editor.diff_hunk.deleted.background", DIFF_FILL_CONTRAST),
         (
             "editor.diff_hunk.deleted.hollow_background",
             DIFF_HOLLOW_CONTRAST,
+            editor_bases,
+            &deleted_hollow,
         ),
-        ("version_control.conflict_marker.ours", DIFF_FILL_CONTRAST),
-        ("version_control.conflict_marker.theirs", DIFF_FILL_CONTRAST),
-    ];
-    let mut diff_fill_minimum = f64::INFINITY;
-    for (name, target) in diff_fills {
-        let actual = editor_bases
+        (
+            "version_control.conflict_marker.ours",
+            DIFF_FILL_CONTRAST,
+            editor_bases,
+            &conflict_ours,
+        ),
+        (
+            "version_control.conflict_marker.theirs",
+            DIFF_FILL_CONTRAST,
+            editor_bases,
+            &conflict_theirs,
+        ),
+    ] {
+        let actual = bases
             .iter()
-            .map(|base| contrast_ratio(style_color(style, name).unwrap(), base).unwrap())
+            .zip(rendered)
+            .map(|(base, output)| contrast_ratio(output, base).unwrap())
             .fold(f64::INFINITY, f64::min);
         diff_fill_minimum = diff_fill_minimum.min(actual);
         if actual < target - 1e-9 {
             errors.push(format!("diff fill {name} reaches only {actual:.3}:1"));
         }
     }
-    for (word, hunk) in [
+    for (name, bases, rendered) in [
         (
             "version_control.word_added",
-            "editor.diff_hunk.added.background",
+            &added_word_underlays,
+            &word_added,
         ),
         (
             "version_control.word_deleted",
-            "editor.diff_hunk.deleted.background",
+            &deleted_word_underlays,
+            &word_deleted,
         ),
     ] {
-        let actual = contrast_ratio(style_color(style, word)?, style_color(style, hunk)?)?;
-        if actual < DIFF_FILL_CONTRAST - 1e-9 {
-            errors.push(format!(
-                "word diff {word} reaches only {actual:.3}:1 against its hunk"
-            ));
+        let actual = bases
+            .iter()
+            .zip(rendered)
+            .map(|(base, output)| contrast_ratio(output, base).unwrap())
+            .fold(f64::INFINITY, f64::min);
+        if actual < WORD_DIFF_CONTRAST - 1e-9 {
+            errors.push(format!("word diff {name} reaches only {actual:.3}:1"));
         }
     }
     let added = style_color(style, "version_control.added")?;
@@ -2487,35 +2871,77 @@ fn validate_theme(
     {
         errors.push(format!("diff added/deleted pair is ambiguous: contrast {pair_contrast:.3}, delta E {pair_delta:.3}, delta L {pair_lightness:.3}, CVD {pair_cvd:.3}"));
     }
-    for (family, first, second) in [
+    let degraded_word_pair = audit.degradations.iter().any(|degradation| {
+        degradation.get("role").and_then(Value::as_str) == Some("version_control.word_pair")
+            && degradation.get("invariant").and_then(Value::as_str)
+                == Some("strong_rendered_separation")
+    });
+    for (family, first_role, second_role, first_scenes, second_scenes) in [
         (
             "hunk.solid",
             "editor.diff_hunk.added.background",
             "editor.diff_hunk.deleted.background",
+            &added_solid,
+            &deleted_solid,
         ),
         (
             "hunk.hollow",
             "editor.diff_hunk.added.hollow_background",
             "editor.diff_hunk.deleted.hollow_background",
+            &added_hollow,
+            &deleted_hollow,
+        ),
+        (
+            "hunk.border",
+            "editor.diff_hunk.added.hollow_border",
+            "editor.diff_hunk.deleted.hollow_border",
+            &added_border,
+            &deleted_border,
         ),
         (
             "word",
             "version_control.word_added",
             "version_control.word_deleted",
+            &word_added,
+            &word_deleted,
         ),
         (
             "conflict",
             "version_control.conflict_marker.ours",
             "version_control.conflict_marker.theirs",
+            &conflict_ours,
+            &conflict_theirs,
         ),
     ] {
-        let first_value = style_color(style, first)?;
-        let second_value = style_color(style, second)?;
-        let normal = delta_e(first_value, second_value)?;
-        let cvd = crate::search::cvd_distance(first_value, second_value)?;
-        let contrast = contrast_ratio(first_value, second_value)?;
-        audit.diff_metrics.push(json!({"family": family, "first": first_value, "second": second_value, "normal_delta_e": round6(normal), "cvd_delta_e": round6(cvd), "pair_contrast": round6(contrast)}));
-        let strong_separation = contrast >= DIFF_LUMINANCE_SEPARATION_CONTRAST - 1e-9
+        let contrast = first_scenes
+            .iter()
+            .zip(second_scenes)
+            .map(|(first, second)| contrast_ratio(first, second).unwrap())
+            .fold(f64::INFINITY, f64::min);
+        let normal = first_scenes
+            .iter()
+            .zip(second_scenes)
+            .map(|(first, second)| delta_e(first, second).unwrap())
+            .fold(f64::INFINITY, f64::min);
+        let cvd = first_scenes
+            .iter()
+            .zip(second_scenes)
+            .map(|(first, second)| crate::search::cvd_distance(first, second).unwrap())
+            .fold(f64::INFINITY, f64::min);
+        let first_value = style_color(style, first_role)?;
+        let second_value = style_color(style, second_role)?;
+        audit.diff_metrics.push(json!({
+            "family": family,
+            "first": first_value,
+            "second": second_value,
+            "first_alpha": round6(crate::color::parse_hex(first_value)?.a),
+            "second_alpha": round6(crate::color::parse_hex(second_value)?.a),
+            "normal_delta_e": round6(normal),
+            "cvd_delta_e": round6(cvd),
+            "pair_contrast": round6(contrast),
+        }));
+        let strong_separation = (family == "word" && degraded_word_pair)
+            || contrast >= DIFF_LUMINANCE_SEPARATION_CONTRAST - 1e-9
             || (normal >= DIFF_NORMAL_DELTA_E - 1e-9 && cvd >= DIFF_CVD_DELTA_E - 1e-9);
         if normal < DIFF_NORMAL_FLOOR_DELTA_E - 1e-9
             || cvd < DIFF_CVD_FLOOR_DELTA_E - 1e-9
@@ -2525,19 +2951,69 @@ fn validate_theme(
             errors.push(format!("diff {family} pair is ambiguous: contrast {contrast:.3}, delta E {normal:.3}, CVD {cvd:.3}"));
         }
     }
-    for (border, fill) in [
+    for (border, fills, borders) in [
         (
             "editor.diff_hunk.added.hollow_border",
-            "editor.diff_hunk.added.hollow_background",
+            &added_hollow,
+            &added_border,
         ),
         (
             "editor.diff_hunk.deleted.hollow_border",
-            "editor.diff_hunk.deleted.hollow_background",
+            &deleted_hollow,
+            &deleted_border,
         ),
     ] {
-        let actual = contrast_ratio(style_color(style, border)?, style_color(style, fill)?)?;
+        let actual = fills
+            .iter()
+            .zip(borders)
+            .map(|(fill, border)| contrast_ratio(border, fill).unwrap())
+            .fold(f64::INFINITY, f64::min);
         if actual < HARD_CONTROL_CONTRAST - 1e-9 {
-            errors.push(format!("{border} against {fill} is only {actual:.3}:1"));
+            errors.push(format!(
+                "{border} reaches only {actual:.3}:1 after composition"
+            ));
+        }
+    }
+    for (family, hollow, border, word) in [
+        (
+            "added",
+            &added_hollow,
+            &added_border,
+            style_color(style, "version_control.word_added")?,
+        ),
+        (
+            "deleted",
+            &deleted_hollow,
+            &deleted_border,
+            style_color(style, "version_control.word_deleted")?,
+        ),
+    ] {
+        let highlighted_hollow =
+            render_with_bounded_generic_highlights(hollow, &generic_highlights)?;
+        let highlighted_border =
+            render_with_bounded_generic_highlights(border, &generic_highlights)?;
+        let word_on_hollow = render_on_bases(&highlighted_hollow, &[word])?;
+        let word_on_border = render_on_bases(&highlighted_border, &[word])?;
+        let retained = word_on_hollow
+            .iter()
+            .zip(&word_on_border)
+            .map(|(fill, border)| delta_e(fill, border).unwrap())
+            .fold(f64::INFINITY, f64::min);
+        let retained_ratio = highlighted_hollow
+            .iter()
+            .zip(&highlighted_border)
+            .zip(word_on_hollow.iter().zip(&word_on_border))
+            .map(|((fill, border), (word_fill, word_border))| {
+                delta_e(word_fill, word_border).unwrap() / delta_e(fill, border).unwrap().max(1e-12)
+            })
+            .fold(f64::INFINITY, f64::min);
+        if retained < DIFF_BORDER_RETENTION_DELTA_E - 1e-9
+            || retained_ratio < DIFF_BORDER_RETENTION_RATIO - 1e-9
+        {
+            errors.push(format!(
+                "{family} word overlay erases its hunk border: delta E {retained:.3}, retained {:.1}%",
+                retained_ratio * 100.0,
+            ));
         }
     }
     audit.minimums.insert(
@@ -2668,7 +3144,12 @@ fn validate_theme(
             degradation.get("invariant").and_then(Value::as_str)
                 == Some("shared_selection_fallback")
         })
-        .filter_map(|degradation| degradation.get("role").and_then(Value::as_str))
+        .filter_map(|degradation| {
+            degradation
+                .get("role")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .collect::<BTreeSet<_>>();
     let shared_selection_mode = !selection_fallbacks.is_empty();
     for (index, (_, _, selection)) in player_values.iter().enumerate() {
@@ -2681,7 +3162,7 @@ fn validate_theme(
             ));
         }
         let mut rendered_selection = Vec::new();
-        for background in editor_text_backgrounds {
+        for background in selection_visibility_backgrounds {
             let rendered = gpui_blend(background, selection)?.opaque_hex();
             let contrast = contrast_ratio(&rendered, background)?;
             let distance = delta_e(&rendered, background)?;
@@ -2714,6 +3195,45 @@ fn validate_theme(
             }
             cursor_backgrounds.extend([rendered.clone(), unfocused.clone()]);
             rendered_selection.extend([rendered, unfocused]);
+        }
+        let mut word_visibility = [f64::INFINITY; 4];
+        for background in editor_text_backgrounds {
+            let rendered = gpui_blend(background, selection)?.opaque_hex();
+            let text_contrast = contrast_ratio(editor_foreground, &rendered)?;
+            word_visibility[0] = word_visibility[0].min(contrast_ratio(&rendered, background)?);
+            word_visibility[1] = word_visibility[1].min(delta_e(&rendered, background)?);
+            if text_contrast < HARD_TEXT_CONTRAST - 1e-9 {
+                errors.push(format!(
+                    "editor text is unreadable on players[{index}].selection over a reachable word scene: {text_contrast:.3}:1"
+                ));
+            }
+            let unfocused = gpui_blend(background, &apply_opacity(selection, 0.5)?)?.opaque_hex();
+            let unfocused_text_contrast = contrast_ratio(editor_foreground, &unfocused)?;
+            word_visibility[2] = word_visibility[2].min(contrast_ratio(&unfocused, background)?);
+            word_visibility[3] = word_visibility[3].min(delta_e(&unfocused, background)?);
+            if unfocused_text_contrast < HARD_TEXT_CONTRAST - 1e-9 {
+                errors.push(format!(
+                    "editor text is unreadable on unfocused players[{index}].selection over a reachable word scene: {unfocused_text_contrast:.3}:1"
+                ));
+            }
+            cursor_backgrounds.extend([rendered, unfocused]);
+        }
+        if word_visibility[0] < FOCUSED_SELECTION_CONTRAST - 1e-9
+            || word_visibility[1] < FOCUSED_SELECTION_DELTA_E - 1e-9
+            || word_visibility[2] < 1.08 - 1e-9
+            || word_visibility[3] < 0.020 - 1e-9
+        {
+            audit.degradation(
+                selection_role.clone(),
+                "word_scene_visibility",
+                json!({
+                    "focused_contrast": round6(word_visibility[0]),
+                    "focused_delta_e": round6(word_visibility[1]),
+                    "unfocused_contrast": round6(word_visibility[2]),
+                    "unfocused_delta_e": round6(word_visibility[3]),
+                    "reason": "selection readability is preserved, but no hue-preserving selection satisfies the full visibility contract on every word scene",
+                }),
+            );
         }
         for (prior_index, prior) in prior_selections.iter().enumerate() {
             if is_fallback {

@@ -1,11 +1,12 @@
 use omarchy_zed_theme::color::{
-    apply_opacity, contrast_ratio, delta_e, gpui_blend, lab, oklab_to_oklch,
+    apply_opacity, contrast_ratio, delta_e, gpui_blend, lab, oklab_to_oklch, parse_hex,
+    render_layers,
 };
 use omarchy_zed_theme::constants::{
     ADDITIONAL_SYNTAX_FIELDS, BASE_SYNTAX_FIELDS, CANONICAL_COLOR_KEYS, CHROME_FIELDS,
-    EDITOR_FIELDS, FOUNDATION_FIELDS, LINK_VC_FIELDS, RUNTIME_STATE_BASE_CONTRAST_STEP,
-    RUNTIME_STATE_CONSECUTIVE_CONTRAST, RUNTIME_STATE_CONSECUTIVE_DELTA_E, STATUS_NAMES,
-    TERMINAL_FIELDS, VIM_FIELDS,
+    DIFF_BORDER_RETENTION_DELTA_E, DIFF_BORDER_RETENTION_RATIO, EDITOR_FIELDS, FOUNDATION_FIELDS,
+    LINK_VC_FIELDS, RUNTIME_STATE_BASE_CONTRAST_STEP, RUNTIME_STATE_CONSECUTIVE_CONTRAST,
+    RUNTIME_STATE_CONSECUTIVE_DELTA_E, STATUS_NAMES, TERMINAL_FIELDS, VIM_FIELDS,
 };
 use omarchy_zed_theme::palette::{Provenance, ResolvedPalette, resolve_palette};
 use omarchy_zed_theme::publish::atomic_write_file;
@@ -373,25 +374,164 @@ fn narrow_olive_palette_uses_scaffold_and_generates() {
 fn every_syntax_capture_is_readable_on_emitted_diff_overlays() {
     let (document, _) = build_theme(&synthetic_palette()).unwrap();
     let style = style(&document);
-    let diff_contexts = [
-        "editor.diff_hunk.added.background",
-        "editor.diff_hunk.added.hollow_background",
-        "editor.diff_hunk.deleted.background",
-        "editor.diff_hunk.deleted.hollow_background",
-        "version_control.word_added",
-        "version_control.word_deleted",
-        "version_control.conflict_marker.ours",
-        "version_control.conflict_marker.theirs",
+    let base = style["editor.background"].as_str().unwrap();
+    let added = render_layers(
+        base,
+        &[style["editor.diff_hunk.added.background"].as_str().unwrap()],
+    )
+    .unwrap();
+    let deleted = render_layers(
+        base,
+        &[style["editor.diff_hunk.deleted.background"]
+            .as_str()
+            .unwrap()],
+    )
+    .unwrap();
+    let diff_contexts = vec![
+        added.clone(),
+        deleted.clone(),
+        render_layers(
+            base,
+            &[style["editor.diff_hunk.added.hollow_background"]
+                .as_str()
+                .unwrap()],
+        )
+        .unwrap(),
+        render_layers(
+            base,
+            &[style["editor.diff_hunk.deleted.hollow_background"]
+                .as_str()
+                .unwrap()],
+        )
+        .unwrap(),
+        render_layers(
+            &added,
+            &[style["version_control.word_added"].as_str().unwrap()],
+        )
+        .unwrap(),
+        render_layers(
+            &deleted,
+            &[style["version_control.word_deleted"].as_str().unwrap()],
+        )
+        .unwrap(),
+        render_layers(
+            base,
+            &[style["version_control.conflict_marker.ours"]
+                .as_str()
+                .unwrap()],
+        )
+        .unwrap(),
+        render_layers(
+            base,
+            &[style["version_control.conflict_marker.theirs"]
+                .as_str()
+                .unwrap()],
+        )
+        .unwrap(),
     ];
     for (capture, spec) in style["syntax"].as_object().unwrap() {
         let foreground = spec["color"].as_str().unwrap();
         let floor = contrast_floor(capture).unwrap();
-        for context in diff_contexts {
-            let background = style[context].as_str().unwrap();
+        for background in &diff_contexts {
             let actual = contrast_ratio(foreground, background).unwrap();
             assert!(
                 actual >= floor - 1e-9,
-                "syntax.{capture} reaches only {actual:.3}:1 on {context}; floor is {floor:.2}:1"
+                "syntax.{capture} reaches only {actual:.3}:1 on rendered diff context; floor is {floor:.2}:1"
+            );
+        }
+    }
+}
+
+#[test]
+fn renderer_layer_roles_remain_translucent() {
+    let (document, _) = build_theme(&synthetic_palette()).unwrap();
+    let style = style(&document);
+    for role in [
+        "search.match_background",
+        "search.active_match_background",
+        "editor.document_highlight.read_background",
+        "editor.document_highlight.write_background",
+        "editor.document_highlight.bracket_background",
+        "editor.diff_hunk.added.background",
+        "editor.diff_hunk.added.hollow_background",
+        "editor.diff_hunk.added.hollow_border",
+        "editor.diff_hunk.deleted.background",
+        "editor.diff_hunk.deleted.hollow_background",
+        "editor.diff_hunk.deleted.hollow_border",
+        "version_control.word_added",
+        "version_control.word_deleted",
+        "version_control.conflict_marker.ours",
+        "version_control.conflict_marker.theirs",
+        "vim.yank.background",
+        "drop_target.background",
+        "scrollbar.thumb.background",
+        "scrollbar.thumb.hover_background",
+        "scrollbar.thumb.active_background",
+        "minimap.thumb.background",
+        "minimap.thumb.hover_background",
+        "minimap.thumb.active_background",
+    ] {
+        assert!(
+            parse_hex(style[role].as_str().unwrap()).unwrap().a < 1.0,
+            "{role} became opaque"
+        );
+    }
+    assert_eq!(
+        parse_hex(style["drop_target.border"].as_str().unwrap())
+            .unwrap()
+            .a,
+        1.0
+    );
+}
+
+#[test]
+fn inline_diff_emphasis_preserves_the_hollow_hunk_border() {
+    let (document, _) = build_theme(&synthetic_palette()).unwrap();
+    let style = style(&document);
+    let base = style["editor.background"].as_str().unwrap();
+    for family in ["added", "deleted"] {
+        let hollow = style[&format!("editor.diff_hunk.{family}.hollow_background")]
+            .as_str()
+            .unwrap();
+        let border = style[&format!("editor.diff_hunk.{family}.hollow_border")]
+            .as_str()
+            .unwrap();
+        let word = style[&format!("version_control.word_{family}")]
+            .as_str()
+            .unwrap();
+        for highlight in [
+            None,
+            Some(style["search.match_background"].as_str().unwrap()),
+            Some(
+                style["editor.document_highlight.read_background"]
+                    .as_str()
+                    .unwrap(),
+            ),
+            Some(style["vim.yank.background"].as_str().unwrap()),
+        ] {
+            let mut without_border_layers = vec![hollow];
+            let mut with_border_layers = vec![hollow, border];
+            if let Some(highlight) = highlight {
+                without_border_layers.push(highlight);
+                with_border_layers.push(highlight);
+            }
+            let before_word = render_layers(base, &without_border_layers).unwrap();
+            let border_before_word = render_layers(base, &with_border_layers).unwrap();
+            without_border_layers.push(word);
+            with_border_layers.push(word);
+            let without_border = render_layers(base, &without_border_layers).unwrap();
+            let with_border = render_layers(base, &with_border_layers).unwrap();
+            let retained = delta_e(&without_border, &with_border).unwrap();
+            let retained_ratio = retained
+                / delta_e(&before_word, &border_before_word)
+                    .unwrap()
+                    .max(1e-12);
+
+            assert!(
+                retained >= DIFF_BORDER_RETENTION_DELTA_E - 1e-9
+                    && retained_ratio >= DIFF_BORDER_RETENTION_RATIO - 1e-9,
+                "{family} inline emphasis erased its hunk border: delta E {retained:.3}, retained {:.1}%",
+                retained_ratio * 100.0,
             );
         }
     }

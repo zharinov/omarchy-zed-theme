@@ -106,8 +106,72 @@ pub struct FillRequest<'a> {
     pub runtime_rendered_references: &'a [(String, f64, f64, f64)],
 }
 
+pub struct OverlayPairRequest<'a> {
+    pub first: FillRequest<'a>,
+    pub second: FillRequest<'a>,
+    pub constraints: PairConstraints,
+    pub maximum_alpha: u8,
+    pub frontier_limit: usize,
+}
+
+pub struct OverlayPairFallback {
+    pub colors: [String; 2],
+    pub strong_error: Option<String>,
+}
+
 type FillRank = [f64; 5];
-type FillCandidate = (Rgba32, FillRank);
+#[derive(Clone)]
+struct FillCandidate {
+    emitted: Rgba32,
+    rank: FillRank,
+    source_chroma: f64,
+}
+
+struct FrontierCandidate {
+    core: FillCandidate,
+    rendered: Box<[ColorMetrics]>,
+    cvd: OnceLock<Box<[CvdLabs]>>,
+}
+
+impl FrontierCandidate {
+    fn new(core: FillCandidate, prepared: &PreparedFill) -> Self {
+        let rendered = prepared
+            .backgrounds
+            .iter()
+            .map(|background| {
+                ColorMetrics::blend_rgb24(*background, core.emitted.rgb24(), core.emitted.alpha())
+                    .metrics()
+            })
+            .collect();
+        Self {
+            core,
+            rendered,
+            cvd: OnceLock::new(),
+        }
+    }
+
+    fn cvd(&self) -> &[CvdLabs] {
+        self.cvd.get_or_init(|| {
+            self.rendered
+                .iter()
+                .map(|rendered| cvd_labs(rendered.rgba.rgba()))
+                .collect()
+        })
+    }
+}
+
+fn frontier_rank_cmp(left: &FrontierCandidate, right: &FrontierCandidate) -> Ordering {
+    rank_cmp(&left.core.rank[..3], &right.core.rank[..3])
+        .then_with(|| left.core.emitted.hex_cmp(right.core.emitted))
+}
+
+fn combined_frontier_rank(left: &FrontierCandidate, right: &FrontierCandidate) -> [f64; 3] {
+    [
+        left.core.rank[0] + right.core.rank[0],
+        left.core.rank[1] + right.core.rank[1],
+        left.core.rank[2] + right.core.rank[2],
+    ]
+}
 
 struct PreparedFill {
     backgrounds: Vec<ColorMetrics>,
@@ -119,7 +183,51 @@ struct PreparedFill {
     runtime_rendered_references: Vec<Vec<(ColorMetrics, f64, f64, f64)>>,
 }
 
+struct PreparedOverlayPair {
+    first: PreparedFill,
+    second: PreparedFill,
+    first_candidates: Vec<FillCandidate>,
+    second_candidates: Vec<FillCandidate>,
+}
+
+fn overlay_frontier(candidates: &[FillCandidate], limit: usize) -> Vec<FillCandidate> {
+    let mut selected = candidates
+        .iter()
+        .take(limit / 2)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut alpha_order = candidates.iter().collect::<Vec<_>>();
+    alpha_order.sort_by(|left, right| {
+        right
+            .emitted
+            .alpha()
+            .cmp(&left.emitted.alpha())
+            .then_with(|| rank_cmp(&left.rank, &right.rank))
+            .then_with(|| left.emitted.hex_cmp(right.emitted))
+    });
+    selected.extend(alpha_order.into_iter().take(limit / 2).cloned());
+    selected.sort_by_key(|candidate| candidate.emitted);
+    selected.dedup_by_key(|candidate| candidate.emitted);
+    selected
+}
+
 impl PreparedFill {
+    fn alpha_values(minimum_alpha: u8, maximum_alpha: u8) -> Vec<u8> {
+        let mut values = (2..=20)
+            .map(|alpha_index| ((alpha_index * 255 + 10) / 20) as u8)
+            .filter(|alpha| *alpha >= minimum_alpha && *alpha <= maximum_alpha)
+            .collect::<Vec<_>>();
+        if minimum_alpha <= maximum_alpha {
+            values.push(minimum_alpha);
+        }
+        if maximum_alpha > 0 {
+            values.push(maximum_alpha);
+        }
+        values.sort_unstable();
+        values.dedup();
+        values
+    }
+
     fn new(request: FillRequest<'_>) -> Result<Self> {
         let backgrounds = request
             .backgrounds
@@ -181,32 +289,47 @@ impl PreparedFill {
         })
     }
 
+    fn best_and_highest_for(
+        &self,
+        opaque: ColorMetrics,
+        distance: f64,
+        retention: f64,
+        alpha_values: &[u8],
+    ) -> (Option<FillCandidate>, Option<FillCandidate>) {
+        let mut best: Option<FillCandidate> = None;
+        let mut highest: Option<FillCandidate> = None;
+        let opaque_rgb = opaque.rgb24();
+        let source_chroma = lab_chroma(opaque.lab);
+
+        for &alpha in alpha_values {
+            let Some(candidate) =
+                self.evaluate_alpha(opaque_rgb, alpha, distance, retention, source_chroma)
+            else {
+                continue;
+            };
+
+            highest = Some(candidate.clone());
+            if best.as_ref().is_none_or(|best| {
+                rank_cmp(&candidate.rank, &best.rank)
+                    .then_with(|| candidate.emitted.hex_cmp(best.emitted))
+                    == Ordering::Less
+            }) {
+                best = Some(candidate);
+            }
+        }
+
+        (best, highest)
+    }
+
     fn best_for(
         &self,
         opaque: ColorMetrics,
         distance: f64,
         retention: f64,
+        alpha_values: &[u8],
     ) -> Option<FillCandidate> {
-        let mut best: Option<FillCandidate> = None;
-        let opaque_rgb = opaque.rgb24();
-
-        for alpha_index in 2..=20 {
-            let alpha = ((alpha_index * 255 + 10) / 20) as u8;
-            let Some((candidate, rank)) =
-                self.evaluate_alpha(opaque_rgb, alpha, distance, retention)
-            else {
-                continue;
-            };
-
-            if best.as_ref().is_none_or(|(best_color, best_rank)| {
-                rank_cmp(&rank, best_rank).then_with(|| candidate.hex_cmp(*best_color))
-                    == Ordering::Less
-            }) {
-                best = Some((candidate, rank));
-            }
-        }
-
-        best
+        self.best_and_highest_for(opaque, distance, retention, alpha_values)
+            .0
     }
 
     fn evaluate_alpha(
@@ -215,6 +338,7 @@ impl PreparedFill {
         alpha: u8,
         distance: f64,
         retention: f64,
+        source_chroma: f64,
     ) -> Option<FillCandidate> {
         let mut minimum_ratio = f64::INFINITY;
         let mut overshoot = 0.0;
@@ -322,7 +446,11 @@ impl PreparedFill {
             -f64::from(alpha) / 255.0,
         ];
 
-        Some((candidate, rank))
+        Some(FillCandidate {
+            emitted: candidate,
+            rank,
+            source_chroma,
+        })
     }
 }
 
@@ -363,6 +491,10 @@ fn lab_distance(left: [f64; 3], right: [f64; 3]) -> f64 {
         .sqrt()
 }
 
+fn lab_chroma([_, a, b]: [f64; 3]) -> f64 {
+    a.hypot(b)
+}
+
 impl Search {
     fn candidate_colors(seed: &str) -> Result<Vec<Rgb24>> {
         let [_, chroma, hue] = oklab_to_oklch(lab(seed)?);
@@ -399,7 +531,7 @@ impl Search {
                 let metrics = ColorMetrics::from_rgb24(color);
                 Ok(TransformCandidate {
                     distance: lab_distance(metrics.lab, source_lab),
-                    retention: oklab_to_oklch(metrics.lab)[1] / seed_chroma.max(1e-12),
+                    retention: lab_chroma(metrics.lab) / seed_chroma.max(1e-12),
                     metrics,
                 })
             })
@@ -516,7 +648,7 @@ impl Search {
             let table = search.transform_table(seed)?;
             for (index, candidate) in table.candidates.iter().enumerate() {
                 let metrics = candidate.metrics;
-                if oklab_to_oklch(metrics.lab)[1] < constraints.minimum_chroma - 1e-12 {
+                if lab_chroma(metrics.lab) < constraints.minimum_chroma - 1e-12 {
                     continue;
                 }
                 if background_metrics.iter().any(|background| {
@@ -527,10 +659,14 @@ impl Search {
                 {
                     continue;
                 }
-                let background_distance = background_metrics
-                    .iter()
-                    .map(|background| metrics.delta_e(*background))
-                    .sum();
+                let background_distance = if constraints.prefer_background {
+                    background_metrics
+                        .iter()
+                        .map(|background| metrics.delta_e(*background))
+                        .sum()
+                } else {
+                    0.0
+                };
                 values.push(PairCandidate {
                     source_index: index,
                     background_distance,
@@ -725,7 +861,7 @@ impl Search {
             return Err(Error("fit_color requires at least one background".into()));
         }
         let source_metrics = ColorMetrics::from_hex(seed)?;
-        let source_chroma = oklab_to_oklch(source_metrics.lab)[1];
+        let source_chroma = lab_chroma(source_metrics.lab);
         let source_retention = source_chroma / source_chroma.max(1e-12);
         let background_metrics = backgrounds
             .iter()
@@ -746,7 +882,7 @@ impl Search {
             {
                 return false;
             }
-            let chroma = oklab_to_oklch(candidate.lab)[1];
+            let chroma = lab_chroma(candidate.lab);
             if chroma < bounds.lower_chroma - 1e-12 || chroma > bounds.upper_chroma + 1e-12 {
                 return false;
             }
@@ -901,23 +1037,50 @@ impl Search {
     }
 
     pub fn fit_fill_readable(&mut self, seed: &str, request: FillRequest<'_>) -> Result<String> {
+        self.fit_fill_readable_bounded(seed, request, OVERLAY_MAX_ALPHA)
+    }
+
+    pub fn fit_fill_readable_bounded(
+        &mut self,
+        seed: &str,
+        request: FillRequest<'_>,
+        maximum_alpha: u8,
+    ) -> Result<String> {
+        self.fit_fill_readable_alpha_range(seed, request, 1, maximum_alpha)
+    }
+
+    pub fn fit_fill_readable_alpha_range(
+        &mut self,
+        seed: &str,
+        request: FillRequest<'_>,
+        minimum_alpha: u8,
+        maximum_alpha: u8,
+    ) -> Result<String> {
         let prepared = PreparedFill::new(request)?;
+        let alpha_values = PreparedFill::alpha_values(minimum_alpha, maximum_alpha);
         let source = ColorMetrics::from_hex(seed)?;
-        if let Some((color, _)) = prepared.best_for(source, 0.0, 1.0) {
-            return Ok(color.hex());
+        if let Some(candidate) = prepared.best_for(source, 0.0, 1.0, &alpha_values) {
+            return Ok(candidate.emitted.hex());
         }
         let table = self.transform_table(seed)?;
         let best = table
             .candidates
             .par_iter()
-            .map(|opaque| prepared.best_for(opaque.metrics, opaque.distance, opaque.retention))
+            .map(|opaque| {
+                prepared.best_for(
+                    opaque.metrics,
+                    opaque.distance,
+                    opaque.retention,
+                    &alpha_values,
+                )
+            })
             .reduce(
                 || None,
                 |left, right| match (left, right) {
                     (None, other) | (other, None) => other,
                     (Some(left), Some(right)) => {
-                        let order =
-                            rank_cmp(&left.1, &right.1).then_with(|| left.0.hex_cmp(right.0));
+                        let order = rank_cmp(&left.rank, &right.rank)
+                            .then_with(|| left.emitted.hex_cmp(right.emitted));
                         Some(if order == Ordering::Greater {
                             right
                         } else {
@@ -926,7 +1089,7 @@ impl Search {
                     }
                 },
             );
-        best.map(|(color, _)| color.hex())
+        best.map(|candidate| candidate.emitted.hex())
             .ok_or_else(|| Error(format!("no candidate for fill {seed}")))
     }
 
@@ -937,9 +1100,249 @@ impl Search {
     ) -> Result<Option<String>> {
         let prepared = PreparedFill::new(request)?;
         let metrics = ColorMetrics::from_hex(seed)?;
+        let alpha_values = PreparedFill::alpha_values(1, u8::MAX);
         Ok(prepared
-            .best_for(metrics, 0.0, 1.0)
-            .map(|(color, _)| color.hex()))
+            .best_for(metrics, 0.0, 1.0, &alpha_values)
+            .map(|candidate| candidate.emitted.hex()))
+    }
+
+    fn prepare_overlay_pair(
+        &mut self,
+        first_seed: &str,
+        second_seed: &str,
+        first_request: FillRequest<'_>,
+        second_request: FillRequest<'_>,
+        maximum_alpha: u8,
+    ) -> Result<PreparedOverlayPair> {
+        let first = PreparedFill::new(first_request)?;
+        let second = PreparedFill::new(second_request)?;
+        if first.backgrounds.len() != second.backgrounds.len() {
+            return Err(Error("overlay pair scene counts differ".into()));
+        }
+
+        let collect = |seed: &str,
+                       table: &TransformTableData,
+                       prepared: &PreparedFill,
+                       maximum_alpha: u8|
+         -> Result<Vec<FillCandidate>> {
+            let alpha_values = PreparedFill::alpha_values(1, maximum_alpha);
+            let mut candidates = table
+                .candidates
+                .par_iter()
+                .flat_map_iter(|opaque| {
+                    let (best, highest) = prepared.best_and_highest_for(
+                        opaque.metrics,
+                        opaque.distance,
+                        opaque.retention,
+                        &alpha_values,
+                    );
+                    [best, highest].into_iter().flatten()
+                })
+                .collect::<Vec<_>>();
+            if let Some(source) =
+                prepared.best_for(ColorMetrics::from_hex(seed)?, 0.0, 1.0, &alpha_values)
+            {
+                candidates.push(source);
+            }
+            candidates.sort_by(|left, right| {
+                rank_cmp(&left.rank, &right.rank).then_with(|| left.emitted.hex_cmp(right.emitted))
+            });
+            candidates.dedup_by_key(|candidate| candidate.emitted);
+            Ok(candidates)
+        };
+
+        let first_table = self.transform_table(first_seed)?;
+        let second_table = self.transform_table(second_seed)?;
+        let first_candidates = collect(first_seed, &first_table, &first, maximum_alpha)?;
+        let second_candidates = collect(second_seed, &second_table, &second, maximum_alpha)?;
+        Ok(PreparedOverlayPair {
+            first,
+            second,
+            first_candidates,
+            second_candidates,
+        })
+    }
+
+    fn solve_overlay_pair(
+        prepared: &PreparedOverlayPair,
+        first_seed: &str,
+        second_seed: &str,
+        constraints: PairConstraints,
+        frontier_limit: usize,
+    ) -> Result<[String; 2]> {
+        let mut best: Option<([Rgba32; 2], [f64; 5])> = None;
+        let mut maxima = [0.0_f64; 3];
+
+        for frontier_size in [128_usize, 512]
+            .into_iter()
+            .filter(|size| *size <= frontier_limit)
+        {
+            let mut first_frontier = overlay_frontier(&prepared.first_candidates, frontier_size)
+                .into_iter()
+                .map(|candidate| FrontierCandidate::new(candidate, &prepared.first))
+                .collect::<Vec<_>>();
+            let mut second_frontier = overlay_frontier(&prepared.second_candidates, frontier_size)
+                .into_iter()
+                .map(|candidate| FrontierCandidate::new(candidate, &prepared.second))
+                .collect::<Vec<_>>();
+            first_frontier.sort_by(frontier_rank_cmp);
+            second_frontier.sort_by(frontier_rank_cmp);
+            let minimum_second = second_frontier.first();
+            for left in &first_frontier {
+                if left.core.source_chroma < constraints.minimum_chroma - 1e-12 {
+                    continue;
+                }
+                if let (Some((_, best_rank)), Some(minimum_second)) = (&best, minimum_second)
+                    && rank_cmp(
+                        &combined_frontier_rank(left, minimum_second),
+                        &best_rank[..3],
+                    ) == Ordering::Greater
+                {
+                    break;
+                }
+                for right in &second_frontier {
+                    if right.core.source_chroma < constraints.minimum_chroma - 1e-12 {
+                        continue;
+                    }
+                    let prefix = combined_frontier_rank(left, right);
+                    if best.as_ref().is_some_and(|(_, best_rank)| {
+                        rank_cmp(&prefix, &best_rank[..3]) == Ordering::Greater
+                    }) {
+                        break;
+                    }
+                    let mut minimum_contrast = f64::INFINITY;
+                    let mut minimum_normal = f64::INFINITY;
+                    let mut minimum_lightness = f64::INFINITY;
+                    for (left_rendered, right_rendered) in
+                        left.rendered.iter().zip(right.rendered.iter())
+                    {
+                        let contrast = left_rendered.contrast(*right_rendered);
+                        let normal = left_rendered.delta_e(*right_rendered);
+                        let lightness = (left_rendered.lab[0] - right_rendered.lab[0]).abs();
+                        minimum_contrast = minimum_contrast.min(contrast);
+                        minimum_normal = minimum_normal.min(normal);
+                        minimum_lightness = minimum_lightness.min(lightness);
+                    }
+                    maxima[0] = maxima[0].max(minimum_contrast);
+                    maxima[1] = maxima[1].max(minimum_normal);
+                    if minimum_contrast < constraints.pair_contrast - 1e-12
+                        || minimum_normal < constraints.normal_delta - 1e-12
+                        || minimum_lightness < constraints.lightness_delta - 1e-12
+                    {
+                        continue;
+                    }
+                    let mut minimum_cvd = minimum_normal;
+                    for (left_cvd, right_cvd) in left.cvd().iter().zip(right.cvd()) {
+                        let cvd = cvd_distance_facts(left_cvd, right_cvd, f64::INFINITY);
+                        minimum_cvd = minimum_cvd.min(cvd);
+                    }
+                    maxima[2] = maxima[2].max(minimum_cvd);
+                    if minimum_cvd < constraints.cvd_delta - 1e-12
+                        || !pair_is_separated(
+                            minimum_contrast,
+                            minimum_normal,
+                            minimum_cvd,
+                            constraints,
+                        )
+                    {
+                        continue;
+                    }
+                    let rank = [
+                        prefix[0],
+                        prefix[1],
+                        prefix[2],
+                        -(minimum_normal + minimum_cvd),
+                        -(minimum_contrast + minimum_lightness),
+                    ];
+                    if best.as_ref().is_none_or(|(best_colors, best_rank)| {
+                        rank_cmp(&rank, best_rank)
+                            .then_with(|| [left.core.emitted, right.core.emitted].cmp(best_colors))
+                            == Ordering::Less
+                    }) {
+                        best = Some(([left.core.emitted, right.core.emitted], rank));
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+
+        best.map(|(colors, _)| [colors[0].hex(), colors[1].hex()])
+            .ok_or_else(|| {
+                Error(format!(
+                    "no rendered overlay pair for {first_seed} and {second_seed} ({} and {} local candidates; maxima contrast {:.3}, delta E {:.3}, CVD {:.3})",
+                    prepared.first_candidates.len(),
+                    prepared.second_candidates.len(),
+                    maxima[0],
+                    maxima[1],
+                    maxima[2],
+                ))
+            })
+    }
+
+    pub fn fit_overlay_pair(
+        &mut self,
+        first_seed: &str,
+        second_seed: &str,
+        request: OverlayPairRequest<'_>,
+    ) -> Result<[String; 2]> {
+        let prepared = self.prepare_overlay_pair(
+            first_seed,
+            second_seed,
+            request.first,
+            request.second,
+            request.maximum_alpha,
+        )?;
+        Self::solve_overlay_pair(
+            &prepared,
+            first_seed,
+            second_seed,
+            request.constraints,
+            request.frontier_limit,
+        )
+    }
+
+    pub fn fit_overlay_pair_with_fallback(
+        &mut self,
+        first_seed: &str,
+        second_seed: &str,
+        request: OverlayPairRequest<'_>,
+        fallback_constraints: PairConstraints,
+        fallback_frontier_limit: usize,
+    ) -> Result<OverlayPairFallback> {
+        let prepared = self.prepare_overlay_pair(
+            first_seed,
+            second_seed,
+            request.first,
+            request.second,
+            request.maximum_alpha,
+        )?;
+        match Self::solve_overlay_pair(
+            &prepared,
+            first_seed,
+            second_seed,
+            request.constraints,
+            request.frontier_limit,
+        ) {
+            Ok(colors) => Ok(OverlayPairFallback {
+                colors,
+                strong_error: None,
+            }),
+            Err(strong_error) => {
+                let colors = Self::solve_overlay_pair(
+                    &prepared,
+                    first_seed,
+                    second_seed,
+                    fallback_constraints,
+                    fallback_frontier_limit,
+                )?;
+                Ok(OverlayPairFallback {
+                    colors,
+                    strong_error: Some(strong_error.to_string()),
+                })
+            }
+        }
     }
 
     pub fn fit_state(
@@ -1197,7 +1600,7 @@ impl Search {
             let fitted_metrics = ColorMetrics::from_hex(&fitted)?;
             let fitted_rgb = Rgb24::from_rgba(fitted_metrics.rgba.rgba());
             let fitted_transform = lab_distance(fitted_metrics.lab, source_lab);
-            let fitted_retention = oklab_to_oklch(fitted_metrics.lab)[1] / seed_chroma.max(1e-12);
+            let fitted_retention = lab_chroma(fitted_metrics.lab) / seed_chroma.max(1e-12);
             consider(
                 fitted_rgb,
                 fitted_metrics,
@@ -1463,5 +1866,122 @@ mod tests {
                 < contrast_ratio(&focal, &backgrounds[0]).unwrap()
         );
         assert_eq!(search.color_results.len(), 2);
+    }
+
+    #[test]
+    fn overlay_pair_is_bounded_deterministic_and_valid_after_composition() {
+        let backgrounds = vec!["#16181d".to_owned(), "#242730".to_owned()];
+        let request = || OverlayPairRequest {
+            first: FillRequest {
+                backgrounds: &backgrounds,
+                target: 1.10,
+                minimum_delta_e: 0.025,
+                runtime_state: None,
+                readable_foregrounds: &[],
+                rendered_references: &[],
+                runtime_rendered_references: &[],
+            },
+            second: FillRequest {
+                backgrounds: &backgrounds,
+                target: 1.10,
+                minimum_delta_e: 0.025,
+                runtime_state: None,
+                readable_foregrounds: &[],
+                rendered_references: &[],
+                runtime_rendered_references: &[],
+            },
+            constraints: PairConstraints {
+                foreground_contrast: 1.10,
+                pair_contrast: 1.01,
+                normal_delta: 0.030,
+                cvd_delta: 0.020,
+                lightness_delta: 0.0,
+                minimum_chroma: 0.0,
+                separation_alternative: None,
+                prefer_background: true,
+            },
+            maximum_alpha: 198,
+            frontier_limit: 512,
+        };
+        let mut search = Search::default();
+        let first = search
+            .fit_overlay_pair("#4fa66b", "#d75b68", request())
+            .unwrap();
+        let second = search
+            .fit_overlay_pair("#4fa66b", "#d75b68", request())
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert!(
+            first
+                .iter()
+                .all(|value| crate::color::parse_hex(value).unwrap().a <= 198.0 / 255.0 + 1e-12)
+        );
+        for background in &backgrounds {
+            let left = crate::color::render_layers(background, &[&first[0]]).unwrap();
+            let right = crate::color::render_layers(background, &[&first[1]]).unwrap();
+            assert!(contrast_ratio(&left, background).unwrap() >= 1.10 - 1e-9);
+            assert!(contrast_ratio(&right, background).unwrap() >= 1.10 - 1e-9);
+            assert!(delta_e(&left, &right).unwrap() >= 0.030 - 1e-9);
+            assert!(cvd_distance(&left, &right).unwrap() >= 0.020 - 1e-9);
+        }
+    }
+
+    #[test]
+    fn overlay_pair_fallback_reuses_candidates_without_changing_the_weak_result() {
+        let backgrounds = vec!["#16181d".to_owned(), "#242730".to_owned()];
+        let constraints = PairConstraints {
+            foreground_contrast: 1.10,
+            pair_contrast: 1.01,
+            normal_delta: 0.030,
+            cvd_delta: 0.020,
+            lightness_delta: 0.0,
+            minimum_chroma: 0.0,
+            separation_alternative: None,
+            prefer_background: true,
+        };
+        let request = |constraints| OverlayPairRequest {
+            first: FillRequest {
+                backgrounds: &backgrounds,
+                target: 1.10,
+                minimum_delta_e: 0.025,
+                runtime_state: None,
+                readable_foregrounds: &[],
+                rendered_references: &[],
+                runtime_rendered_references: &[],
+            },
+            second: FillRequest {
+                backgrounds: &backgrounds,
+                target: 1.10,
+                minimum_delta_e: 0.025,
+                runtime_state: None,
+                readable_foregrounds: &[],
+                rendered_references: &[],
+                runtime_rendered_references: &[],
+            },
+            constraints,
+            maximum_alpha: 198,
+            frontier_limit: 128,
+        };
+        let impossible = PairConstraints {
+            cvd_delta: 1.0,
+            ..constraints
+        };
+        let mut search = Search::default();
+        let fallback = search
+            .fit_overlay_pair_with_fallback(
+                "#4fa66b",
+                "#d75b68",
+                request(impossible),
+                constraints,
+                512,
+            )
+            .unwrap();
+        let direct = search
+            .fit_overlay_pair("#4fa66b", "#d75b68", request(constraints))
+            .unwrap();
+
+        assert!(fallback.strong_error.is_some());
+        assert_eq!(fallback.colors, direct);
     }
 }
