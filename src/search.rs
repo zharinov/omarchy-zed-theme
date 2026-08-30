@@ -157,6 +157,7 @@ impl PairConstraints {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct FillRequest<'a> {
     pub backgrounds: &'a [String],
     pub target: f64,

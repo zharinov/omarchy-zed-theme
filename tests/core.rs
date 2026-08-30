@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -28,6 +28,13 @@ fn temporary(name: &str) -> PathBuf {
         "omarchy-zed-theme-test-{}-{sequence}-{name}",
         std::process::id()
     ))
+}
+
+fn required_path(variable: &str) -> PathBuf {
+    PathBuf::from(
+        std::env::var_os(variable)
+            .unwrap_or_else(|| panic!("{variable} is required for this integration test")),
+    )
 }
 
 fn style(document: &Value) -> &serde_json::Map<String, Value> {
@@ -152,6 +159,59 @@ fn venice_like_palette() -> ResolvedPalette {
     palette
 }
 
+fn fixture_palette(value: &Value) -> (String, ResolvedPalette) {
+    let object = value
+        .as_object()
+        .expect("palette fixture must be an object");
+    let name = object["name"]
+        .as_str()
+        .expect("palette fixture must have a name")
+        .to_owned();
+    let mode = object["mode"]
+        .as_str()
+        .expect("palette fixture must have a mode")
+        .to_owned();
+    let colors = object["colors"]
+        .as_object()
+        .expect("palette fixture must have colors")
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}: {key} must be a string"))
+                    .to_owned(),
+            )
+        })
+        .collect();
+    let provenance = object["provenance"]
+        .as_object()
+        .expect("palette fixture must have provenance")
+        .iter()
+        .map(|(key, value)| {
+            let provenance = match value.as_str() {
+                Some("direct") => Provenance::Direct,
+                Some("alias") => Provenance::Alias,
+                Some("derived") => Provenance::Derived,
+                other => panic!("{name}: invalid provenance for {key}: {other:?}"),
+            };
+            (key.clone(), provenance)
+        })
+        .collect();
+
+    (
+        name,
+        ResolvedPalette {
+            mode,
+            colors,
+            extras: BTreeMap::new(),
+            resolver_stderr: String::new(),
+            provenance,
+        },
+    )
+}
+
 fn renamed_fields(source: &str, structure: &str) -> BTreeSet<String> {
     let start_marker = format!("pub struct {structure} {{");
     let body = source
@@ -258,11 +318,55 @@ pub struct Fixture {
 }
 
 #[test]
-fn current_zed_color_schema_matches_the_manifest_when_source_is_provided() {
-    // This opt-in check keeps a Zed checkout out of normal builds and test runs.
-    let Some(root) = std::env::var_os("OMARCHY_ZED_THEME_ZED_SOURCE").map(PathBuf::from) else {
-        return;
-    };
+fn representative_palette_fixtures_meet_the_rust_contract() {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/resolved-palettes.json")).unwrap();
+    assert_eq!(fixtures["version"].as_u64(), Some(1));
+    let omarchy_commit = include_str!("upstream-repositories.tsv")
+        .lines()
+        .find_map(|line| {
+            let mut columns = line.split('\t');
+            (columns.next() == Some("omarchy"))
+                .then(|| columns.nth(1))
+                .flatten()
+        })
+        .expect("missing pinned Omarchy revision");
+    assert_eq!(fixtures["source"]["name"].as_str(), Some("omarchy"));
+    assert_eq!(fixtures["source"]["commit"].as_str(), Some(omarchy_commit));
+
+    let expected_names = BTreeSet::from([
+        "matte-black".to_owned(),
+        "nord".to_owned(),
+        "tokyo-night".to_owned(),
+        "white".to_owned(),
+    ]);
+    let palettes = fixtures["palettes"].as_array().unwrap();
+    assert_eq!(palettes.len(), expected_names.len());
+    let mut actual_names = BTreeSet::new();
+    for fixture in palettes {
+        let (name, palette) = fixture_palette(fixture);
+        let (document, audit) =
+            build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let syntax = style(&document)["syntax"].as_object().unwrap();
+
+        assert_eq!(syntax.len(), 56, "{name}");
+        assert!(
+            audit.syntax_collapses.is_empty(),
+            "{name}: unexpected syntax collapse"
+        );
+        assert!(!audit.diff_metrics.is_empty(), "{name}");
+        assert_eq!(audit.interaction_ladders.len(), 3, "{name}");
+
+        actual_names.insert(name);
+    }
+
+    assert_eq!(actual_names, expected_names);
+}
+
+#[test]
+#[ignore = "requires the pinned Zed source checkout"]
+fn pinned_zed_color_schema_matches_the_manifest() {
+    let root = required_path("OMARCHY_ZED_THEME_ZED_SOURCE");
     let source_path = root.join("crates/settings_content/src/theme.rs");
     let source = fs::read_to_string(&source_path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", source_path.display()));
@@ -703,26 +807,12 @@ fn atomic_writer_rejects_final_symlink() {
 }
 
 #[test]
+#[ignore = "requires the pinned Omarchy source checkout"]
 fn all_builtin_themes_meet_the_rust_contract() {
-    let default_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("omarchy/themes");
-    let configured_root = std::env::var_os("OMARCHY_THEMES_DIR").map(PathBuf::from);
-    let root = configured_root.as_deref().unwrap_or(&default_root);
-    let resolver_available = std::process::Command::new("omarchy-theme-color")
-        .arg("--help")
-        .output()
-        .is_ok();
-    if configured_root.is_some() {
-        assert!(root.is_dir(), "configured Omarchy theme root is missing");
-        assert!(
-            resolver_available,
-            "omarchy-theme-color is required for the configured built-in-theme corpus"
-        );
-    } else if !root.is_dir() || !resolver_available {
-        return;
-    }
+    let root = required_path("OMARCHY_THEMES_DIR");
+    let resolver = required_path("OMARCHY_ZED_THEME_COLOR");
+    assert!(root.is_dir(), "configured Omarchy theme root is missing");
+    assert!(resolver.is_file(), "configured resolver is missing");
 
     let theme_names = [
         "catppuccin-latte",
@@ -758,7 +848,8 @@ fn all_builtin_themes_meet_the_rust_contract() {
     let mut profile_summary = BTreeMap::new();
 
     for name in theme_names {
-        let palette = resolve_palette(&root.join(name).join("colors.toml"), None).unwrap();
+        let palette =
+            resolve_palette(&root.join(name).join("colors.toml"), Some(&resolver)).unwrap();
         let (document, audit) =
             build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
 
@@ -999,14 +1090,13 @@ fn all_builtin_themes_meet_the_rust_contract() {
 }
 
 #[test]
-fn pinned_external_corpus_meets_the_rust_contract_when_available() {
-    // The opt-in root contains local checkouts at the commits in external-corpus.tsv.
-    let Some(root) = std::env::var_os("OMARCHY_ZED_THEME_EXTERNAL_CORPUS").map(PathBuf::from)
-    else {
-        return;
-    };
+#[ignore = "requires the pinned external theme corpus"]
+fn pinned_external_corpus_meets_the_rust_contract() {
+    let root = required_path("OMARCHY_ZED_THEME_EXTERNAL_CORPUS");
+    let resolver = required_path("OMARCHY_ZED_THEME_COLOR");
     let manifest = include_str!("external-corpus.tsv");
     let mut tested = 0;
+    let mut errors = Vec::new();
 
     for line in manifest.lines().filter(|line| !line.starts_with('#')) {
         let columns: Vec<_> = line.split('\t').collect();
@@ -1016,38 +1106,62 @@ fn pinned_external_corpus_meets_the_rust_contract_when_available() {
         };
 
         let checkout = root.join(name);
-        let actual_commit = std::process::Command::new("git")
-            .args(["-C"])
-            .arg(&checkout)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap_or_else(|error| panic!("{name}: cannot inspect commit: {error}"));
+        let result = (|| -> Result<(), String> {
+            let actual_commit = std::process::Command::new("git")
+                .args(["-C"])
+                .arg(&checkout)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .map_err(|error| format!("cannot inspect commit: {error}"))?;
+            if !actual_commit.status.success() {
+                return Err("git rev-parse failed".into());
+            }
+            let actual_commit = String::from_utf8_lossy(&actual_commit.stdout);
+            if actual_commit.trim() != *commit {
+                return Err(format!(
+                    "corpus checkout is at {}, expected {commit}",
+                    actual_commit.trim()
+                ));
+            }
 
-        assert!(
-            actual_commit.status.success(),
-            "{name}: git rev-parse failed"
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&actual_commit.stdout).trim(),
-            *commit,
-            "{name}: corpus checkout is not at the pinned commit"
-        );
+            let palette = resolve_palette(&checkout.join(palette_path), Some(&resolver))
+                .map_err(|error| error.to_string())?;
+            let (document, audit) = build_theme(&palette).map_err(|error| error.to_string())?;
+            let syntax = style(&document)["syntax"]
+                .as_object()
+                .ok_or_else(|| "generated syntax is not an object".to_owned())?;
+            if syntax.len() != 56 {
+                return Err(format!(
+                    "generated {} syntax captures, expected 56",
+                    syntax.len()
+                ));
+            }
+            if !audit.syntax_collapses.is_empty() {
+                return Err("unexpected syntax collapse".into());
+            }
+            if audit.diff_metrics.is_empty() {
+                return Err("missing diff metrics".into());
+            }
+            if audit.interaction_ladders.len() != 3 {
+                return Err(format!(
+                    "generated {} interaction ladders, expected 3",
+                    audit.interaction_ladders.len()
+                ));
+            }
 
-        let palette = resolve_palette(&checkout.join(palette_path), None)
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        let (document, audit) =
-            build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
-        let syntax = style(&document)["syntax"].as_object().unwrap();
-        assert_eq!(syntax.len(), 56, "{name}");
-        assert!(
-            audit.syntax_collapses.is_empty(),
-            "{name}: unexpected syntax collapse"
-        );
-        assert!(!audit.diff_metrics.is_empty(), "{name}");
-        assert_eq!(audit.interaction_ladders.len(), 3, "{name}");
+            Ok(())
+        })();
+        if let Err(error) = result {
+            errors.push(format!("{name}: {error}"));
+        }
 
         tested += 1;
     }
 
     assert_eq!(tested, 16);
+    assert!(
+        errors.is_empty(),
+        "external corpus failures:\n{}",
+        errors.join("\n")
+    );
 }

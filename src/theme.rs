@@ -128,6 +128,39 @@ fn render_with_bounded_generic_highlights(
     Ok(scenes)
 }
 
+fn fit_preserving_highlight(
+    search: &mut Search,
+    audit: &mut Audit,
+    role: &str,
+    seed: &str,
+    request: FillRequest<'_>,
+) -> Result<String> {
+    let preserving_error =
+        match search.fit_fill_readable_bounded(seed, request, PRESERVING_HIGHLIGHT_MAX_ALPHA) {
+            Ok(output) => return Ok(output),
+            Err(error) => error,
+        };
+    let output = search
+        .fit_fill_readable_bounded(seed, request, OVERLAY_MAX_ALPHA)
+        .map_err(|fallback_error| {
+            Error(format!(
+                "{role}: preferred alpha cap failed: {preserving_error}; relaxed alpha cap failed: {fallback_error}"
+            ))
+        })?;
+
+    audit.degradation(
+        role.into(),
+        "highlight_alpha_preservation",
+        json!({
+            "preferred_maximum_alpha": PRESERVING_HIGHLIGHT_MAX_ALPHA,
+            "fallback_maximum_alpha": OVERLAY_MAX_ALPHA,
+            "actual_alpha": round6(parse_hex(&output)?.a),
+            "reason": preserving_error.to_string(),
+        }),
+    );
+    Ok(output)
+}
+
 struct OpaqueRole(&'static str);
 struct OverlayRole(&'static str);
 struct StrokeRole(&'static str);
@@ -915,43 +948,81 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     ]);
 
     let readable_editor_overlay_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
-    let search_match = search
-        .fit_fill_readable_bounded(
-            &semantic.yellow,
-            FillRequest::new(&editor_bases, SEARCH_MATCH_CONTRAST, STATE_HOVER_DELTA_E)
-                .with_readable_foregrounds(&readable_editor_overlay_text),
-            PRESERVING_HIGHLIGHT_MAX_ALPHA,
+    let search_match_request =
+        FillRequest::new(&editor_bases, SEARCH_MATCH_CONTRAST, STATE_HOVER_DELTA_E)
+            .with_readable_foregrounds(&readable_editor_overlay_text);
+    let initial_search_match = fit_preserving_highlight(
+        &mut search,
+        &mut audit,
+        "search.match_background",
+        &semantic.yellow,
+        search_match_request,
+    )?;
+    let search_active_request = FillRequest::new(
+        &editor_bases,
+        SEARCH_ACTIVE_CONTRAST,
+        STATE_SELECTED_DELTA_E,
+    )
+    .with_readable_foregrounds(&readable_editor_overlay_text);
+    let (search_match, search_active) = match fit_preserving_highlight(
+        &mut search,
+        &mut audit,
+        "search.active_match_background",
+        &semantic.accent,
+        search_active_request.with_rendered_references(&[(
+            initial_search_match.clone(),
+            STATE_CONSECUTIVE_CONTRAST,
+            STATE_CONSECUTIVE_DELTA_E,
+        )]),
+    ) {
+        Ok(search_active) => (initial_search_match, search_active),
+        Err(sequential_error) => {
+            let [joint_search_match, joint_search_active] = search
+                .fit_overlay_pair(
+                    &semantic.yellow,
+                    &semantic.accent,
+                    OverlayPairRequest::new(
+                        search_match_request,
+                        search_active_request,
+                        PairConstraints::new(
+                            SEARCH_MATCH_CONTRAST,
+                            STATE_CONSECUTIVE_CONTRAST,
+                            STATE_CONSECUTIVE_DELTA_E,
+                            0.0,
+                        ),
+                    )
+                    .with_limits(PRESERVING_HIGHLIGHT_MAX_ALPHA, 512),
+                )
+                .map_err(|joint_error| {
+                    Error(format!(
+                        "search highlights failed sequentially ({sequential_error}) and jointly ({joint_error})"
+                    ))
+                })?;
+            audit.degradation(
+                "search.active_match_background".into(),
+                "joint_state_fit",
+                json!({
+                    "initial_match": initial_search_match,
+                    "joint_match": joint_search_match,
+                    "reason": sequential_error.to_string(),
+                }),
+            );
+            (joint_search_match, joint_search_active)
+        }
+    };
+
+    let document_read = fit_preserving_highlight(
+        &mut search,
+        &mut audit,
+        "editor.document_highlight.read_background",
+        &semantic.accent,
+        FillRequest::new(
+            &editor_bases,
+            STATE_SELECTED_CONTRAST,
+            STATE_SELECTED_DELTA_E,
         )
-        .map_err(|error| Error(format!("search match: {error}")))?;
-    let search_active = search
-        .fit_fill_readable_bounded(
-            &semantic.accent,
-            FillRequest::new(
-                &editor_bases,
-                SEARCH_ACTIVE_CONTRAST,
-                STATE_SELECTED_DELTA_E,
-            )
-            .with_readable_foregrounds(&readable_editor_overlay_text)
-            .with_rendered_references(&[(
-                search_match.clone(),
-                STATE_CONSECUTIVE_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )]),
-            PRESERVING_HIGHLIGHT_MAX_ALPHA,
-        )
-        .map_err(|error| Error(format!("active search match: {error}")))?;
-    let document_read = search
-        .fit_fill_readable_bounded(
-            &semantic.accent,
-            FillRequest::new(
-                &editor_bases,
-                STATE_SELECTED_CONTRAST,
-                STATE_SELECTED_DELTA_E,
-            )
-            .with_readable_foregrounds(&readable_editor_overlay_text),
-            PRESERVING_HIGHLIGHT_MAX_ALPHA,
-        )
-        .map_err(|error| Error(format!("document read highlight: {error}")))?;
+        .with_readable_foregrounds(&readable_editor_overlay_text),
+    )?;
 
     if parse_hex(&document_read)?.opaque_hex() != content_accent {
         audit.fidelity_deviations.push(json!({
@@ -963,30 +1034,30 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         }));
     }
 
-    let document_write = search
-        .fit_fill_readable_bounded(
-            &semantic.orange,
-            FillRequest::new(
-                &editor_bases,
-                STATE_SELECTED_CONTRAST,
-                STATE_SELECTED_DELTA_E,
-            )
-            .with_readable_foregrounds(&readable_editor_overlay_text),
-            PRESERVING_HIGHLIGHT_MAX_ALPHA,
+    let document_write = fit_preserving_highlight(
+        &mut search,
+        &mut audit,
+        "editor.document_highlight.write_background",
+        &semantic.orange,
+        FillRequest::new(
+            &editor_bases,
+            STATE_SELECTED_CONTRAST,
+            STATE_SELECTED_DELTA_E,
         )
-        .map_err(|error| Error(format!("document write highlight: {error}")))?;
-    let document_bracket = search
-        .fit_fill_readable_bounded(
-            &semantic.cyan,
-            FillRequest::new(
-                &editor_bases,
-                STATE_SELECTED_CONTRAST,
-                STATE_SELECTED_DELTA_E,
-            )
-            .with_readable_foregrounds(&readable_editor_overlay_text),
-            PRESERVING_HIGHLIGHT_MAX_ALPHA,
+        .with_readable_foregrounds(&readable_editor_overlay_text),
+    )?;
+    let document_bracket = fit_preserving_highlight(
+        &mut search,
+        &mut audit,
+        "editor.document_highlight.bracket_background",
+        &semantic.cyan,
+        FillRequest::new(
+            &editor_bases,
+            STATE_SELECTED_CONTRAST,
+            STATE_SELECTED_DELTA_E,
         )
-        .map_err(|error| Error(format!("document bracket highlight: {error}")))?;
+        .with_readable_foregrounds(&readable_editor_overlay_text),
+    )?;
 
     // Diff colors are derived as a dedicated semantic subsystem because diff viewers
     // combine text, fills, hollow borders, selections, and conflict overlays.
@@ -1087,18 +1158,18 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         )
         .map_err(|error| Error(format!("conflict backgrounds: {error}")))?;
 
-    let yank = search
-        .fit_fill_readable_bounded(
-            &semantic.yellow,
-            FillRequest::new(
-                &editor_bases,
-                STATE_SELECTED_CONTRAST,
-                STATE_SELECTED_DELTA_E,
-            )
-            .with_readable_foregrounds(&readable_editor_overlay_text),
-            PRESERVING_HIGHLIGHT_MAX_ALPHA,
+    let yank = fit_preserving_highlight(
+        &mut search,
+        &mut audit,
+        "vim.yank.background",
+        &semantic.yellow,
+        FillRequest::new(
+            &editor_bases,
+            STATE_SELECTED_CONTRAST,
+            STATE_SELECTED_DELTA_E,
         )
-        .map_err(|error| Error(format!("Vim yank highlight: {error}")))?;
+        .with_readable_foregrounds(&readable_editor_overlay_text),
+    )?;
 
     let generic_highlights = [
         search_match.as_str(),
@@ -1207,6 +1278,19 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             .chain(word_deleted_scenes.iter().cloned()),
     );
 
+    let player_seed_values = [
+        semantic.accent.clone(),
+        semantic.orange.clone(),
+        semantic.magenta.clone(),
+        semantic.green.clone(),
+        semantic.blue.clone(),
+        semantic.yellow.clone(),
+        semantic.cyan.clone(),
+        semantic.red.clone(),
+    ];
+    let mut player_seeds = vec![player_seed_values[0].clone()];
+    player_seeds.extend(cvd_greedy_order(&player_seed_values[1..])?);
+
     let selection_readable = [(editor_primary.clone(), TEXT_CONTRAST)];
     let selection_request = || {
         FillRequest::new(
@@ -1224,44 +1308,62 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         u8::MAX,
     ) {
         Ok(selection) => selection,
-        Err(primary_error) => {
-            let fallback = search
-                .fit_fill_readable_alpha_range(
-                    &semantic.accent,
-                    selection_request(),
-                    u8::MAX,
-                    u8::MAX,
-                )
-                .map_err(|fallback_error| {
-                    Error(format!(
-                        "focused selection: {primary_error}; accent fallback: {fallback_error}"
-                    ))
-                })?;
-            audit.degradation(
-                "element.selection_background".into(),
-                "overlay_seed_substitution",
-                json!({
-                    "requested": color(palette, "selection"),
-                    "fallback": semantic.accent,
-                    "reason": primary_error.to_string(),
-                }),
-            );
-            fallback
+        Err(source_error) => {
+            match search.fit_fill_readable_alpha_range(
+                &semantic.accent,
+                selection_request(),
+                u8::MAX,
+                u8::MAX,
+            ) {
+                Ok(selection) => {
+                    audit.degradation(
+                        "players[0].selection".into(),
+                        "selection_seed_substitution",
+                        json!({
+                            "requested": color(palette, "selection"),
+                            "fallback": semantic.accent,
+                            "reason": source_error.to_string(),
+                        }),
+                    );
+                    selection
+                }
+                Err(accent_error) => {
+                    let mut fallback_errors = Vec::new();
+                    let mut fallback = None;
+                    for seed in player_seeds.iter().skip(1) {
+                        match search.fit_fill_readable_alpha_range(
+                            seed,
+                            selection_request(),
+                            u8::MAX,
+                            u8::MAX,
+                        ) {
+                            Ok(selection) => {
+                                fallback = Some((seed, selection));
+                                break;
+                            }
+                            Err(error) => fallback_errors.push(format!("{seed}: {error}")),
+                        }
+                    }
+                    let (fallback_seed, selection) = fallback.ok_or_else(|| {
+                        Error(format!(
+                            "focused selection failed for source ({source_error}), accent ({accent_error}), and player seeds ({})",
+                            fallback_errors.join("; ")
+                        ))
+                    })?;
+                    audit.degradation(
+                        "players[0].selection".into(),
+                        "selection_seed_substitution",
+                        json!({
+                            "requested": color(palette, "selection"),
+                            "fallback": fallback_seed,
+                            "reason": source_error.to_string(),
+                        }),
+                    );
+                    selection
+                }
+            }
         }
     };
-
-    let player_seed_values = [
-        semantic.accent.clone(),
-        semantic.orange.clone(),
-        semantic.magenta.clone(),
-        semantic.green.clone(),
-        semantic.blue.clone(),
-        semantic.yellow.clone(),
-        semantic.cyan.clone(),
-        semantic.red.clone(),
-    ];
-    let mut player_seeds = vec![player_seed_values[0].clone()];
-    player_seeds.extend(cvd_greedy_order(&player_seed_values[1..])?);
 
     let mut player_cursor_backgrounds = editor_text_backgrounds.clone();
     for background in &editor_text_backgrounds {
@@ -1450,6 +1552,32 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         terminal.insert(format!("terminal.ansi.bright_{name}"), triplet[2].clone());
     }
 
+    let overlay_contexts = editor_text_backgrounds.clone();
+    let focused_selections: Vec<_> = editor_text_backgrounds
+        .iter()
+        .flat_map(|base| {
+            players
+                .iter()
+                .map(|player| gpui_blend(base, &player["selection"]).unwrap().opaque_hex())
+        })
+        .collect();
+    let local_unfocused: Vec<_> = editor_text_backgrounds
+        .iter()
+        .map(|base| {
+            gpui_blend(base, &apply_opacity(&players[0]["selection"], 0.5).unwrap())
+                .unwrap()
+                .opaque_hex()
+        })
+        .collect();
+    let syntax_contexts = unique(
+        editor_bases
+            .iter()
+            .cloned()
+            .chain(overlay_contexts.iter().cloned())
+            .chain(focused_selections)
+            .chain(local_unfocused),
+    );
+
     let status_seeds: BTreeMap<&str, &String> = BTreeMap::from([
         ("created", &diff_green_seed),
         ("deleted", &diff_red_seed),
@@ -1491,12 +1619,18 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         if *name == "ignored" {
             continue;
         }
+        let syntax_backgrounds = if *name == "predictive" {
+            syntax_contexts.as_slice()
+        } else {
+            &[]
+        };
         let status_foreground_backgrounds = unique(
             interaction_bases
                 .iter()
                 .chain(editor_text_backgrounds.iter())
                 .cloned()
-                .chain(std::iter::once(status_backgrounds[name].clone())),
+                .chain(std::iter::once(status_backgrounds[name].clone()))
+                .chain(syntax_backgrounds.iter().cloned()),
         );
         let output = if matches!(*name, "created" | "deleted" | "warning") {
             search.fit_color_bounded(
@@ -1574,32 +1708,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         );
         vim.insert(format!("vim.{name}.background"), background);
     }
-
-    let overlay_contexts = editor_text_backgrounds.clone();
-    let focused_selections: Vec<_> = editor_text_backgrounds
-        .iter()
-        .flat_map(|base| {
-            players
-                .iter()
-                .map(|player| gpui_blend(base, &player["selection"]).unwrap().opaque_hex())
-        })
-        .collect();
-    let local_unfocused: Vec<_> = editor_text_backgrounds
-        .iter()
-        .map(|base| {
-            gpui_blend(base, &apply_opacity(&players[0]["selection"], 0.5).unwrap())
-                .unwrap()
-                .opaque_hex()
-        })
-        .collect();
-    let syntax_contexts = unique(
-        editor_bases
-            .iter()
-            .cloned()
-            .chain(overlay_contexts.iter().cloned())
-            .chain(focused_selections)
-            .chain(local_unfocused),
-    );
 
     let syntax = build_syntax(
         &mut search,
