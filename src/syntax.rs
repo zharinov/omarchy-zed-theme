@@ -50,11 +50,9 @@ struct FamilyAllocation {
 type DistanceMatrix = Vec<Vec<f64>>;
 
 fn minimum_contrast(color: &str, contexts: &[String]) -> Result<f64> {
-    contexts
-        .iter()
-        .map(|context| contrast_ratio(color, context))
-        .collect::<Result<Vec<_>>>()
-        .map(|values| values.into_iter().fold(f64::INFINITY, f64::min))
+    contexts.iter().try_fold(f64::INFINITY, |minimum, context| {
+        Ok(minimum.min(contrast_ratio(color, context)?))
+    })
 }
 
 fn role_source_preferences(role: SemanticRole) -> &'static [&'static str] {

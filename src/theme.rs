@@ -5,7 +5,7 @@
 
 use self::tokens::{
     ContentTokens, DerivedTokens, InteractionTokens, OpaqueColor, OverlayColor, PaintColor,
-    RoleColor, RoleColorKind, StatusChannel, StatusTokens, SurfaceTokens, ThemeTokens,
+    RoleColor, StatusChannel, StatusTokens, SurfaceTokens, ThemeTokens,
 };
 use crate::color::{
     apply_opacity, contrast_ratio, delta_e, gamut_map_oklch, gpui_blend, lab, lightness,
@@ -24,7 +24,7 @@ use crate::search::{
 use crate::syntax::{build_syntax, contrast_floor};
 use crate::{Error, Result};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 mod tokens;
 
@@ -164,70 +164,54 @@ fn fit_highlight_with_alpha_fallback(
     Ok(output)
 }
 
-struct OpaqueRole(&'static str);
-struct OverlayRole(&'static str);
-struct StrokeRole(&'static str);
-
 #[derive(Default)]
 struct StyleBuilder(BTreeMap<String, String>);
 
 impl StyleBuilder {
-    fn set_role(&mut self, role: RoleColor) -> Result<()> {
-        let (role, value, kind) = role.into_parts();
-        let alpha = crate::color::parse_hex(&value)?.a;
-
-        if kind == RoleColorKind::Opaque && alpha < 1.0 {
-            return Err(Error(format!(
-                "opaque role {} received translucent color {}",
-                role, value
-            )));
+    fn insert(&mut self, role: RoleColor) -> Result<()> {
+        let (name, value) = role.into_parts();
+        match self.0.entry(name) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(Error(format!(
+                "theme role {} was generated twice",
+                entry.key()
+            ))),
         }
-        if kind == RoleColorKind::Overlay && alpha >= 1.0 {
-            return Err(Error(format!(
-                "layered overlay role {} received opaque color {}",
-                role, value
-            )));
-        }
+    }
 
-        self.0.insert(role, value);
+    fn insert_opaque(&mut self, role: impl Into<String>, color: String) -> Result<()> {
+        self.insert(RoleColor::opaque_value(role, color)?)
+    }
+
+    fn insert_overlay(&mut self, role: impl Into<String>, color: String) -> Result<()> {
+        self.insert(RoleColor::overlay_value(role, color)?)
+    }
+
+    fn extend(&mut self, roles: impl IntoIterator<Item = RoleColor>) -> Result<()> {
+        for role in roles {
+            self.insert(role)?;
+        }
         Ok(())
     }
 
-    fn set_opaque(&mut self, role: OpaqueRole, color: String) -> Result<()> {
-        if crate::color::parse_hex(&color)?.a < 1.0 {
-            return Err(Error(format!(
-                "opaque role {} received translucent color {color}",
-                role.0
-            )));
+    fn extend_opaque(&mut self, roles: impl IntoIterator<Item = (String, String)>) -> Result<()> {
+        for (role, color) in roles {
+            self.insert_opaque(role, color)?;
         }
-        self.0.insert(role.0.into(), color);
         Ok(())
     }
 
-    fn set_overlay(&mut self, role: OverlayRole, color: String) -> Result<()> {
-        if crate::color::parse_hex(&color)?.a >= 1.0 {
-            return Err(Error(format!(
-                "layered overlay role {} received opaque color {color}",
-                role.0
-            )));
+    fn append_to(self, style: &mut Map<String, Value>) -> Result<()> {
+        for (role, color) in self.0 {
+            if style.contains_key(&role) {
+                return Err(Error(format!("theme role {role} was generated twice")));
+            }
+            style.insert(role, color.into());
         }
-        self.0.insert(role.0.into(), color);
         Ok(())
-    }
-
-    fn set_stroke(&mut self, role: StrokeRole, color: String) -> Result<()> {
-        if crate::color::parse_hex(&color)?.a >= 1.0 {
-            return Err(Error(format!(
-                "layered stroke role {} received opaque color {color}",
-                role.0
-            )));
-        }
-        self.0.insert(role.0.into(), color);
-        Ok(())
-    }
-
-    fn into_inner(self) -> BTreeMap<String, String> {
-        self.0
     }
 }
 
@@ -254,15 +238,18 @@ fn derive_surfaces(
             ("elevated", 0.020),
         ]
     };
-    let authored: Vec<(&str, &str)> = [
+    let authored = [
         "darker_background",
         "dark_background",
         "lighter_background",
         "background",
     ]
     .into_iter()
-    .map(|key| (key, color(palette, key)))
-    .collect();
+    .map(|key| {
+        let value = color(palette, key);
+        Ok((key, value, lightness(value)?))
+    })
+    .collect::<Result<Vec<_>>>()?;
 
     let mut surfaces = BTreeMap::from([("canvas".into(), canvas.to_owned())]);
     let mut used = BTreeSet::from([canvas.to_owned()]);
@@ -273,57 +260,63 @@ fn derive_surfaces(
         let lower_side = target < canvas_lightness;
         let mut eligible = Vec::new();
 
-        for (key, value) in &authored {
-            let value_lightness = lightness(value)?;
+        for (key, value, value_lightness) in &authored {
             let on_side = if lower_side {
-                value_lightness < canvas_lightness
+                *value_lightness < canvas_lightness
             } else {
-                value_lightness > canvas_lightness
+                *value_lightness > canvas_lightness
             };
 
             if used.contains(*value) {
                 continue;
             }
 
-            if (value_lightness - target).abs() > 0.015 + 1e-12 {
+            if (*value_lightness - target).abs() > 0.015 + 1e-12 {
                 continue;
             }
 
-            if !on_side || value_lightness <= previous + 1e-6 {
+            if !on_side || *value_lightness <= previous + 1e-6 {
                 continue;
             }
 
-            eligible.push(((value_lightness - target).abs(), *key, *value));
+            eligible.push((
+                (*value_lightness - target).abs(),
+                *key,
+                *value,
+                *value_lightness,
+            ));
         }
 
         eligible.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(right.1)));
 
-        let (source_key, output) = if let Some((_, key, value)) = eligible.first() {
-            (*key, (*value).to_owned())
-        } else {
-            let (key, source) = authored
-                .iter()
-                .min_by(|left, right| {
-                    (lightness(left.1).unwrap() - target)
-                        .abs()
-                        .total_cmp(&(lightness(right.1).unwrap() - target).abs())
-                        .then(left.0.cmp(right.0))
-                })
-                .unwrap();
-            let mut output = tone(source, target, 1.0)?;
-            if lightness(&output)? <= previous + 1e-6 {
-                output = tone(source, (previous + 0.004).min(1.0), 1.0)?;
-            }
-            (*key, output)
-        };
+        let (source_key, source, source_lightness, output) =
+            if let Some((_, key, value, value_lightness)) = eligible.first() {
+                (*key, *value, *value_lightness, (*value).to_owned())
+            } else {
+                let Some((key, source, source_lightness)) =
+                    authored.iter().min_by(|left, right| {
+                        (left.2 - target)
+                            .abs()
+                            .total_cmp(&(right.2 - target).abs())
+                            .then(left.0.cmp(right.0))
+                    })
+                else {
+                    return Err(Error("no authored surface colors are available".into()));
+                };
+                let mut output = tone(source, target, 1.0)?;
+                if lightness(&output)? <= previous + 1e-6 {
+                    output = tone(source, (previous + 0.004).min(1.0), 1.0)?;
+                }
+                (*key, *source, *source_lightness, output)
+            };
 
         used.insert(output.clone());
         previous = lightness(&output)?;
 
         audit.surface_changes.push(json!({
-            "role": role, "source_key": source_key, "source": color(palette, source_key), "output": output,
-            "delta_l": round6(lightness(&output)? - lightness(color(palette, source_key))?),
-            "delta_e": round6(delta_e(&output, color(palette, source_key))?),
+            "role": role, "source_key": source_key, "source": source, "output": output,
+            "delta_l": round6(lightness(&output)? - source_lightness),
+            "delta_e": round6(delta_e(&output, source)?),
         }));
 
         surfaces.insert(role.into(), output);
@@ -335,9 +328,29 @@ fn derive_surfaces(
 fn minimum_contrast(foreground: &str, backgrounds: &[String]) -> Result<f64> {
     backgrounds
         .iter()
-        .map(|background| contrast_ratio(foreground, background))
-        .collect::<Result<Vec<_>>>()
-        .map(|values| values.into_iter().fold(f64::INFINITY, f64::min))
+        .try_fold(f64::INFINITY, |minimum, background| {
+            Ok(minimum.min(contrast_ratio(foreground, background)?))
+        })
+}
+
+fn minimum_pairwise(
+    first: &[String],
+    second: &[String],
+    metric: impl Fn(&str, &str) -> Result<f64>,
+) -> Result<f64> {
+    if first.len() != second.len() {
+        return Err(Error(format!(
+            "paired color contexts have different lengths: {} and {}",
+            first.len(),
+            second.len()
+        )));
+    }
+    first
+        .iter()
+        .zip(second)
+        .try_fold(f64::INFINITY, |minimum, (left, right)| {
+            Ok(minimum.min(metric(left, right)?))
+        })
 }
 
 fn fit_player_cursors(
@@ -1496,9 +1509,13 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         ]));
     }
 
-    let local_selection = gpui_blend(&canvas, &players[0]["selection"])?.opaque_hex();
-    let local_unfocused_selection =
-        gpui_blend(&canvas, &apply_opacity(&players[0]["selection"], 0.5)?)?.opaque_hex();
+    let local_selection_overlay = players
+        .first()
+        .and_then(|player| player.get("selection"))
+        .ok_or_else(|| Error("local player has no selection color".into()))?;
+    let local_unfocused_overlay = apply_opacity(local_selection_overlay, 0.5)?;
+    let local_selection = gpui_blend(&canvas, local_selection_overlay)?.opaque_hex();
+    let local_unfocused_selection = gpui_blend(&canvas, &local_unfocused_overlay)?.opaque_hex();
     let terminal_backgrounds = unique([canvas.clone(), local_selection, local_unfocused_selection]);
     let foreground_triplet = terminal_triplet(
         &mut search,
@@ -1556,22 +1573,19 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     }
 
     let overlay_contexts = editor_text_backgrounds.clone();
-    let focused_selections: Vec<_> = editor_text_backgrounds
+    let mut focused_selections = Vec::with_capacity(editor_text_backgrounds.len() * players.len());
+    for base in &editor_text_backgrounds {
+        for player in &players {
+            let selection = player
+                .get("selection")
+                .ok_or_else(|| Error("player has no selection color".into()))?;
+            focused_selections.push(gpui_blend(base, selection)?.opaque_hex());
+        }
+    }
+    let local_unfocused = editor_text_backgrounds
         .iter()
-        .flat_map(|base| {
-            players
-                .iter()
-                .map(|player| gpui_blend(base, &player["selection"]).unwrap().opaque_hex())
-        })
-        .collect();
-    let local_unfocused: Vec<_> = editor_text_backgrounds
-        .iter()
-        .map(|base| {
-            gpui_blend(base, &apply_opacity(&players[0]["selection"], 0.5).unwrap())
-                .unwrap()
-                .opaque_hex()
-        })
-        .collect();
+        .map(|base| Ok(gpui_blend(base, &local_unfocused_overlay)?.opaque_hex()))
+        .collect::<Result<Vec<_>>>()?;
     let syntax_contexts = unique(
         editor_bases
             .iter()
@@ -1665,21 +1679,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         statuses.insert(format!("{name}.background"), background);
         statuses.insert(format!("{name}.border"), border);
     }
-    for (alias, source) in [
-        ("success", "created"),
-        ("error", "deleted"),
-        ("conflict", "warning"),
-        ("modified", "warning"),
-        ("renamed", "info"),
-    ] {
-        for suffix in ["", ".background", ".border"] {
-            statuses.insert(
-                format!("{alias}{suffix}"),
-                statuses[&format!("{source}{suffix}")].clone(),
-            );
-        }
-    }
-
     let mode_seeds: [(&str, &String); 8] = [
         ("normal", &semantic.accent),
         ("insert", &semantic.green),
@@ -1820,11 +1819,8 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         },
         content: ContentTokens {
             primary: OpaqueColor::new(semantic.primary.clone())?,
-            muted: OpaqueColor::new(statuses["unreachable"].clone())?,
-            disabled: OpaqueColor::new(statuses["hidden"].clone())?,
             accent: OpaqueColor::new(content_accent)?,
             editor_primary: OpaqueColor::new(editor_primary.clone())?,
-            predictive: OpaqueColor::new(statuses["predictive"].clone())?,
         },
         interactions: InteractionTokens {
             element_hover: OverlayColor::new(element_hover.clone())?,
@@ -1837,14 +1833,11 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             negative: status_channel("deleted")?,
             warning: status_channel("warning")?,
             informational: status_channel("info")?,
-            predictive_background: OpaqueColor::new(statuses["predictive.background"].clone())?,
-            predictive_border: OpaqueColor::new(statuses["predictive.border"].clone())?,
-            hint_foreground: OpaqueColor::new(statuses["hint"].clone())?,
-            hint_background: OpaqueColor::new(statuses["hint.background"].clone())?,
-            hint_border: OpaqueColor::new(statuses["hint.border"].clone())?,
-            hidden_background: OpaqueColor::new(statuses["hidden.background"].clone())?,
-            ignored_background: OpaqueColor::new(statuses["ignored.background"].clone())?,
-            unreachable_background: OpaqueColor::new(statuses["unreachable.background"].clone())?,
+            predictive: status_channel("predictive")?,
+            hint: status_channel("hint")?,
+            hidden: status_channel("hidden")?,
+            ignored: status_channel("ignored")?,
+            unreachable: status_channel("unreachable")?,
         },
         derived: DerivedTokens {
             editor_active_line: OverlayColor::new(editor_active_line.clone())?,
@@ -1857,20 +1850,14 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     let mut fixed = StyleBuilder::default();
     macro_rules! put {
         ($name:expr, $value:expr) => {
-            fixed.set_opaque(OpaqueRole($name), $value)?;
+            fixed.insert_opaque($name, $value)?;
         };
     }
     macro_rules! put_overlay {
         ($name:expr, $value:expr) => {
-            fixed.set_overlay(OverlayRole($name), $value)?;
+            fixed.insert_overlay($name, $value)?;
         };
     }
-    macro_rules! put_stroke {
-        ($name:expr, $value:expr) => {
-            fixed.set_stroke(StrokeRole($name), $value)?;
-        };
-    }
-
     put!("border", semantic.structural.clone());
     put!("border.variant", semantic.structural.clone());
     put!("border.focused", semantic.accent.clone());
@@ -1945,7 +1932,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         "editor.diff_hunk.added.hollow_background",
         diff_added_hollow.clone()
     );
-    put_stroke!(
+    put_overlay!(
         "editor.diff_hunk.added.hollow_border",
         diff_added_hollow_border
     );
@@ -1954,11 +1941,11 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         "editor.diff_hunk.deleted.hollow_background",
         diff_deleted_hollow.clone()
     );
-    put_stroke!(
+    put_overlay!(
         "editor.diff_hunk.deleted.hollow_border",
         diff_deleted_hollow_border
     );
-    fixed.0.extend(terminal);
+    fixed.extend_opaque(terminal)?;
 
     put!("version_control.added", version_control_added);
     put!("version_control.deleted", version_control_deleted);
@@ -1974,22 +1961,17 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     let vim_yank = vim
         .remove("vim.yank.background")
         .ok_or_else(|| Error("missing generated Vim yank highlight".into()))?;
-    fixed.set_overlay(OverlayRole("vim.yank.background"), vim_yank)?;
+    fixed.insert_overlay("vim.yank.background", vim_yank)?;
 
-    fixed.0.extend(vim);
-    for role in theme_tokens.zed_roles() {
-        fixed.set_role(role)?;
-    }
+    fixed.extend_opaque(vim)?;
+    fixed.extend(theme_tokens.zed_roles())?;
+    let mut status_roles = StyleBuilder::default();
+    status_roles.extend(theme_tokens.statuses.zed_roles())?;
 
     let mut style = Map::new();
     style.insert("background.appearance".into(), "opaque".into());
-    style.extend(statuses.into_iter().map(|(key, value)| (key, value.into())));
-    style.extend(
-        fixed
-            .into_inner()
-            .into_iter()
-            .map(|(key, value)| (key, value.into())),
-    );
+    status_roles.append_to(&mut style)?;
+    fixed.append_to(&mut style)?;
 
     style.insert(
         "accents".into(),
@@ -2973,11 +2955,7 @@ fn validate_theme(
             &conflict_theirs,
         ),
     ] {
-        let actual = bases
-            .iter()
-            .zip(rendered)
-            .map(|(base, output)| contrast_ratio(output, base).unwrap())
-            .fold(f64::INFINITY, f64::min);
+        let actual = minimum_pairwise(bases, rendered, contrast_ratio)?;
         diff_fill_minimum = diff_fill_minimum.min(actual);
         if actual < target - 1e-9 {
             errors.push(format!("diff fill {name} reaches only {actual:.3}:1"));
@@ -2996,11 +2974,7 @@ fn validate_theme(
             &word_deleted,
         ),
     ] {
-        let actual = bases
-            .iter()
-            .zip(rendered)
-            .map(|(base, output)| contrast_ratio(output, base).unwrap())
-            .fold(f64::INFINITY, f64::min);
+        let actual = minimum_pairwise(bases, rendered, contrast_ratio)?;
         if actual < WORD_DIFF_CONTRAST - 1e-9 {
             errors.push(format!("word diff {name} reaches only {actual:.3}:1"));
         }
@@ -3068,21 +3042,9 @@ fn validate_theme(
             &conflict_theirs,
         ),
     ] {
-        let contrast = first_scenes
-            .iter()
-            .zip(second_scenes)
-            .map(|(first, second)| contrast_ratio(first, second).unwrap())
-            .fold(f64::INFINITY, f64::min);
-        let normal = first_scenes
-            .iter()
-            .zip(second_scenes)
-            .map(|(first, second)| delta_e(first, second).unwrap())
-            .fold(f64::INFINITY, f64::min);
-        let cvd = first_scenes
-            .iter()
-            .zip(second_scenes)
-            .map(|(first, second)| crate::search::cvd_distance(first, second).unwrap())
-            .fold(f64::INFINITY, f64::min);
+        let contrast = minimum_pairwise(first_scenes, second_scenes, contrast_ratio)?;
+        let normal = minimum_pairwise(first_scenes, second_scenes, delta_e)?;
+        let cvd = minimum_pairwise(first_scenes, second_scenes, crate::search::cvd_distance)?;
         let first_value = style_color(style, first_role)?;
         let second_value = style_color(style, second_role)?;
         audit.diff_metrics.push(json!({
@@ -3119,11 +3081,7 @@ fn validate_theme(
             &deleted_border,
         ),
     ] {
-        let actual = fills
-            .iter()
-            .zip(borders)
-            .map(|(fill, border)| contrast_ratio(border, fill).unwrap())
-            .fold(f64::INFINITY, f64::min);
+        let actual = minimum_pairwise(fills, borders, contrast_ratio)?;
         if actual < HARD_CONTROL_CONTRAST - 1e-9 {
             errors.push(format!(
                 "{border} reaches only {actual:.3}:1 after composition"
@@ -3150,19 +3108,27 @@ fn validate_theme(
             render_with_bounded_generic_highlights(border, &generic_highlights)?;
         let word_on_hollow = render_on_bases(&highlighted_hollow, &[word])?;
         let word_on_border = render_on_bases(&highlighted_border, &[word])?;
-        let retained = word_on_hollow
-            .iter()
-            .zip(&word_on_border)
-            .map(|(fill, border)| delta_e(fill, border).unwrap())
-            .fold(f64::INFINITY, f64::min);
+        let retained = minimum_pairwise(&word_on_hollow, &word_on_border, delta_e)?;
+        if highlighted_hollow.len() != word_on_hollow.len()
+            || highlighted_border.len() != word_on_border.len()
+            || highlighted_hollow.len() != highlighted_border.len()
+        {
+            return Err(Error(
+                "diff border retention contexts have different lengths".into(),
+            ));
+        }
         let retained_ratio = highlighted_hollow
             .iter()
             .zip(&highlighted_border)
             .zip(word_on_hollow.iter().zip(&word_on_border))
-            .map(|((fill, border), (word_fill, word_border))| {
-                delta_e(word_fill, word_border).unwrap() / delta_e(fill, border).unwrap().max(1e-12)
-            })
-            .fold(f64::INFINITY, f64::min);
+            .try_fold(
+                f64::INFINITY,
+                |minimum, ((fill, border), (word_fill, word_border))| {
+                    let ratio =
+                        delta_e(word_fill, word_border)? / delta_e(fill, border)?.max(1e-12);
+                    Ok::<_, Error>(minimum.min(ratio))
+                },
+            )?;
         if retained < DIFF_BORDER_RETENTION_DELTA_E - 1e-9
             || retained_ratio < DIFF_BORDER_RETENTION_RATIO - 1e-9
         {
@@ -3447,6 +3413,13 @@ fn validate_theme(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn style_builder_rejects_duplicate_roles() {
+        let mut style = StyleBuilder::default();
+        style.insert_opaque("text", "#112233".into()).unwrap();
+        assert!(style.insert_opaque("text", "#445566".into()).is_err());
+    }
 
     #[test]
     fn conventional_semantic_seed_recovers_chroma_from_gamut_endpoints() {

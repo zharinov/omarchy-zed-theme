@@ -95,11 +95,8 @@ pub(crate) struct SurfaceTokens {
 #[derive(Clone, Debug)]
 pub(crate) struct ContentTokens {
     pub(crate) primary: OpaqueColor,
-    pub(crate) muted: OpaqueColor,
-    pub(crate) disabled: OpaqueColor,
     pub(crate) accent: OpaqueColor,
     pub(crate) editor_primary: OpaqueColor,
-    pub(crate) predictive: OpaqueColor,
 }
 
 #[derive(Clone, Debug)]
@@ -123,14 +120,11 @@ pub(crate) struct StatusTokens {
     pub(crate) negative: StatusChannel,
     pub(crate) warning: StatusChannel,
     pub(crate) informational: StatusChannel,
-    pub(crate) predictive_background: OpaqueColor,
-    pub(crate) predictive_border: OpaqueColor,
-    pub(crate) hint_foreground: OpaqueColor,
-    pub(crate) hint_background: OpaqueColor,
-    pub(crate) hint_border: OpaqueColor,
-    pub(crate) hidden_background: OpaqueColor,
-    pub(crate) ignored_background: OpaqueColor,
-    pub(crate) unreachable_background: OpaqueColor,
+    pub(crate) predictive: StatusChannel,
+    pub(crate) hint: StatusChannel,
+    pub(crate) hidden: StatusChannel,
+    pub(crate) ignored: StatusChannel,
+    pub(crate) unreachable: StatusChannel,
 }
 
 #[derive(Clone, Debug)]
@@ -150,43 +144,44 @@ pub(crate) struct ThemeTokens {
     pub(crate) derived: DerivedTokens,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RoleColorKind {
-    Opaque,
-    Overlay,
-    Paint,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RoleColor {
     role: String,
     value: String,
-    kind: RoleColorKind,
 }
 
 impl RoleColor {
-    fn new(role: impl Into<String>, value: String, kind: RoleColorKind) -> Self {
+    fn new(role: impl Into<String>, value: String) -> Self {
         Self {
             role: role.into(),
             value,
-            kind,
         }
     }
 
     fn opaque(role: impl Into<String>, color: &OpaqueColor) -> Self {
-        Self::new(role, color.to_hex(), RoleColorKind::Opaque)
+        Self::new(role, color.to_hex())
     }
 
     fn overlay(role: impl Into<String>, color: &OverlayColor) -> Self {
-        Self::new(role, color.to_hex(), RoleColorKind::Overlay)
+        Self::new(role, color.to_hex())
     }
 
     fn paint(role: impl Into<String>, color: &PaintColor) -> Self {
-        Self::new(role, color.to_hex(), RoleColorKind::Paint)
+        Self::new(role, color.to_hex())
     }
 
-    pub(crate) fn into_parts(self) -> (String, String, RoleColorKind) {
-        (self.role, self.value, self.kind)
+    pub(crate) fn opaque_value(role: impl Into<String>, value: String) -> Result<Self> {
+        let color = OpaqueColor::new(value)?;
+        Ok(Self::new(role, color.0))
+    }
+
+    pub(crate) fn overlay_value(role: impl Into<String>, value: String) -> Result<Self> {
+        let color = OverlayColor::new(value)?;
+        Ok(Self::new(role, color.0))
+    }
+
+    pub(crate) fn into_parts(self) -> (String, String) {
+        (self.role, self.value)
     }
 }
 
@@ -247,24 +242,13 @@ impl ThemeTokens {
         push_opaque(&mut roles, &["text", "icon"], &self.content.primary);
         push_opaque(
             &mut roles,
-            &[
-                "text.muted",
-                "icon.muted",
-                "icon.placeholder",
-                "unreachable",
-            ],
-            &self.content.muted,
+            &["text.muted", "icon.muted", "icon.placeholder"],
+            &self.statuses.unreachable.foreground,
         );
         push_opaque(
             &mut roles,
-            &[
-                "text.placeholder",
-                "text.disabled",
-                "icon.disabled",
-                "hidden",
-                "ignored",
-            ],
-            &self.content.disabled,
+            &["text.placeholder", "text.disabled", "icon.disabled"],
+            &self.statuses.hidden.foreground,
         );
         push_opaque(
             &mut roles,
@@ -276,8 +260,6 @@ impl ThemeTokens {
             &["editor.foreground"],
             &self.content.editor_primary,
         );
-        push_opaque(&mut roles, &["predictive"], &self.content.predictive);
-
         push_overlay(
             &mut roles,
             &["element.hover"],
@@ -325,14 +307,18 @@ impl ThemeTokens {
             &self.derived.document_read,
         );
 
+        roles
+    }
+}
+
+impl StatusTokens {
+    pub(crate) fn zed_roles(&self) -> Vec<RoleColor> {
+        let mut roles = Vec::new();
         for (names, channel) in [
-            (&["created", "success"][..], &self.statuses.positive),
-            (&["deleted", "error"][..], &self.statuses.negative),
-            (
-                &["conflict", "modified", "warning"][..],
-                &self.statuses.warning,
-            ),
-            (&["info", "renamed"][..], &self.statuses.informational),
+            (&["created", "success"][..], &self.positive),
+            (&["deleted", "error"][..], &self.negative),
+            (&["conflict", "modified", "warning"][..], &self.warning),
+            (&["info", "renamed"][..], &self.informational),
         ] {
             for name in names {
                 roles.extend([
@@ -343,23 +329,18 @@ impl ThemeTokens {
             }
         }
 
-        for (role, color) in [
-            (
-                "predictive.background",
-                &self.statuses.predictive_background,
-            ),
-            ("predictive.border", &self.statuses.predictive_border),
-            ("hint", &self.statuses.hint_foreground),
-            ("hint.background", &self.statuses.hint_background),
-            ("hint.border", &self.statuses.hint_border),
-            ("hidden.background", &self.statuses.hidden_background),
-            ("ignored.background", &self.statuses.ignored_background),
-            (
-                "unreachable.background",
-                &self.statuses.unreachable_background,
-            ),
+        for (name, channel) in [
+            ("predictive", &self.predictive),
+            ("hint", &self.hint),
+            ("hidden", &self.hidden),
+            ("ignored", &self.ignored),
+            ("unreachable", &self.unreachable),
         ] {
-            roles.push(RoleColor::opaque(role, color));
+            roles.extend([
+                RoleColor::opaque(name, &channel.foreground),
+                RoleColor::opaque(format!("{name}.background"), &channel.background),
+                RoleColor::opaque(format!("{name}.border"), &channel.border),
+            ]);
         }
 
         roles
@@ -376,6 +357,8 @@ mod tests {
         assert!(OpaqueColor::new("#11223380".into()).is_err());
         assert!(OverlayColor::new("#11223380".into()).is_ok());
         assert!(OverlayColor::new("#112233".into()).is_err());
+        assert!(RoleColor::opaque_value("opaque", "#11223380".into()).is_err());
+        assert!(RoleColor::overlay_value("overlay", "#112233".into()).is_err());
     }
 
     #[test]

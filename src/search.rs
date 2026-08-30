@@ -1827,32 +1827,47 @@ pub fn cvd_greedy_order(values: &[String]) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
 
-    let mut remaining: Vec<(usize, String)> = values.iter().cloned().enumerate().collect();
-    let (_, first) = remaining.remove(0);
-    let mut ordered = vec![first];
+    let prepared = values
+        .iter()
+        .map(|value| PreparedCvd::new(value))
+        .collect::<Result<Vec<_>>>()?;
+    let mut distances = vec![0.0; values.len() * values.len()];
+    for first in 0..values.len() {
+        for second in (first + 1)..values.len() {
+            let distance = prepared[first].distance(prepared[second]);
+            distances[first * values.len() + second] = distance;
+            distances[second * values.len() + first] = distance;
+        }
+    }
+
+    let mut remaining: Vec<usize> = (1..values.len()).collect();
+    let mut ordered = vec![0];
 
     while !remaining.is_empty() {
         let best_index = (0..remaining.len())
             .max_by(|left, right| {
-                let score = |index: usize| remaining[index].1.as_str();
+                let score = |index: usize| remaining[index];
                 let left_score = ordered
                     .iter()
-                    .map(|chosen| cvd_distance(score(*left), chosen).unwrap())
+                    .map(|chosen| distances[score(*left) * values.len() + chosen])
                     .fold(f64::INFINITY, f64::min);
                 let right_score = ordered
                     .iter()
-                    .map(|chosen| cvd_distance(score(*right), chosen).unwrap())
+                    .map(|chosen| distances[score(*right) * values.len() + chosen])
                     .fold(f64::INFINITY, f64::min);
                 left_score
                     .total_cmp(&right_score)
-                    .then_with(|| remaining[*right].0.cmp(&remaining[*left].0))
+                    .then_with(|| remaining[*right].cmp(&remaining[*left]))
             })
-            .unwrap();
+            .expect("remaining colors are non-empty");
 
-        ordered.push(remaining.remove(best_index).1);
+        ordered.push(remaining.remove(best_index));
     }
 
-    Ok(ordered)
+    Ok(ordered
+        .into_iter()
+        .map(|index| values[index].clone())
+        .collect())
 }
 
 const CVD_MATRICES: [[[f64; 3]; 3]; 3] = [
@@ -1872,16 +1887,6 @@ const CVD_MATRICES: [[[f64; 3]; 3]; 3] = [
         [0.004733, 0.691367, 0.303900],
     ],
 ];
-
-fn simulate_cvd(value: &str, matrix: [[f64; 3]; 3]) -> Result<[f64; 3]> {
-    use crate::color::parse_hex;
-    let color = parse_hex(value)?;
-    Ok(simulate_cvd_rgba(color, matrix))
-}
-
-fn simulate_cvd_rgba(color: Rgba, matrix: [[f64; 3]; 3]) -> [f64; 3] {
-    simulate_cvd_linear(crate::color::linear_rgb(color), matrix)
-}
 
 fn simulate_cvd_linear(rgb: [f64; 3], matrix: [[f64; 3]; 3]) -> [f64; 3] {
     use crate::color::{linear_to_srgb, rgb_to_oklab};
@@ -1903,6 +1908,30 @@ fn simulate_cvd_linear(rgb: [f64; 3], matrix: [[f64; 3]; 3]) -> [f64; 3] {
 fn cvd_labs(color: Rgba) -> CvdLabs {
     let rgb = crate::color::linear_rgb(color);
     CVD_MATRICES.map(|matrix| simulate_cvd_linear(rgb, matrix))
+}
+
+#[derive(Clone, Copy)]
+struct PreparedCvd {
+    normal: [f64; 3],
+    simulated: CvdLabs,
+}
+
+impl PreparedCvd {
+    fn new(value: &str) -> Result<Self> {
+        let metrics = ColorMetrics::from_hex(value)?;
+        Ok(Self {
+            normal: metrics.lab,
+            simulated: cvd_labs(metrics.rgba.rgba()),
+        })
+    }
+
+    fn distance(self, other: Self) -> f64 {
+        cvd_distance_facts(
+            &self.simulated,
+            &other.simulated,
+            lab_distance(self.normal, other.normal),
+        )
+    }
 }
 
 fn cvd_distance_precomputed(
@@ -1940,14 +1969,7 @@ fn cvd_distance_facts(first_cvd: &CvdLabs, second_cvd: &CvdLabs, normal_delta: f
 }
 
 pub fn cvd_distance(first: &str, second: &str) -> Result<f64> {
-    let mut minimum = lab_distance(lab(first)?, lab(second)?);
-    for matrix in CVD_MATRICES {
-        minimum = minimum.min(lab_distance(
-            simulate_cvd(first, matrix)?,
-            simulate_cvd(second, matrix)?,
-        ));
-    }
-    Ok(minimum)
+    Ok(PreparedCvd::new(first)?.distance(PreparedCvd::new(second)?))
 }
 
 pub fn round6(value: f64) -> f64 {
@@ -1961,6 +1983,11 @@ mod tests {
     #[test]
     fn empty_cvd_order_is_empty() {
         assert!(cvd_greedy_order(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cvd_order_reports_invalid_colors() {
+        assert!(cvd_greedy_order(&["invalid".into()]).is_err());
     }
 
     #[test]
