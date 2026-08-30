@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 pub enum SemanticRole {
     Base,
     Subdued,
+    Predictive,
     Declaration,
     Type,
     Member,
@@ -25,6 +26,7 @@ impl SemanticRole {
         match self {
             Self::Base => "base",
             Self::Subdued => "subdued",
+            Self::Predictive => "predictive",
             Self::Declaration => "declaration",
             Self::Type => "type",
             Self::Member => "member",
@@ -52,7 +54,7 @@ impl SemanticRole {
             Self::Member => 0.45,
             Self::Metadata => 0.35,
             Self::Base | Self::DiffChange | Self::DiffAdd | Self::DiffDelete => 1.0,
-            Self::Subdued => 0.20,
+            Self::Subdued | Self::Predictive => 0.20,
         }
     }
 }
@@ -112,12 +114,14 @@ impl MergePlan {
                 });
             }
         }
+
         families.sort_by_key(|family| {
             ORDINARY_ROLES
                 .iter()
                 .position(|role| *role == family.anchor)
                 .unwrap()
         });
+
         Self {
             family_count,
             families,

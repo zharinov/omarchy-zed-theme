@@ -234,6 +234,7 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
         .collect::<Vec<_>>();
 
     let clusters = complete_link_clusters(&evidence);
+
     let total_weight: f64 = evidence.iter().map(|color| color.weight).sum();
     let effective_hue_families = if total_weight <= 1e-12 {
         0.0
@@ -325,20 +326,23 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
 
 impl SyntaxProfile {
     pub fn audit(&self) -> Value {
-        let color_audit =
-            |colors: &[EvidenceColor]| {
-                colors.iter().map(|color| {
-                json!({
-                    "value": color.value,
-                    "keys": color.keys,
-                    "provenance": format!("{:?}", color.provenance).to_ascii_lowercase(),
-                    "oklch": [round6(color.lightness), round6(color.chroma), round6(color.hue)],
-                    "breadth_weight": round6(color.weight),
+        let color_audit = |colors: &[EvidenceColor]| {
+            colors
+                .iter()
+                .map(|color| {
+                    json!({
+                        "value": color.value,
+                        "keys": color.keys,
+                        "provenance": format!("{:?}", color.provenance).to_ascii_lowercase(),
+                        "oklch": [round6(color.lightness), round6(color.chroma), round6(color.hue)],
+                        "breadth_weight": round6(color.weight),
+                    })
                 })
-            }).collect::<Vec<_>>()
-            };
+                .collect::<Vec<_>>()
+        };
         let authored_colors = color_audit(&self.authored_colors);
         let evidence = color_audit(&self.evidence);
+
         let clusters = self
             .clusters
             .iter()
@@ -350,6 +354,7 @@ impl SyntaxProfile {
                 })
             })
             .collect::<Vec<_>>();
+
         json!({
             "thresholds": {
                 "chroma_evidence": CHROMA_EVIDENCE,

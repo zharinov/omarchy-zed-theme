@@ -34,6 +34,19 @@ fn style(document: &Value) -> &serde_json::Map<String, Value> {
     document["themes"][0]["style"].as_object().unwrap()
 }
 
+fn role<'a>(style: &'a serde_json::Map<String, Value>, name: &str) -> &'a str {
+    style[name].as_str().unwrap()
+}
+
+fn rgb(value: &str) -> (u8, u8, u8) {
+    let color = parse_hex(value).unwrap();
+    (
+        (color.r * 255.0).round() as u8,
+        (color.g * 255.0).round() as u8,
+        (color.b * 255.0).round() as u8,
+    )
+}
+
 fn assert_semantic_hue(name: &str, role: &str, value: &str, target_degrees: f64) {
     let [_, chroma, hue] = oklab_to_oklch(lab(value).unwrap());
     let target = target_degrees.to_radians();
@@ -119,6 +132,7 @@ fn venice_like_palette() -> ResolvedPalette {
     ] {
         palette.colors.insert(key.into(), value.into());
     }
+
     for (key, value) in [
         ("color1", "#706548"),
         ("color2", "#6f6644"),
@@ -371,6 +385,109 @@ fn narrow_olive_palette_uses_scaffold_and_generates() {
 }
 
 #[test]
+fn semantic_tokens_preserve_exact_cross_role_relationships() {
+    let (document, audit) = build_theme(&synthetic_palette()).unwrap();
+    let style = style(&document);
+
+    for group in [
+        &[
+            "editor.background",
+            "editor.gutter.background",
+            "tab.active_background",
+            "toolbar.background",
+        ][..],
+        &[
+            "background",
+            "status_bar.background",
+            "title_bar.background",
+        ],
+        &["text", "icon"],
+        &[
+            "text.muted",
+            "icon.muted",
+            "icon.placeholder",
+            "unreachable",
+        ],
+        &[
+            "text.placeholder",
+            "text.disabled",
+            "icon.disabled",
+            "hidden",
+            "ignored",
+        ],
+        &["text.accent", "icon.accent", "link_text.hover"],
+        &["element.active", "element.selected"],
+        &["ghost_element.active", "ghost_element.selected"],
+        &[
+            "element.disabled",
+            "ghost_element.disabled",
+            "title_bar.inactive_background",
+        ],
+    ] {
+        let expected = role(style, group[0]);
+        for name in &group[1..] {
+            assert_eq!(role(style, name), expected, "{name} left its token group");
+        }
+    }
+
+    for role_name in [
+        "border.transparent",
+        "ghost_element.background",
+        "scrollbar.track.background",
+    ] {
+        assert_eq!(role(style, role_name), "#00000000", "{role_name}");
+    }
+
+    for (source, aliases) in [
+        ("created", &["success"][..]),
+        ("deleted", &["error"]),
+        ("warning", &["conflict", "modified"]),
+        ("info", &["renamed"]),
+    ] {
+        for suffix in ["", ".background", ".border"] {
+            let expected = role(style, &format!("{source}{suffix}"));
+            for alias in aliases {
+                let alias_role = format!("{alias}{suffix}");
+                assert_eq!(role(style, &alias_role), expected, "{alias_role}");
+            }
+        }
+    }
+
+    let syntax = style["syntax"].as_object().unwrap();
+    let editor_foreground = role(style, "editor.foreground");
+    assert_eq!(syntax["primary"]["color"], editor_foreground);
+    assert_eq!(syntax["variable"]["color"], editor_foreground);
+    assert_eq!(syntax["predictive"]["color"], role(style, "predictive"));
+
+    let structural_rgb = rgb(role(style, "border"));
+    assert_eq!(rgb(role(style, "editor.wrap_guide")), structural_rgb);
+    assert_eq!(rgb(role(style, "editor.active_wrap_guide")), structural_rgb);
+    assert!(role(style, "editor.wrap_guide").ends_with("0d"));
+    assert!(role(style, "editor.active_wrap_guide").ends_with("1a"));
+    let canvas = role(style, "editor.background");
+    let rendered_wrap = gpui_blend(canvas, role(style, "editor.wrap_guide"))
+        .unwrap()
+        .opaque_hex();
+    let rendered_active = gpui_blend(canvas, role(style, "editor.active_wrap_guide"))
+        .unwrap()
+        .opaque_hex();
+    assert!(
+        contrast_ratio(&rendered_active, canvas).unwrap()
+            > contrast_ratio(&rendered_wrap, canvas).unwrap()
+    );
+    assert!(delta_e(&rendered_active, canvas).unwrap() > delta_e(&rendered_wrap, canvas).unwrap());
+
+    let audited_relations = audit
+        .fidelity_deviations
+        .iter()
+        .filter_map(|entry| entry["requested_relation"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(audited_relations.contains("surface and active line share RGB"));
+    assert!(audited_relations.contains("content accent and document read share RGB"));
+    assert!(audited_relations.contains("cursor and selection share RGB"));
+}
+
+#[test]
 fn every_syntax_capture_is_readable_on_emitted_diff_overlays() {
     let (document, _) = build_theme(&synthetic_palette()).unwrap();
     let style = style(&document);
@@ -429,6 +546,7 @@ fn every_syntax_capture_is_readable_on_emitted_diff_overlays() {
         )
         .unwrap(),
     ];
+
     for (capture, spec) in style["syntax"].as_object().unwrap() {
         let foreground = spec["color"].as_str().unwrap();
         let floor = contrast_floor(capture).unwrap();
@@ -592,12 +710,17 @@ fn all_builtin_themes_meet_the_rust_contract() {
         .join("omarchy/themes");
     let configured_root = std::env::var_os("OMARCHY_THEMES_DIR").map(PathBuf::from);
     let root = configured_root.as_deref().unwrap_or(&default_root);
-    if !root.is_dir()
-        || std::process::Command::new("omarchy-theme-color")
-            .arg("--help")
-            .output()
-            .is_err()
-    {
+    let resolver_available = std::process::Command::new("omarchy-theme-color")
+        .arg("--help")
+        .output()
+        .is_ok();
+    if configured_root.is_some() {
+        assert!(root.is_dir(), "configured Omarchy theme root is missing");
+        assert!(
+            resolver_available,
+            "omarchy-theme-color is required for the configured built-in-theme corpus"
+        );
+    } else if !root.is_dir() || !resolver_available {
         return;
     }
 
@@ -625,11 +748,13 @@ fn all_builtin_themes_meet_the_rust_contract() {
         "vantablack",
         "white",
     ];
+
     let syntax_manifest: BTreeSet<_> = BASE_SYNTAX_FIELDS
         .iter()
         .chain(ADDITIONAL_SYNTAX_FIELDS)
         .copied()
         .collect();
+
     let mut profile_summary = BTreeMap::new();
 
     for name in theme_names {
@@ -699,6 +824,7 @@ fn all_builtin_themes_meet_the_rust_contract() {
         assert!(inactive_saliency + 0.10 <= hover_saliency, "{name}");
         assert!(inactive_saliency + 0.20 <= active_saliency, "{name}");
         assert!(hover_saliency <= active_saliency + 0.03, "{name}");
+
         let line_audit = audit
             .saliency
             .iter()
@@ -835,6 +961,7 @@ fn all_builtin_themes_meet_the_rust_contract() {
                 colors.len()
             );
         }
+
         assert!(
             audit.syntax_policy["saliency"]["allocations"]
                 .as_array()
@@ -852,6 +979,7 @@ fn all_builtin_themes_meet_the_rust_contract() {
         assert!(pair_contrast >= 1.05);
         assert!(pair_delta >= 0.075);
     }
+
     let matte = &profile_summary["matte-black"];
     let nord = &profile_summary["nord"];
     let tokyo = &profile_summary["tokyo-night"];

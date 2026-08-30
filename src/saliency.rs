@@ -27,12 +27,35 @@ pub struct SaliencyRequest<'a> {
     pub bounds: FitBounds,
 }
 
+impl<'a> SaliencyRequest<'a> {
+    pub fn new(backgrounds: &'a [String], hard_floor: f64, preferred_saliency: f64) -> Self {
+        Self {
+            backgrounds,
+            hard_floor,
+            preferred_saliency,
+            avoid: &[],
+            bounds: FitBounds::default(),
+        }
+    }
+
+    pub fn with_avoid(mut self, avoid: &'a [String]) -> Self {
+        self.avoid = avoid;
+        self
+    }
+
+    pub fn with_bounds(mut self, bounds: FitBounds) -> Self {
+        self.bounds = bounds;
+        self
+    }
+}
+
 fn geometric_contrast(color: &str, backgrounds: &[String]) -> Result<f64> {
     if backgrounds.is_empty() {
         return Err(Error(
             "relative saliency requires at least one background".into(),
         ));
     }
+
     let mean_log = backgrounds
         .iter()
         .map(|background| contrast_ratio(color, background).map(f64::ln))
@@ -60,15 +83,18 @@ pub fn fit_relative(
         avoid,
         mut bounds,
     } = request;
+
     let reference_contrast = geometric_contrast(reference, backgrounds)?;
     let preferred_saliency = preferred_saliency.clamp(0.0, 1.0);
     let preferred_contrast = (reference_contrast.ln() * preferred_saliency)
         .exp()
         .max(hard_floor);
     bounds.preferred_contrast = Some(preferred_contrast);
+
     let output = search.fit_color_bounded(seed, backgrounds, hard_floor, avoid, bounds)?;
     let actual_contrast = geometric_contrast(&output, backgrounds)?;
     let actual_saliency = actual_contrast.ln() / reference_contrast.ln().max(1e-12);
+
     Ok(SaliencyFit {
         output,
         reference_contrast,
@@ -108,13 +134,7 @@ mod tests {
             &mut search,
             "#aaaaaa",
             "#dddddd",
-            SaliencyRequest {
-                backgrounds: &backgrounds,
-                hard_floor: 1.52,
-                preferred_saliency: INACTIVE_LINE_NUMBER_SALIENCY,
-                avoid: &[],
-                bounds: FitBounds::default(),
-            },
+            SaliencyRequest::new(&backgrounds, 1.52, INACTIVE_LINE_NUMBER_SALIENCY),
         )
         .unwrap();
         assert!((fit.preferred_saliency - INACTIVE_LINE_NUMBER_SALIENCY).abs() < 1e-12);

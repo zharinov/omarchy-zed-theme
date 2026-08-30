@@ -218,17 +218,13 @@ fn allocate_families(
             search,
             &seed,
             reference,
-            SaliencyRequest {
-                backgrounds: contexts,
-                hard_floor: SYNTAX_SEMANTIC_FLOOR,
-                preferred_saliency: saliency,
-                avoid: &[],
-                bounds: FitBounds {
+            SaliencyRequest::new(contexts, SYNTAX_SEMANTIC_FLOOR, saliency).with_bounds(
+                FitBounds {
                     lower_chroma: chroma_floor,
                     upper_chroma: chroma_cap,
                     ..FitBounds::default()
                 },
-            },
+            ),
         )?;
         let output = saliency_fit.output;
         let output_chroma = oklab_to_oklch(lab(&output)?)[1];
@@ -254,6 +250,7 @@ fn allocate_families(
             output,
         });
     }
+
     Ok(allocations)
 }
 
@@ -375,6 +372,7 @@ fn select_separated_plan(
                 allocation.family = family;
             }
             allocations.sort_by_key(|allocation| allocation.family);
+
             let ordered_indices = allocations
                 .iter()
                 .map(|allocation| allocation.origin_family)
@@ -384,6 +382,7 @@ fn select_separated_plan(
             return Ok((plan, allocations, normal, cvd));
         }
     }
+
     let candidates = full_allocations
         .iter()
         .map(|allocation| {
@@ -414,34 +413,27 @@ pub fn build_syntax(
     palette: &ResolvedPalette,
     contexts: &[String],
     saliency_reference: &str,
+    predictive: &str,
     diff_sources: [&str; 3],
     audit: &mut Audit,
 ) -> Result<Map<String, Value>> {
     let profile = profile::measure(palette)?;
-    let base_fit = fit_relative(
-        search,
-        &palette.colors["foreground"],
-        saliency_reference,
-        SaliencyRequest {
-            backgrounds: contexts,
-            hard_floor: SYNTAX_PRIMARY_FLOOR,
-            preferred_saliency: PRIMARY_SALIENCY,
-            avoid: &[],
-            bounds: FitBounds::default(),
-        },
-    )?;
-    let base = base_fit.output.clone();
+    let base = saliency_reference.to_owned();
+    if minimum_contrast(&base, contexts)? < SYNTAX_PRIMARY_FLOOR - 1e-12 {
+        return Err(crate::Error(
+            "editor primary does not meet the syntax-primary floor".into(),
+        ));
+    }
+
     let mut subdued_fit = fit_relative(
         search,
         &palette.colors["muted"],
         saliency_reference,
-        SaliencyRequest {
-            backgrounds: contexts,
-            hard_floor: SYNTAX_SUBDUED_FLOOR,
-            preferred_saliency: SemanticRole::Subdued.saliency(),
-            avoid: &[],
-            bounds: FitBounds::default(),
-        },
+        SaliencyRequest::new(
+            contexts,
+            SYNTAX_SUBDUED_FLOOR,
+            SemanticRole::Subdued.saliency(),
+        ),
     )?;
     let mut subdued = subdued_fit.output.clone();
     if subdued == base {
@@ -459,16 +451,15 @@ pub fn build_syntax(
             search,
             &seed,
             saliency_reference,
-            SaliencyRequest {
-                backgrounds: contexts,
-                hard_floor: SYNTAX_SUBDUED_FLOOR,
-                preferred_saliency: SemanticRole::Subdued.saliency(),
-                avoid: &[],
-                bounds: FitBounds {
-                    upper_chroma: profile.chroma_envelope.ordinary_maximum,
-                    ..FitBounds::default()
-                },
-            },
+            SaliencyRequest::new(
+                contexts,
+                SYNTAX_SUBDUED_FLOOR,
+                SemanticRole::Subdued.saliency(),
+            )
+            .with_bounds(FitBounds {
+                upper_chroma: profile.chroma_envelope.ordinary_maximum,
+                ..FitBounds::default()
+            }),
         )?;
         subdued = subdued_fit.output.clone();
     }
@@ -477,6 +468,7 @@ pub fn build_syntax(
             "base and subdued syntax roles collided exactly".into(),
         ));
     }
+
     let full_plan = MergePlan::with_family_count(8);
     let full_allocations = allocate_families(
         search,
@@ -507,16 +499,9 @@ pub fn build_syntax(
         }
     }
 
-    let pair_constraints = PairConstraints {
-        foreground_contrast: SYNTAX_SEMANTIC_FLOOR,
-        pair_contrast: SYNTAX_DIFF_CONTRACT.contrast,
-        normal_delta: SYNTAX_DIFF_CONTRACT.normal_delta_e,
-        cvd_delta: SYNTAX_DIFF_CONTRACT.cvd_delta_e,
-        lightness_delta: 0.0,
-        minimum_chroma: 0.025,
-        separation_alternative: SYNTAX_DIFF_CONTRACT.separation_alternative,
-        prefer_background: false,
-    };
+    let pair_constraints =
+        PairConstraints::from_contract(SYNTAX_SEMANTIC_FLOOR, SYNTAX_DIFF_CONTRACT)
+            .with_minimum_chroma(0.025);
     let [syntax_add, syntax_delete] = search
         .fit_pair(diff_sources[0], diff_sources[2], contexts, pair_constraints)
         .map_err(|error| crate::Error(format!("syntax diff semantic pair: {error}")))?;
@@ -526,6 +511,7 @@ pub fn build_syntax(
     let mut role_colors = BTreeMap::from([
         (SemanticRole::Base, base.clone()),
         (SemanticRole::Subdued, subdued.clone()),
+        (SemanticRole::Predictive, predictive.to_owned()),
         (SemanticRole::DiffChange, syntax_change.clone()),
         (SemanticRole::DiffAdd, syntax_add.clone()),
         (SemanticRole::DiffDelete, syntax_delete.clone()),
@@ -579,6 +565,7 @@ pub fn build_syntax(
             })
         })
         .collect::<Vec<_>>();
+
     let mut merge_plan_audit = plan.audit();
     if let Some(object) = merge_plan_audit.as_object_mut() {
         object.insert(
@@ -591,6 +578,7 @@ pub fn build_syntax(
             (plan.family_count < profile.target_families).into(),
         );
     }
+
     audit.syntax_policy = json!({
         "version": 1,
         "profile": profile.audit(),
@@ -631,22 +619,30 @@ pub fn build_syntax(
         },
     });
 
-    for role in [SemanticRole::Base, SemanticRole::Subdued] {
-        let output = &role_colors[&role];
-        let saliency_fit = if role == SemanticRole::Base {
-            &base_fit
-        } else {
-            &subdued_fit
-        };
-        audit.syntax_roles.push(json!({
-            "role": role.as_str(),
-            "family": Value::Null,
-            "output": output,
-            "minimum_contrast": round6(minimum_contrast(output, contexts)?),
-            "preferred_saliency": round6(saliency_fit.preferred_saliency),
-            "measured_saliency": round6(saliency_fit.actual_saliency),
-        }));
-    }
+    audit.syntax_roles.push(json!({
+        "role": SemanticRole::Base.as_str(),
+        "family": Value::Null,
+        "output": base,
+        "minimum_contrast": round6(minimum_contrast(&base, contexts)?),
+        "preferred_saliency": PRIMARY_SALIENCY,
+        "measured_saliency": PRIMARY_SALIENCY,
+        "disposition": "shared_editor_primary",
+    }));
+    audit.syntax_roles.push(json!({
+        "role": SemanticRole::Subdued.as_str(),
+        "family": Value::Null,
+        "output": subdued,
+        "minimum_contrast": round6(minimum_contrast(&subdued, contexts)?),
+        "preferred_saliency": round6(subdued_fit.preferred_saliency),
+        "measured_saliency": round6(subdued_fit.actual_saliency),
+    }));
+    audit.syntax_roles.push(json!({
+        "role": SemanticRole::Predictive.as_str(),
+        "family": Value::Null,
+        "output": predictive,
+        "minimum_contrast": round6(minimum_contrast(predictive, contexts)?),
+        "disposition": "shared_predictive_content",
+    }));
     for role in plan.families.iter().flat_map(|family| family.roles.iter()) {
         let family = plan.family_for(*role).unwrap();
         let output = &role_colors[role];
@@ -691,6 +687,7 @@ pub fn build_syntax(
         }
         output.insert(capture.capture.into(), Value::Object(spec));
     }
+
     Ok(output)
 }
 

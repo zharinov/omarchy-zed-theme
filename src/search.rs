@@ -96,6 +96,67 @@ pub struct PairConstraints {
     pub prefer_background: bool,
 }
 
+impl PairConstraints {
+    pub const fn new(
+        foreground_contrast: f64,
+        pair_contrast: f64,
+        normal_delta: f64,
+        cvd_delta: f64,
+    ) -> Self {
+        Self {
+            foreground_contrast,
+            pair_contrast,
+            normal_delta,
+            cvd_delta,
+            lightness_delta: 0.0,
+            minimum_chroma: 0.0,
+            separation_alternative: None,
+            prefer_background: false,
+        }
+    }
+
+    pub const fn from_contract(foreground_contrast: f64, contract: PairContract) -> Self {
+        Self {
+            foreground_contrast,
+            pair_contrast: contract.contrast,
+            normal_delta: contract.normal_delta_e,
+            cvd_delta: contract.cvd_delta_e,
+            lightness_delta: 0.0,
+            minimum_chroma: 0.0,
+            separation_alternative: contract.separation_alternative,
+            prefer_background: false,
+        }
+    }
+
+    pub const fn with_foreground_contrast(mut self, foreground_contrast: f64) -> Self {
+        self.foreground_contrast = foreground_contrast;
+        self
+    }
+
+    pub const fn with_minimum_chroma(mut self, minimum_chroma: f64) -> Self {
+        self.minimum_chroma = minimum_chroma;
+        self
+    }
+
+    pub const fn with_cvd_delta(mut self, cvd_delta: f64) -> Self {
+        self.cvd_delta = cvd_delta;
+        self
+    }
+
+    pub const fn with_separation_alternative(
+        mut self,
+        separation_alternative: Option<(f64, f64, f64)>,
+    ) -> Self {
+        self.separation_alternative = separation_alternative;
+        self
+    }
+
+    pub const fn prefer_background(mut self) -> Self {
+        self.prefer_background = true;
+        self
+    }
+}
+
 pub struct FillRequest<'a> {
     pub backgrounds: &'a [String],
     pub target: f64,
@@ -106,12 +167,82 @@ pub struct FillRequest<'a> {
     pub runtime_rendered_references: &'a [(String, f64, f64, f64)],
 }
 
+impl<'a> FillRequest<'a> {
+    pub const fn new(backgrounds: &'a [String], target: f64, minimum_delta_e: f64) -> Self {
+        Self {
+            backgrounds,
+            target,
+            minimum_delta_e,
+            runtime_state: None,
+            readable_foregrounds: &[],
+            rendered_references: &[],
+            runtime_rendered_references: &[],
+        }
+    }
+
+    pub const fn with_target(mut self, target: f64) -> Self {
+        self.target = target;
+        self
+    }
+
+    pub const fn with_runtime_state(mut self, runtime_state: (f64, f64, f64)) -> Self {
+        self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub const fn with_readable_foregrounds(
+        mut self,
+        readable_foregrounds: &'a [(String, f64)],
+    ) -> Self {
+        self.readable_foregrounds = readable_foregrounds;
+        self
+    }
+
+    pub const fn with_rendered_references(
+        mut self,
+        rendered_references: &'a [(String, f64, f64)],
+    ) -> Self {
+        self.rendered_references = rendered_references;
+        self
+    }
+
+    pub const fn with_runtime_rendered_references(
+        mut self,
+        runtime_rendered_references: &'a [(String, f64, f64, f64)],
+    ) -> Self {
+        self.runtime_rendered_references = runtime_rendered_references;
+        self
+    }
+}
+
 pub struct OverlayPairRequest<'a> {
     pub first: FillRequest<'a>,
     pub second: FillRequest<'a>,
     pub constraints: PairConstraints,
     pub maximum_alpha: u8,
     pub frontier_limit: usize,
+}
+
+impl<'a> OverlayPairRequest<'a> {
+    pub const fn new(
+        first: FillRequest<'a>,
+        second: FillRequest<'a>,
+        constraints: PairConstraints,
+    ) -> Self {
+        Self {
+            first,
+            second,
+            constraints,
+            maximum_alpha: OVERLAY_MAX_ALPHA,
+            frontier_limit: 512,
+        }
+    }
+
+    pub const fn with_limits(mut self, maximum_alpha: u8, frontier_limit: usize) -> Self {
+        self.maximum_alpha = maximum_alpha;
+        self.frontier_limit = frontier_limit;
+        self
+    }
 }
 
 pub struct OverlayPairFallback {
@@ -536,11 +667,13 @@ impl Search {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+
         table.sort_by(|left, right| {
             left.distance
                 .total_cmp(&right.distance)
                 .then_with(|| left.metrics.rgb24().cmp(&right.metrics.rgb24()))
         });
+
         Ok(Arc::new(TransformTableData {
             candidates: table.into(),
             cvd: OnceLock::new(),
@@ -554,14 +687,17 @@ impl Search {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+
         let tables = seeds
             .par_iter()
             .map(|seed| Self::build_transform_table(seed).map(|table| ((*seed).to_owned(), table)))
             .collect::<Vec<_>>();
+
         for table in tables {
             let (seed, table) = table?;
             self.transform_tables.insert(seed, table);
         }
+
         Ok(())
     }
 
@@ -569,6 +705,7 @@ impl Search {
         if let Some(table) = self.transform_tables.get(seed) {
             return Ok(Arc::clone(table));
         }
+
         let table = Self::build_transform_table(seed)?;
         self.transform_tables
             .insert(seed.to_owned(), Arc::clone(&table));
@@ -672,6 +809,7 @@ impl Search {
                     background_distance,
                 });
             }
+
             values.sort_by(|left, right| {
                 let left_facts = &table.candidates[left.source_index];
                 let right_facts = &table.candidates[right.source_index];
@@ -693,8 +831,10 @@ impl Search {
             });
             Ok((values, table))
         };
+
         let (first, first_table) = collect(self, first_seed, first_backgrounds)?;
         let (second, second_table) = collect(self, second_seed, second_backgrounds)?;
+
         let mut best: Option<([Rgb24; 2], [f64; 4])> = None;
         let mut maxima = [0.0_f64; 3];
         let minimum_second_primary = second
@@ -783,7 +923,8 @@ impl Search {
                 break;
             }
         }
-        best.map(|(colors, _)| [colors[0].hex(), colors[1].hex()]).ok_or_else(|| {
+
+        let Some((colors, _)) = best else {
             for first_candidate in &first {
                 let first_facts = &first_table.candidates[first_candidate.source_index];
                 for second_candidate in &second {
@@ -806,13 +947,18 @@ impl Search {
                     ));
                 }
             }
-            Error(format!(
+
+            return Err(Error(format!(
                 "no jointly fitted pair remains for {first_seed}/{second_seed} ({} first candidates, {} second candidates; maxima contrast {:.3}, delta E {:.3}, cheap-feasible CVD {:.3})",
                 first.len(),
                 second.len(),
-                maxima[0], maxima[1], maxima[2]
-            ))
-        })
+                maxima[0],
+                maxima[1],
+                maxima[2]
+            )));
+        };
+
+        Ok([colors[0].hex(), colors[1].hex()])
     }
 
     pub fn fit_color_bounded(
@@ -860,6 +1006,7 @@ impl Search {
         if backgrounds.is_empty() {
             return Err(Error("fit_color requires at least one background".into()));
         }
+
         let source_metrics = ColorMetrics::from_hex(seed)?;
         let source_chroma = lab_chroma(source_metrics.lab);
         let source_retention = source_chroma / source_chroma.max(1e-12);
@@ -901,12 +1048,14 @@ impl Search {
             }
             true
         };
+
         if passes(source_metrics)
             && !bounds.prefer_background
             && bounds.preferred_contrast.is_none()
         {
             return Ok(seed.to_owned());
         }
+
         if !bounds.prefer_background && bounds.preferred_contrast.is_none() {
             let mut best: Option<(Rgb24, [f64; 3])> = None;
             for candidate in self.transform_table(seed)?.candidates.iter() {
@@ -938,6 +1087,7 @@ impl Search {
                 ))
             });
         }
+
         if let Some(preferred_contrast) = bounds.preferred_contrast {
             let mut best: Option<(Rgb24, [f64; 3])> = None;
             let preferred_log = preferred_contrast.ln();
@@ -986,6 +1136,7 @@ impl Search {
                 ))
             });
         }
+
         let mut best: Option<(Rgb24, [f64; 4])> = None;
         let consider = |candidate: Rgb24,
                         metrics: ColorMetrics,
@@ -1062,6 +1213,7 @@ impl Search {
         if let Some(candidate) = prepared.best_for(source, 0.0, 1.0, &alpha_values) {
             return Ok(candidate.emitted.hex());
         }
+
         let table = self.transform_table(seed)?;
         let best = table
             .candidates
@@ -1666,6 +1818,10 @@ impl Search {
 }
 
 pub fn cvd_greedy_order(values: &[String]) -> Result<Vec<String>> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut remaining: Vec<(usize, String)> = values.iter().cloned().enumerate().collect();
     let (_, first) = remaining.remove(0);
     let mut ordered = vec![first];
@@ -1798,6 +1954,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_cvd_order_is_empty() {
+        assert!(cvd_greedy_order(&[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn chroma_bounds_are_enforced_and_part_of_the_query_cache_key() {
         let mut search = Search::default();
         let backgrounds = vec!["#101010".to_owned()];
@@ -1871,37 +2032,13 @@ mod tests {
     #[test]
     fn overlay_pair_is_bounded_deterministic_and_valid_after_composition() {
         let backgrounds = vec!["#16181d".to_owned(), "#242730".to_owned()];
-        let request = || OverlayPairRequest {
-            first: FillRequest {
-                backgrounds: &backgrounds,
-                target: 1.10,
-                minimum_delta_e: 0.025,
-                runtime_state: None,
-                readable_foregrounds: &[],
-                rendered_references: &[],
-                runtime_rendered_references: &[],
-            },
-            second: FillRequest {
-                backgrounds: &backgrounds,
-                target: 1.10,
-                minimum_delta_e: 0.025,
-                runtime_state: None,
-                readable_foregrounds: &[],
-                rendered_references: &[],
-                runtime_rendered_references: &[],
-            },
-            constraints: PairConstraints {
-                foreground_contrast: 1.10,
-                pair_contrast: 1.01,
-                normal_delta: 0.030,
-                cvd_delta: 0.020,
-                lightness_delta: 0.0,
-                minimum_chroma: 0.0,
-                separation_alternative: None,
-                prefer_background: true,
-            },
-            maximum_alpha: 198,
-            frontier_limit: 512,
+        let request = || {
+            OverlayPairRequest::new(
+                FillRequest::new(&backgrounds, 1.10, 0.025),
+                FillRequest::new(&backgrounds, 1.10, 0.025),
+                PairConstraints::new(1.10, 1.01, 0.030, 0.020).prefer_background(),
+            )
+            .with_limits(198, 512)
         };
         let mut search = Search::default();
         let first = search
@@ -1930,43 +2067,16 @@ mod tests {
     #[test]
     fn overlay_pair_fallback_reuses_candidates_without_changing_the_weak_result() {
         let backgrounds = vec!["#16181d".to_owned(), "#242730".to_owned()];
-        let constraints = PairConstraints {
-            foreground_contrast: 1.10,
-            pair_contrast: 1.01,
-            normal_delta: 0.030,
-            cvd_delta: 0.020,
-            lightness_delta: 0.0,
-            minimum_chroma: 0.0,
-            separation_alternative: None,
-            prefer_background: true,
+        let constraints = PairConstraints::new(1.10, 1.01, 0.030, 0.020).prefer_background();
+        let request = |constraints| {
+            OverlayPairRequest::new(
+                FillRequest::new(&backgrounds, 1.10, 0.025),
+                FillRequest::new(&backgrounds, 1.10, 0.025),
+                constraints,
+            )
+            .with_limits(198, 128)
         };
-        let request = |constraints| OverlayPairRequest {
-            first: FillRequest {
-                backgrounds: &backgrounds,
-                target: 1.10,
-                minimum_delta_e: 0.025,
-                runtime_state: None,
-                readable_foregrounds: &[],
-                rendered_references: &[],
-                runtime_rendered_references: &[],
-            },
-            second: FillRequest {
-                backgrounds: &backgrounds,
-                target: 1.10,
-                minimum_delta_e: 0.025,
-                runtime_state: None,
-                readable_foregrounds: &[],
-                rendered_references: &[],
-                runtime_rendered_references: &[],
-            },
-            constraints,
-            maximum_alpha: 198,
-            frontier_limit: 128,
-        };
-        let impossible = PairConstraints {
-            cvd_delta: 1.0,
-            ..constraints
-        };
+        let impossible = constraints.with_cvd_delta(1.0);
         let mut search = Search::default();
         let fallback = search
             .fit_overlay_pair_with_fallback(

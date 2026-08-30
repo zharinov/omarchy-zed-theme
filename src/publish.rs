@@ -78,6 +78,7 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
             )));
         }
     };
+
     if !file.metadata()?.is_file() {
         return Err(Error(format!(
             "refusing non-regular target: {}",

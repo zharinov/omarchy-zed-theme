@@ -43,6 +43,7 @@ fn print_generation(generation: Generation) {
     for warning in generation.audit.warnings {
         eprintln!("omarchy-zed-theme: resolver warning: {warning}");
     }
+
     for degradation in generation.audit.degradations {
         eprintln!("omarchy-zed-theme: degradation: {degradation}");
     }

@@ -43,12 +43,15 @@ fn theme_property(object: &CstObject) -> Result<Option<CstObjectProp>> {
             .ok_or_else(|| Error("Zed settings contain an unnamed property".into()))?
             .decoded_value()
             .map_err(|error| Error(format!("invalid Zed setting name: {error}")))?;
-        if name == "theme" {
-            if found.is_some() {
-                return Err(Error("Zed settings contain duplicate theme keys".into()));
-            }
-            found = Some(property);
+
+        if name != "theme" {
+            continue;
         }
+        if found.is_some() {
+            return Err(Error("Zed settings contain duplicate theme keys".into()));
+        }
+
+        found = Some(property);
     }
     Ok(found)
 }
@@ -246,18 +249,18 @@ fn activate_settings(
         if !claim_matches(claim_path, owner)? {
             return Ok(false);
         }
+
         let updated = set_theme(source, Some(&managed))?;
-        if updated.as_bytes() == source.as_bytes()
-            || atomic_write_file_if_unchanged(
-                settings_path,
-                original.as_deref(),
-                updated.as_bytes(),
-            )?
+        if updated.as_bytes() == source.as_bytes() {
+            return Ok(true);
+        }
+        if atomic_write_file_if_unchanged(settings_path, original.as_deref(), updated.as_bytes())?
             .is_some()
         {
             return Ok(true);
         }
     }
+
     Err(Error(format!(
         "Zed settings did not remain stable: {}",
         settings_path.display()
@@ -280,18 +283,18 @@ fn restore_settings(
         if !claim_matches(claim_path, owner)? {
             return Ok(None);
         }
+
         let updated = set_theme(source, previous_theme)?;
-        if updated.as_bytes() == source.as_bytes()
-            || atomic_write_file_if_unchanged(
-                settings_path,
-                original.as_deref(),
-                updated.as_bytes(),
-            )?
+        if updated.as_bytes() == source.as_bytes() {
+            return Ok(Some(true));
+        }
+        if atomic_write_file_if_unchanged(settings_path, original.as_deref(), updated.as_bytes())?
             .is_some()
         {
             return Ok(Some(true));
         }
     }
+
     Err(Error(format!(
         "Zed settings did not remain stable: {}",
         settings_path.display()
@@ -349,6 +352,7 @@ fn activate_paths(
     if owner.is_empty() {
         return Err(Error("activation owner cannot be empty".into()));
     }
+
     let _lock = state_lock(state_path)?;
     if !claim_matches(claim_path, owner)? {
         return Ok(());
@@ -394,6 +398,7 @@ fn restore_paths(
     if owner.is_empty() {
         return Err(Error("activation owner cannot be empty".into()));
     }
+
     let _lock = state_lock(state_path)?;
     if !claim_matches(claim_path, owner)? {
         return Ok(());
@@ -402,6 +407,7 @@ fn restore_paths(
         return Ok(());
     };
     let mut state = parse_state(&content)?;
+
     if !claim_matches(claim_path, owner)? {
         return Ok(());
     }
@@ -414,6 +420,7 @@ fn restore_paths(
     else {
         return Ok(());
     };
+
     if !claim_matches(claim_path, owner)? {
         if restored {
             state.active = false;
@@ -421,6 +428,7 @@ fn restore_paths(
         }
         return Ok(());
     }
+
     fs::remove_file(state_path)?;
     if let Some(parent) = state_path.parent() {
         let _ = fs::remove_dir(parent);

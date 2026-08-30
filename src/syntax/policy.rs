@@ -104,7 +104,7 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "predictive",
-        role: Subdued,
+        role: Predictive,
     },
     CapturePolicy {
         capture: "preproc",
