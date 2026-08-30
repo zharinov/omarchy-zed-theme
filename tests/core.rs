@@ -1,4 +1,6 @@
-use omarchy_zed_theme::color::{apply_opacity, contrast_ratio, delta_e, gpui_blend};
+use omarchy_zed_theme::color::{
+    apply_opacity, contrast_ratio, delta_e, gpui_blend, lab, oklab_to_oklch,
+};
 use omarchy_zed_theme::constants::{
     ADDITIONAL_SYNTAX_FIELDS, BASE_SYNTAX_FIELDS, CANONICAL_COLOR_KEYS, CHROME_FIELDS,
     EDITOR_FIELDS, FOUNDATION_FIELDS, LINK_VC_FIELDS, RUNTIME_STATE_BASE_CONTRAST_STEP,
@@ -7,6 +9,8 @@ use omarchy_zed_theme::constants::{
 };
 use omarchy_zed_theme::palette::{Provenance, ResolvedPalette, resolve_palette};
 use omarchy_zed_theme::publish::atomic_write_file;
+use omarchy_zed_theme::saliency::relative_saliency;
+use omarchy_zed_theme::syntax::contrast_floor;
 use omarchy_zed_theme::theme::build_theme;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,6 +31,18 @@ fn temporary(name: &str) -> PathBuf {
 
 fn style(document: &Value) -> &serde_json::Map<String, Value> {
     document["themes"][0]["style"].as_object().unwrap()
+}
+
+fn assert_semantic_hue(name: &str, role: &str, value: &str, target_degrees: f64) {
+    let [_, chroma, hue] = oklab_to_oklch(lab(value).unwrap());
+    let target = target_degrees.to_radians();
+    let difference = (hue - target).abs();
+    let distance = difference.min(std::f64::consts::TAU - difference);
+    assert!(chroma >= 0.025, "{name}: {role} is effectively achromatic");
+    assert!(
+        distance <= 45.0_f64.to_radians(),
+        "{name}: {role} is outside its conventional hue sector"
+    );
 }
 
 fn synthetic_palette() -> ResolvedPalette {
@@ -65,6 +81,60 @@ fn synthetic_palette() -> ResolvedPalette {
             .map(|key| ((*key).to_owned(), Provenance::Direct))
             .collect(),
     }
+}
+
+fn venice_like_palette() -> ResolvedPalette {
+    let mut palette = synthetic_palette();
+    palette.mode = "light".into();
+    for (key, value) in [
+        ("background", "#f5f2e9"),
+        ("dark_background", "#b8b6af"),
+        ("darker_background", "#7a7974"),
+        ("lighter_background", "#f6f3eb"),
+        ("foreground", "#492924"),
+        ("dark_foreground", "#361e1b"),
+        ("light_foreground", "#644945"),
+        ("bright_foreground", "#765e5b"),
+        ("accent", "#72684b"),
+        ("selection", "#c3c0b8"),
+        ("selection_background", "#c3c0b8"),
+        ("selection_foreground", "#492924"),
+        ("muted", "#85837d"),
+        ("cursor", "#72684b"),
+        ("red", "#706548"),
+        ("yellow", "#6f6645"),
+        ("orange", "#706547"),
+        ("green", "#6f6644"),
+        ("cyan", "#726947"),
+        ("blue", "#72684b"),
+        ("magenta", "#796e51"),
+        ("brown", "#3e3827"),
+        ("bright_red", "#948962"),
+        ("bright_yellow", "#938a5e"),
+        ("bright_green", "#938a5c"),
+        ("bright_cyan", "#968d60"),
+        ("bright_blue", "#968c65"),
+        ("bright_magenta", "#9e926c"),
+    ] {
+        palette.colors.insert(key.into(), value.into());
+    }
+    for (key, value) in [
+        ("color1", "#706548"),
+        ("color2", "#6f6644"),
+        ("color3", "#6f6645"),
+        ("color4", "#72684b"),
+        ("color5", "#796e51"),
+        ("color6", "#726947"),
+        ("color9", "#948962"),
+        ("color10", "#938a5c"),
+        ("color11", "#938a5e"),
+        ("color12", "#968c65"),
+        ("color13", "#9e926c"),
+        ("color14", "#968d60"),
+    ] {
+        palette.colors.insert(key.into(), value.into());
+    }
+    palette
 }
 
 fn renamed_fields(source: &str, structure: &str) -> BTreeSet<String> {
@@ -232,6 +302,102 @@ fn theme_bytes_and_audit_are_thread_count_independent() {
 }
 
 #[test]
+fn syntax_profile_does_not_reassign_diff_source_families() {
+    let authored = synthetic_palette();
+    let mut neutral_profile = authored.clone();
+    for provenance in neutral_profile.provenance.values_mut() {
+        *provenance = Provenance::Derived;
+    }
+
+    let (authored_document, authored_audit) = build_theme(&authored).unwrap();
+    let (neutral_document, neutral_audit) = build_theme(&neutral_profile).unwrap();
+    assert_ne!(
+        authored_audit.syntax_policy["profile"]["target_families"],
+        neutral_audit.syntax_policy["profile"]["target_families"]
+    );
+
+    let authored_syntax = style(&authored_document)["syntax"].as_object().unwrap();
+    let neutral_syntax = style(&neutral_document)["syntax"].as_object().unwrap();
+    for capture in ["diff.plus", "diff.minus", "diff"] {
+        assert_eq!(
+            authored_syntax[capture]["color"], neutral_syntax[capture]["color"],
+            "{capture} changed with profile-only provenance"
+        );
+    }
+
+    let diff_audit = &authored_audit.syntax_policy["diff"];
+    assert_eq!(diff_audit["profile_budgeted"].as_bool(), Some(false));
+    assert_eq!(diff_audit["added_source_key"].as_str(), Some("green"));
+    assert_eq!(diff_audit["deleted_source_key"].as_str(), Some("red"));
+    assert_eq!(diff_audit["change_source_key"].as_str(), Some("yellow"));
+
+    for (capture, source_key) in [
+        ("diff.plus", "green"),
+        ("diff.minus", "red"),
+        ("diff", "yellow"),
+    ] {
+        let source = oklab_to_oklch(lab(&authored.colors[source_key]).unwrap());
+        let output =
+            oklab_to_oklch(lab(authored_syntax[capture]["color"].as_str().unwrap()).unwrap());
+        let hue_distance = (source[2] - output[2])
+            .abs()
+            .min(std::f64::consts::TAU - (source[2] - output[2]).abs());
+        assert!(
+            hue_distance < 0.03,
+            "{capture} left the {source_key} hue family"
+        );
+    }
+}
+
+#[test]
+fn narrow_olive_palette_uses_scaffold_and_generates() {
+    let (_, audit) = build_theme(&venice_like_palette()).unwrap();
+    let allocations = audit.syntax_policy["saliency"]["allocations"]
+        .as_array()
+        .unwrap();
+    assert!(
+        allocations
+            .iter()
+            .filter(|allocation| allocation["seed_kind"] == "authored_hue")
+            .count()
+            <= 1
+    );
+    assert!(
+        allocations
+            .iter()
+            .any(|allocation| allocation["seed_kind"] == "dynamic_scaffold")
+    );
+}
+
+#[test]
+fn every_syntax_capture_is_readable_on_emitted_diff_overlays() {
+    let (document, _) = build_theme(&synthetic_palette()).unwrap();
+    let style = style(&document);
+    let diff_contexts = [
+        "editor.diff_hunk.added.background",
+        "editor.diff_hunk.added.hollow_background",
+        "editor.diff_hunk.deleted.background",
+        "editor.diff_hunk.deleted.hollow_background",
+        "version_control.word_added",
+        "version_control.word_deleted",
+        "version_control.conflict_marker.ours",
+        "version_control.conflict_marker.theirs",
+    ];
+    for (capture, spec) in style["syntax"].as_object().unwrap() {
+        let foreground = spec["color"].as_str().unwrap();
+        let floor = contrast_floor(capture).unwrap();
+        for context in diff_contexts {
+            let background = style[context].as_str().unwrap();
+            let actual = contrast_ratio(foreground, background).unwrap();
+            assert!(
+                actual >= floor - 1e-9,
+                "syntax.{capture} reaches only {actual:.3}:1 on {context}; floor is {floor:.2}:1"
+            );
+        }
+    }
+}
+
+#[test]
 fn runtime_element_active_advances_hover() {
     let (document, _) = build_theme(&synthetic_palette()).unwrap();
     let style = style(&document);
@@ -295,51 +461,206 @@ fn all_builtin_themes_meet_the_rust_contract() {
         return;
     }
 
-    let expected_richness = BTreeMap::from([
-        ("catppuccin-latte", 6),
-        ("catppuccin", 5),
-        ("ethereal", 7),
-        ("everforest", 5),
-        ("flexoki-light", 5),
-        ("gruvbox", 5),
-        ("hackerman", 5),
-        ("kanagawa", 7),
-        ("last-horizon", 4),
-        ("lumon", 4),
-        ("lupine", 4),
-        ("matte-black", 4),
-        ("miasma", 5),
-        ("nord", 7),
-        ("osaka-jade", 4),
-        ("retro-82", 4),
-        ("ristretto", 5),
-        ("rose-pine", 5),
-        ("solitude", 0),
-        ("tokyo-night", 5),
-        ("vantablack", 0),
-        ("white", 0),
-    ]);
+    let theme_names = [
+        "catppuccin-latte",
+        "catppuccin",
+        "ethereal",
+        "everforest",
+        "flexoki-light",
+        "gruvbox",
+        "hackerman",
+        "kanagawa",
+        "last-horizon",
+        "lumon",
+        "lupine",
+        "matte-black",
+        "miasma",
+        "nord",
+        "osaka-jade",
+        "retro-82",
+        "ristretto",
+        "rose-pine",
+        "solitude",
+        "tokyo-night",
+        "vantablack",
+        "white",
+    ];
     let syntax_manifest: BTreeSet<_> = BASE_SYNTAX_FIELDS
         .iter()
         .chain(ADDITIONAL_SYNTAX_FIELDS)
         .copied()
         .collect();
+    let mut profile_summary = BTreeMap::new();
 
-    for (name, expected_r) in expected_richness {
+    for name in theme_names {
         let palette = resolve_palette(&root.join(name).join("colors.toml"), None).unwrap();
         let (document, audit) =
             build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
 
+        let profile = &audit.syntax_policy["profile"];
+        profile_summary.insert(
+            name,
+            (
+                profile["scores"]["authored_breadth"].as_f64().unwrap(),
+                profile["scores"]["authored_intensity"].as_f64().unwrap(),
+                profile["baseline_kind"].as_str().unwrap().to_owned(),
+                profile["target_families"].as_u64().unwrap(),
+            ),
+        );
+        let family_count = audit.syntax_policy["merge_plan"]["family_count"]
+            .as_u64()
+            .unwrap();
+        let requested_family_count = profile["target_families"].as_u64().unwrap();
+        assert!(family_count <= requested_family_count, "{name}");
         assert_eq!(
-            audit.syntax_richness["R"].as_u64(),
-            Some(expected_r),
+            audit.syntax_policy["merge_plan"]["requested_family_count"].as_u64(),
+            Some(requested_family_count),
             "{name}"
+        );
+        assert!((4..=8).contains(&family_count), "{name}");
+        let family_colors = audit.syntax_policy["saliency"]["ordinary_pair_metrics"]["colors"]
+            .as_array()
+            .unwrap();
+        assert_eq!(family_colors.len(), family_count as usize, "{name}");
+        assert_eq!(
+            family_colors
+                .iter()
+                .map(|color| color.as_str().unwrap())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            family_count as usize,
+            "{name}: accidental family collision"
         );
         assert!(!audit.diff_metrics.is_empty(), "{name}");
         assert_eq!(audit.interaction_ladders.len(), 3, "{name}");
 
         let style = style(&document);
         let syntax = style["syntax"].as_object().unwrap();
+        let editor_backgrounds = vec![style["editor.background"].as_str().unwrap().to_owned()];
+        let editor_foreground = style["editor.foreground"].as_str().unwrap();
+        let inactive_saliency = relative_saliency(
+            style["editor.line_number"].as_str().unwrap(),
+            editor_foreground,
+            &editor_backgrounds,
+        )
+        .unwrap();
+        let hover_saliency = relative_saliency(
+            style["editor.hover_line_number"].as_str().unwrap(),
+            editor_foreground,
+            &editor_backgrounds,
+        )
+        .unwrap();
+        let active_saliency = relative_saliency(
+            style["editor.active_line_number"].as_str().unwrap(),
+            editor_foreground,
+            &editor_backgrounds,
+        )
+        .unwrap();
+        assert!(inactive_saliency + 0.10 <= hover_saliency, "{name}");
+        assert!(inactive_saliency + 0.20 <= active_saliency, "{name}");
+        assert!(hover_saliency <= active_saliency + 0.03, "{name}");
+        let line_audit = audit
+            .saliency
+            .iter()
+            .find(|entry| entry["role"] == "editor.line_number")
+            .unwrap();
+        let active_line_audit = audit
+            .saliency
+            .iter()
+            .find(|entry| entry["role"] == "editor.active_line_number")
+            .unwrap();
+        assert_eq!(line_audit["preferred_saliency"].as_f64(), Some(0.394));
+        assert!(
+            (line_audit["actual_saliency"].as_f64().unwrap() - 0.394).abs() <= 0.03,
+            "{name}"
+        );
+        assert!(
+            (active_line_audit["actual_saliency"].as_f64().unwrap() - 1.0).abs() <= 0.03,
+            "{name}"
+        );
+        assert_eq!(
+            audit.syntax_policy["saliency"]["measured_order_verified"].as_bool(),
+            Some(true),
+            "{name}"
+        );
+
+        let primary_saliency = relative_saliency(
+            syntax["primary"]["color"].as_str().unwrap(),
+            editor_foreground,
+            &editor_backgrounds,
+        )
+        .unwrap();
+        let subdued_saliency = relative_saliency(
+            syntax["comment"]["color"].as_str().unwrap(),
+            editor_foreground,
+            &editor_backgrounds,
+        )
+        .unwrap();
+        assert!(subdued_saliency + 0.03 <= primary_saliency, "{name}");
+
+        for (role, value, hue) in [
+            (
+                "syntax add",
+                syntax["diff.plus"]["color"].as_str().unwrap(),
+                145.0,
+            ),
+            (
+                "syntax remove",
+                syntax["diff.minus"]["color"].as_str().unwrap(),
+                25.0,
+            ),
+            (
+                "syntax change",
+                syntax["diff"]["color"].as_str().unwrap(),
+                85.0,
+            ),
+            (
+                "added diff background",
+                style["editor.diff_hunk.added.background"].as_str().unwrap(),
+                145.0,
+            ),
+            (
+                "removed diff background",
+                style["editor.diff_hunk.deleted.background"]
+                    .as_str()
+                    .unwrap(),
+                25.0,
+            ),
+            (
+                "added diff border",
+                style["editor.diff_hunk.added.hollow_border"]
+                    .as_str()
+                    .unwrap(),
+                145.0,
+            ),
+            (
+                "removed diff border",
+                style["editor.diff_hunk.deleted.hollow_border"]
+                    .as_str()
+                    .unwrap(),
+                25.0,
+            ),
+            (
+                "version-control added",
+                style["version_control.added"].as_str().unwrap(),
+                145.0,
+            ),
+            (
+                "version-control deleted",
+                style["version_control.deleted"].as_str().unwrap(),
+                25.0,
+            ),
+            (
+                "version-control modified",
+                style["version_control.modified"].as_str().unwrap(),
+                85.0,
+            ),
+            ("created status", style["created"].as_str().unwrap(), 145.0),
+            ("deleted status", style["deleted"].as_str().unwrap(), 25.0),
+            ("modified status", style["modified"].as_str().unwrap(), 85.0),
+        ] {
+            assert_semantic_hue(name, role, value, hue);
+        }
 
         assert_eq!(
             syntax.keys().map(String::as_str).collect::<BTreeSet<_>>(),
@@ -347,16 +668,42 @@ fn all_builtin_themes_meet_the_rust_contract() {
             "{name}"
         );
         if matches!(name, "white" | "vantablack" | "solitude") {
+            assert_eq!(profile["baseline_kind"].as_str(), Some("neutral"), "{name}");
+            assert_eq!(family_count, 4, "{name}");
+            assert!(
+                profile["chroma_envelope"]["maximum_ordinary_chroma"]
+                    .as_f64()
+                    .unwrap()
+                    <= 0.055 + 1e-9,
+                "{name} inflated the neutral chroma envelope"
+            );
+            assert!(
+                audit.syntax_policy["saliency"]["allocations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|allocation| allocation["seed_kind"] == "dynamic_scaffold"),
+                "{name} did not use the dynamic scaffold"
+            );
             let colors: BTreeSet<_> = syntax
                 .values()
                 .filter_map(|spec| spec["color"].as_str())
                 .collect();
             assert!(
-                colors.len() >= 6,
+                colors.len() >= 7,
                 "{name} collapsed to {} syntax colors",
                 colors.len()
             );
         }
+        assert!(
+            audit.syntax_policy["saliency"]["allocations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|allocation| allocation["seed_kind"] == "dynamic_scaffold")
+                .all(|allocation| allocation["output_chroma"].as_f64().unwrap() <= 0.055 + 1e-9),
+            "{name} synthesized an ordinary high-chroma family"
+        );
 
         let added = style["version_control.added"].as_str().unwrap();
         let deleted = style["version_control.deleted"].as_str().unwrap();
@@ -365,6 +712,22 @@ fn all_builtin_themes_meet_the_rust_contract() {
         assert!(pair_contrast >= 1.05);
         assert!(pair_delta >= 0.075);
     }
+    let matte = &profile_summary["matte-black"];
+    let nord = &profile_summary["nord"];
+    let tokyo = &profile_summary["tokyo-night"];
+    let catppuccin = &profile_summary["catppuccin"];
+    assert_eq!(matte.2, "accent_led");
+    assert_eq!(nord.2, "palette_native");
+    assert!(matte.0 < nord.0, "matte-black should be narrower than nord");
+    assert!(
+        matte.1 > nord.1,
+        "matte-black should be more intense than nord"
+    );
+    assert!(tokyo.0 > nord.0, "tokyo-night should be broader than nord");
+    assert!(
+        catppuccin.0 > nord.0,
+        "catppuccin should be broader than nord"
+    );
 }
 
 #[test]

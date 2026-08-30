@@ -2,6 +2,7 @@ pub mod color;
 pub mod constants;
 pub mod palette;
 pub mod publish;
+pub mod saliency;
 pub mod search;
 pub mod syntax;
 pub mod theme;

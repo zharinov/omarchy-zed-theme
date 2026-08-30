@@ -3,11 +3,18 @@
 //! Omarchy supplies every UI color. Built-in colors may repair syntax roles only.
 //! Search can record an unmet preference, but it cannot downgrade a failed validation.
 
-use crate::color::{apply_opacity, contrast_ratio, delta_e, gpui_blend, lightness, tone};
+use crate::color::{
+    apply_opacity, contrast_ratio, delta_e, gamut_map_oklch, gpui_blend, lab, lightness,
+    oklab_to_oklch, tone,
+};
 use crate::constants::*;
 use crate::palette::ResolvedPalette;
+use crate::saliency::{
+    HOVER_LINE_NUMBER_SALIENCY, INACTIVE_LINE_NUMBER_SALIENCY, PRIMARY_SALIENCY, SaliencyRequest,
+    fit_relative,
+};
 use crate::search::{FillRequest, FitBounds, PairConstraints, Search, cvd_greedy_order, round6};
-use crate::syntax::{Tier, build_syntax, contrast_floor};
+use crate::syntax::{build_syntax, contrast_floor};
 use crate::{Error, Result};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,7 +28,8 @@ pub struct Audit {
     pub degradations: Vec<Value>,
     pub minimums: BTreeMap<String, f64>,
     pub warnings: Vec<String>,
-    pub syntax_richness: Value,
+    pub saliency: Vec<Value>,
+    pub syntax_policy: Value,
     pub syntax_roles: Vec<Value>,
     pub syntax_collapses: Vec<Value>,
     pub diff_metrics: Vec<Value>,
@@ -42,7 +50,8 @@ impl Audit {
                 .then(|| palette.resolver_stderr.clone())
                 .into_iter()
                 .collect(),
-            syntax_richness: Value::Null,
+            saliency: Vec::new(),
+            syntax_policy: Value::Null,
             syntax_roles: Vec::new(),
             syntax_collapses: Vec::new(),
             diff_metrics: Vec::new(),
@@ -73,7 +82,8 @@ impl Audit {
             "mode": self.mode, "extras": self.extras, "surface_changes": self.surface_changes,
             "repairs": self.repairs, "degradations": self.degradations,
             "minimums": self.minimums, "warnings": self.warnings,
-            "syntax_richness": self.syntax_richness, "syntax_roles": self.syntax_roles,
+            "saliency": self.saliency,
+            "syntax_policy": self.syntax_policy, "syntax_roles": self.syntax_roles,
             "syntax_collapses": self.syntax_collapses, "diff_metrics": self.diff_metrics,
             "interaction_ladders": self.interaction_ladders, "fidelity_deviations": self.fidelity_deviations,
         })
@@ -268,6 +278,7 @@ fn terminal_triplet(
                     lower_lightness: lower,
                     upper_lightness: upper,
                     prefer_background,
+                    ..FitBounds::default()
                 },
             )
         } else {
@@ -280,6 +291,7 @@ fn terminal_triplet(
                     lower_lightness: lower,
                     upper_lightness: upper,
                     prefer_background,
+                    ..FitBounds::default()
                 },
             )?;
             audit.degradation(format!("{role}.{variant}"), "terminal_preferred_contrast", json!({
@@ -313,6 +325,7 @@ fn terminal_triplet(
             lower_lightness: dim_lower,
             upper_lightness: dim_upper,
             prefer_background: true,
+            ..FitBounds::default()
         },
     ) {
         Ok(value) => value,
@@ -361,6 +374,26 @@ struct SemanticPalette {
     magenta: String,
 }
 
+fn conventional_semantic_seed(
+    palette: &ResolvedPalette,
+    key: &str,
+    target_hue_degrees: f64,
+) -> Result<String> {
+    let [source_lightness, source_chroma, source_hue] = oklab_to_oklch(lab(color(palette, key))?);
+    // Exact gamut endpoints cannot carry chroma. Re-enter the usable gamut before
+    // imposing the conventional hue; downstream fitting still chooses final tone.
+    let lightness = source_lightness.clamp(0.35, 0.80);
+    let target_hue = target_hue_degrees.to_radians();
+    let difference = (source_hue - target_hue).abs();
+    let hue_distance = difference.min(std::f64::consts::TAU - difference);
+    let hue = if source_chroma >= 0.035 && hue_distance <= 40.0_f64.to_radians() {
+        source_hue
+    } else {
+        target_hue
+    };
+    Ok(gamut_map_oklch(lightness, source_chroma.clamp(0.080, 0.180), hue).opaque_hex())
+}
+
 fn derive_semantics(
     search: &mut Search,
     palette: &ResolvedPalette,
@@ -407,6 +440,7 @@ fn derive_semantics(
                 normal_delta: SEMANTIC_PAIR_CONTRACT.normal_delta_e,
                 cvd_delta: SEMANTIC_PAIR_CONTRACT.cvd_delta_e,
                 lightness_delta: 0.0,
+                minimum_chroma: 0.0,
                 separation_alternative: SEMANTIC_PAIR_CONTRACT.separation_alternative,
                 prefer_background: false,
             },
@@ -771,6 +805,59 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         &editor_bases,
         EDITOR_BASE_TEXT_CONTRAST,
     )?;
+    let editor_line_number = fit_relative(
+        &mut search,
+        color(palette, "muted"),
+        &editor_primary,
+        SaliencyRequest {
+            backgrounds: &editor_bases,
+            hard_floor: PASSIVE_CONTRAST,
+            preferred_saliency: INACTIVE_LINE_NUMBER_SALIENCY,
+            avoid: &[],
+            bounds: FitBounds::default(),
+        },
+    )?;
+    let editor_hover_line_number = fit_relative(
+        &mut search,
+        color(palette, "muted"),
+        &editor_primary,
+        SaliencyRequest {
+            backgrounds: &editor_bases,
+            hard_floor: CONTROL_CONTRAST,
+            preferred_saliency: HOVER_LINE_NUMBER_SALIENCY,
+            avoid: &[],
+            bounds: FitBounds::default(),
+        },
+    )?;
+    let editor_active_line_number = fit_relative(
+        &mut search,
+        &editor_primary,
+        &editor_primary,
+        SaliencyRequest {
+            backgrounds: &editor_bases,
+            hard_floor: TEXT_CONTRAST,
+            preferred_saliency: PRIMARY_SALIENCY,
+            avoid: &[],
+            bounds: FitBounds::default(),
+        },
+    )?;
+    audit.saliency.extend([
+        editor_line_number.audit(
+            "editor.line_number",
+            PASSIVE_CONTRAST,
+            "911-theme median from tmp/zed-saliency-policy-evaluation.json",
+        ),
+        editor_hover_line_number.audit(
+            "editor.hover_line_number",
+            CONTROL_CONTRAST,
+            "deterministic midpoint between inactive and primary",
+        ),
+        editor_active_line_number.audit(
+            "editor.active_line_number",
+            TEXT_CONTRAST,
+            "911-theme active median",
+        ),
+    ]);
     let search_match = search
         .fit_state(
             &semantic.yellow,
@@ -839,12 +926,43 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
 
     // Diff colors are derived as a dedicated semantic subsystem because diff viewers
     // combine text, fills, hollow borders, selections, and conflict overlays.
+    let diff_green_seed = conventional_semantic_seed(palette, "green", 145.0)?;
+    let diff_red_seed = conventional_semantic_seed(palette, "red", 25.0)?;
+    let diff_yellow_seed = conventional_semantic_seed(palette, "yellow", 85.0)?;
+    let [version_control_added, version_control_deleted] = search
+        .fit_pair(
+            &diff_green_seed,
+            &diff_red_seed,
+            &interaction_bases,
+            PairConstraints {
+                foreground_contrast: TEXT_CONTRAST,
+                pair_contrast: SEMANTIC_PAIR_CONTRACT.contrast,
+                normal_delta: SEMANTIC_PAIR_CONTRACT.normal_delta_e,
+                cvd_delta: SEMANTIC_PAIR_CONTRACT.cvd_delta_e,
+                lightness_delta: 0.0,
+                minimum_chroma: 0.025,
+                separation_alternative: SEMANTIC_PAIR_CONTRACT.separation_alternative,
+                prefer_background: false,
+            },
+        )
+        .map_err(|error| Error(format!("version-control add/delete foregrounds: {error}")))?;
+    let version_control_modified = search.fit_color_bounded(
+        &diff_yellow_seed,
+        &interaction_bases,
+        TEXT_CONTRAST,
+        &[],
+        FitBounds {
+            lower_chroma: 0.025,
+            ..FitBounds::default()
+        },
+    )?;
     let diff_constraints = PairConstraints {
         foreground_contrast: DIFF_FILL_CONTRAST,
         pair_contrast: DIFF_PAIR_CONTRAST,
         normal_delta: DIFF_NORMAL_FLOOR_DELTA_E,
         cvd_delta: DIFF_CVD_FLOOR_DELTA_E,
         lightness_delta: 0.0,
+        minimum_chroma: 0.025,
         separation_alternative: Some((
             DIFF_LUMINANCE_SEPARATION_CONTRAST,
             DIFF_NORMAL_DELTA_E,
@@ -855,9 +973,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     let readable_diff_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
     let [diff_added, diff_deleted] = search
         .fit_pair_on_backgrounds_readable(
-            color(palette, "green"),
+            &diff_green_seed,
             &editor_bases,
-            color(palette, "red"),
+            &diff_red_seed,
             &editor_bases,
             diff_constraints,
             &readable_diff_text,
@@ -865,9 +983,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         .map_err(|error| Error(format!("solid diff hunks: {error}")))?;
     let [diff_added_hollow, diff_deleted_hollow] = search
         .fit_pair_on_backgrounds_readable(
-            color(palette, "green"),
+            &diff_green_seed,
             &editor_bases,
-            color(palette, "red"),
+            &diff_red_seed,
             &editor_bases,
             PairConstraints {
                 foreground_contrast: DIFF_HOLLOW_CONTRAST,
@@ -878,9 +996,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         .map_err(|error| Error(format!("hollow diff hunks: {error}")))?;
     let [word_added, word_deleted] = search
         .fit_pair_on_backgrounds_readable(
-            color(palette, "green"),
+            &diff_green_seed,
             std::slice::from_ref(&diff_added),
-            color(palette, "red"),
+            &diff_red_seed,
             std::slice::from_ref(&diff_deleted),
             PairConstraints {
                 foreground_contrast: DIFF_FILL_CONTRAST,
@@ -897,6 +1015,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             &editor_bases,
             PairConstraints {
                 foreground_contrast: DIFF_FILL_CONTRAST,
+                minimum_chroma: 0.0,
                 ..diff_constraints
             },
             &readable_diff_text,
@@ -1128,14 +1247,14 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
 
     let status_seeds: BTreeMap<&str, &String> = BTreeMap::from([
         ("conflict", &semantic.orange),
-        ("created", &semantic.green),
-        ("deleted", &semantic.red),
+        ("created", &diff_green_seed),
+        ("deleted", &diff_red_seed),
         ("error", &semantic.red),
         ("hidden", &semantic.disabled),
         ("hint", &semantic.cyan),
         ("ignored", &semantic.secondary),
         ("info", &semantic.blue),
-        ("modified", &semantic.yellow),
+        ("modified", &diff_yellow_seed),
         ("predictive", &semantic.secondary),
         ("renamed", &semantic.blue),
         ("success", &semantic.green),
@@ -1175,10 +1294,21 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                 .cloned()
                 .chain(std::iter::once(status_backgrounds[name].clone())),
         );
-        status_foregrounds.insert(
-            *name,
-            search.fit_color(seed, &status_foreground_backgrounds, TEXT_CONTRAST)?,
-        );
+        let output = if matches!(*name, "created" | "deleted" | "modified") {
+            search.fit_color_bounded(
+                seed,
+                &status_foreground_backgrounds,
+                TEXT_CONTRAST,
+                &[],
+                FitBounds {
+                    lower_chroma: 0.025,
+                    ..FitBounds::default()
+                },
+            )?
+        } else {
+            search.fit_color(seed, &status_foreground_backgrounds, TEXT_CONTRAST)?
+        };
+        status_foregrounds.insert(*name, output);
     }
     let mut statuses = BTreeMap::new();
     for name in STATUS_NAMES {
@@ -1278,7 +1408,14 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             .chain(chained),
     );
 
-    let syntax = build_syntax(&mut search, palette, &syntax_contexts, &mut audit)?;
+    let syntax = build_syntax(
+        &mut search,
+        palette,
+        &syntax_contexts,
+        &editor_primary,
+        [&diff_green_seed, &diff_yellow_seed, &diff_red_seed],
+        &mut audit,
+    )?;
 
     let accent_seeds = cvd_greedy_order(&[
         semantic.accent.clone(),
@@ -1424,9 +1561,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         editor_highlighted_line
     );
     put!("editor.debugger_active_line.background", debugger_active);
-    put!("editor.line_number", semantic.secondary.clone());
-    put!("editor.active_line_number", semantic.primary.clone());
-    put!("editor.hover_line_number", semantic.primary.clone());
+    put!("editor.line_number", editor_line_number.output);
+    put!(
+        "editor.active_line_number",
+        editor_active_line_number.output
+    );
+    put!("editor.hover_line_number", editor_hover_line_number.output);
     put!(
         "editor.invisible",
         search.fit_color(
@@ -1481,7 +1621,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     put!(
         "editor.diff_hunk.added.hollow_border",
         search.fit_color(
-            &semantic.green,
+            &diff_green_seed,
             &[canvas.clone(), diff_added_hollow.clone()],
             CONTROL_CONTRAST
         )?
@@ -1494,7 +1634,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     put!(
         "editor.diff_hunk.deleted.hollow_border",
         search.fit_color(
-            &semantic.red,
+            &diff_red_seed,
             &[canvas.clone(), diff_deleted_hollow.clone()],
             CONTROL_CONTRAST
         )?
@@ -1504,9 +1644,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         "link_text.hover",
         search.fit_color(&semantic.accent, &ui_backgrounds, TEXT_CONTRAST)?
     );
-    put!("version_control.added", semantic.green.clone());
-    put!("version_control.deleted", semantic.red.clone());
-    put!("version_control.modified", semantic.yellow.clone());
+    put!("version_control.added", version_control_added);
+    put!("version_control.deleted", version_control_deleted);
+    put!("version_control.modified", version_control_modified);
     put!("version_control.renamed", semantic.blue.clone());
     put!("version_control.conflict", semantic.orange.clone());
     put!("version_control.ignored", semantic.secondary.clone());
@@ -1667,11 +1807,6 @@ fn validate_theme(
         "text.disabled",
         "text.accent",
     ];
-    let editor_label_fields = [
-        "editor.line_number",
-        "editor.active_line_number",
-        "editor.hover_line_number",
-    ];
     let semantic_text_fields = [
         "link_text.hover",
         "version_control.added",
@@ -1684,7 +1819,6 @@ fn validate_theme(
     let mut text_minimum = f64::INFINITY;
     for (names, backgrounds) in [
         (&ui_text_fields[..], ui_backgrounds),
-        (&editor_label_fields[..], editor_bases),
         (&semantic_text_fields[..], interaction_bases),
     ] {
         for name in names {
@@ -1701,6 +1835,47 @@ fn validate_theme(
         (text_minimum * 10_000.0).round() / 10_000.0,
     );
     let editor_foreground = style_color(style, "editor.foreground")?;
+    let mut editor_label_minimum = f64::INFINITY;
+    for (name, floor) in [
+        ("editor.line_number", HARD_PASSIVE_CONTRAST),
+        ("editor.hover_line_number", HARD_CONTROL_CONTRAST),
+        ("editor.active_line_number", HARD_TEXT_CONTRAST),
+    ] {
+        let actual = minimum_contrast(style_color(style, name)?, editor_bases)?;
+        editor_label_minimum = editor_label_minimum.min(actual);
+        if actual < floor - 1e-9 {
+            errors.push(format!(
+                "{name} reaches only {actual:.3}:1; floor is {floor:.2}:1"
+            ));
+        }
+    }
+    audit.minimums.insert(
+        "editor_labels".into(),
+        (editor_label_minimum * 10_000.0).round() / 10_000.0,
+    );
+    let inactive_saliency = crate::saliency::relative_saliency(
+        style_color(style, "editor.line_number")?,
+        editor_foreground,
+        editor_bases,
+    )?;
+    let hover_saliency = crate::saliency::relative_saliency(
+        style_color(style, "editor.hover_line_number")?,
+        editor_foreground,
+        editor_bases,
+    )?;
+    let active_saliency = crate::saliency::relative_saliency(
+        style_color(style, "editor.active_line_number")?,
+        editor_foreground,
+        editor_bases,
+    )?;
+    if inactive_saliency + 0.10 > hover_saliency
+        || inactive_saliency + 0.20 > active_saliency
+        || hover_saliency > active_saliency + 0.03
+    {
+        errors.push(format!(
+            "editor line-number saliency hierarchy is invalid: inactive {inactive_saliency:.3}, hover {hover_saliency:.3}, active {active_saliency:.3}"
+        ));
+    }
     let editor_foreground_minimum = minimum_contrast(editor_foreground, editor_text_backgrounds)?;
     let editor_base_minimum = minimum_contrast(editor_foreground, editor_bases)?;
     if editor_base_minimum < EDITOR_BASE_TEXT_CONTRAST - 1e-9 {
@@ -1732,13 +1907,6 @@ fn validate_theme(
         ));
     }
     let mut syntax_minimum = f64::INFINITY;
-    let syntax_tier = match audit.syntax_richness.get("tier").and_then(Value::as_str) {
-        Some("baseline") => Tier::Baseline,
-        Some("restrained") => Tier::Restrained,
-        Some("broad") => Tier::Broad,
-        Some("rich") => Tier::Rich,
-        _ => return Err(Error("syntax richness tier is missing".into())),
-    };
     for (name, spec) in syntax {
         let value = spec
             .get("color")
@@ -1746,12 +1914,37 @@ fn validate_theme(
             .ok_or_else(|| Error(format!("syntax role {name} has no color")))?;
         let actual = minimum_contrast(value, syntax_contexts)?;
         syntax_minimum = syntax_minimum.min(actual);
-        let target = contrast_floor(name, syntax_tier) - 0.02;
+        let target = contrast_floor(name)
+            .ok_or_else(|| Error(format!("syntax role {name} has no capture policy")))?
+            - 0.02;
         if actual < target - 1e-9 {
             errors.push(format!(
                 "syntax.{name} reaches only {actual:.3}:1; floor is {target:.2}:1"
             ));
         }
+    }
+    let syntax_primary_saliency = crate::saliency::relative_saliency(
+        syntax
+            .get("primary")
+            .and_then(|spec| spec.get("color"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error("syntax.primary has no color".into()))?,
+        editor_foreground,
+        syntax_contexts,
+    )?;
+    let syntax_subdued_saliency = crate::saliency::relative_saliency(
+        syntax
+            .get("comment")
+            .and_then(|spec| spec.get("color"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error("syntax.comment has no color".into()))?,
+        editor_foreground,
+        syntax_contexts,
+    )?;
+    if syntax_subdued_saliency + 0.03 > syntax_primary_saliency {
+        errors.push(format!(
+            "subdued syntax does not remain below primary saliency: subdued {syntax_subdued_saliency:.3}, primary {syntax_primary_saliency:.3}"
+        ));
     }
     let syntax_color = |name: &str| -> Result<&str> {
         syntax
@@ -2569,5 +2762,34 @@ fn validate_theme(
             "theme validation failed:\n  - {}",
             errors.join("\n  - ")
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conventional_semantic_seed_recovers_chroma_from_gamut_endpoints() {
+        let palette = ResolvedPalette {
+            mode: "dark".into(),
+            colors: BTreeMap::from([
+                ("green".into(), "#000000".into()),
+                ("red".into(), "#ffffff".into()),
+                ("yellow".into(), "#000000".into()),
+            ]),
+            extras: BTreeMap::new(),
+            resolver_stderr: String::new(),
+            provenance: BTreeMap::new(),
+        };
+        for (key, target) in [("green", 145.0), ("red", 25.0), ("yellow", 85.0)] {
+            let output = conventional_semantic_seed(&palette, key, target).unwrap();
+            let [_, chroma, hue] = oklab_to_oklch(lab(&output).unwrap());
+            let target = target.to_radians();
+            let difference = (hue - target).abs();
+            let hue_distance = difference.min(std::f64::consts::TAU - difference);
+            assert!(chroma >= 0.025, "{key} stayed achromatic: {output}");
+            assert!(hue_distance <= 5.0_f64.to_radians(), "{key}: {output}");
+        }
     }
 }

@@ -384,8 +384,14 @@ Item {
 
   Process {
     id: syncProcess
+    stderr: StdioCollector {
+      id: syncErrorOutput
+      waitForEnd: true
+    }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
+        console.warn("Omarchy Zed Theme sync error: "
+          + String(syncErrorOutput.text || "").trim())
         root.fail("cannot update Zed")
       } else if (root.initialSyncPending) {
         root.initialSyncPending = false

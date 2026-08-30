@@ -1,0 +1,277 @@
+//! Static capture policy shared by syntax construction and validation.
+
+use super::plan::SemanticRole;
+pub const SYNTAX_PRIMARY_FLOOR: f64 = 4.52;
+pub const SYNTAX_SEMANTIC_FLOOR: f64 = 3.52;
+pub const SYNTAX_SUBDUED_FLOOR: f64 = 3.02;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapturePolicy {
+    pub capture: &'static str,
+    pub role: SemanticRole,
+}
+
+use SemanticRole::*;
+
+pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
+    CapturePolicy {
+        capture: "attribute",
+        role: Member,
+    },
+    CapturePolicy {
+        capture: "boolean",
+        role: Value,
+    },
+    CapturePolicy {
+        capture: "comment",
+        role: Subdued,
+    },
+    CapturePolicy {
+        capture: "comment.doc",
+        role: Subdued,
+    },
+    CapturePolicy {
+        capture: "constant",
+        role: Value,
+    },
+    CapturePolicy {
+        capture: "constructor",
+        role: Declaration,
+    },
+    CapturePolicy {
+        capture: "diff.minus",
+        role: DiffDelete,
+    },
+    CapturePolicy {
+        capture: "diff.plus",
+        role: DiffAdd,
+    },
+    CapturePolicy {
+        capture: "embedded",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "emphasis",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "emphasis.strong",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "enum",
+        role: Type,
+    },
+    CapturePolicy {
+        capture: "function",
+        role: Declaration,
+    },
+    CapturePolicy {
+        capture: "function.builtin",
+        role: Declaration,
+    },
+    CapturePolicy {
+        capture: "hint",
+        role: Metadata,
+    },
+    CapturePolicy {
+        capture: "keyword",
+        role: Control,
+    },
+    CapturePolicy {
+        capture: "label",
+        role: Declaration,
+    },
+    CapturePolicy {
+        capture: "link_text",
+        role: Link,
+    },
+    CapturePolicy {
+        capture: "link_uri",
+        role: Link,
+    },
+    CapturePolicy {
+        capture: "namespace",
+        role: Type,
+    },
+    CapturePolicy {
+        capture: "number",
+        role: Value,
+    },
+    CapturePolicy {
+        capture: "operator",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "predictive",
+        role: Subdued,
+    },
+    CapturePolicy {
+        capture: "preproc",
+        role: Control,
+    },
+    CapturePolicy {
+        capture: "primary",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "property",
+        role: Member,
+    },
+    CapturePolicy {
+        capture: "punctuation",
+        role: Subdued,
+    },
+    CapturePolicy {
+        capture: "punctuation.bracket",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "punctuation.delimiter",
+        role: Subdued,
+    },
+    CapturePolicy {
+        capture: "punctuation.list_marker",
+        role: Subdued,
+    },
+    CapturePolicy {
+        capture: "punctuation.markup",
+        role: Subdued,
+    },
+    CapturePolicy {
+        capture: "punctuation.special",
+        role: Special,
+    },
+    CapturePolicy {
+        capture: "selector",
+        role: Member,
+    },
+    CapturePolicy {
+        capture: "selector.pseudo",
+        role: Special,
+    },
+    CapturePolicy {
+        capture: "string",
+        role: String,
+    },
+    CapturePolicy {
+        capture: "string.escape",
+        role: Special,
+    },
+    CapturePolicy {
+        capture: "string.regex",
+        role: String,
+    },
+    CapturePolicy {
+        capture: "string.special",
+        role: Special,
+    },
+    CapturePolicy {
+        capture: "string.special.symbol",
+        role: Special,
+    },
+    CapturePolicy {
+        capture: "tag",
+        role: Member,
+    },
+    CapturePolicy {
+        capture: "text.literal",
+        role: Value,
+    },
+    CapturePolicy {
+        capture: "title",
+        role: Declaration,
+    },
+    CapturePolicy {
+        capture: "type",
+        role: Type,
+    },
+    CapturePolicy {
+        capture: "variable",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "variable.parameter",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "variable.special",
+        role: Special,
+    },
+    CapturePolicy {
+        capture: "variant",
+        role: Value,
+    },
+    CapturePolicy {
+        capture: "concept",
+        role: Type,
+    },
+    CapturePolicy {
+        capture: "diff",
+        role: DiffChange,
+    },
+    CapturePolicy {
+        capture: "lifetime",
+        role: Special,
+    },
+    CapturePolicy {
+        capture: "markup",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "module",
+        role: Type,
+    },
+    CapturePolicy {
+        capture: "storageclass",
+        role: Control,
+    },
+    CapturePolicy {
+        capture: "strikethrough",
+        role: Subdued,
+    },
+    CapturePolicy {
+        capture: "text",
+        role: Base,
+    },
+    CapturePolicy {
+        capture: "warning",
+        role: Metadata,
+    },
+];
+
+pub fn capture_policy(capture: &str) -> Option<&'static CapturePolicy> {
+    CAPTURE_POLICIES
+        .iter()
+        .find(|policy| policy.capture == capture)
+}
+
+pub fn contrast_floor(capture: &str) -> Option<f64> {
+    capture_policy(capture).map(|policy| match policy.role {
+        Base => SYNTAX_PRIMARY_FLOOR,
+        Subdued => SYNTAX_SUBDUED_FLOOR,
+        _ => SYNTAX_SEMANTIC_FLOOR,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::{ADDITIONAL_SYNTAX_FIELDS, BASE_SYNTAX_FIELDS};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn capture_policy_exactly_covers_the_manifest() {
+        let expected = BASE_SYNTAX_FIELDS
+            .iter()
+            .chain(ADDITIONAL_SYNTAX_FIELDS)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let actual = CAPTURE_POLICIES
+            .iter()
+            .map(|policy| policy.capture)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(CAPTURE_POLICIES.len(), actual.len());
+    }
+}

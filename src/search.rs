@@ -39,6 +39,9 @@ struct ColorQuery {
     avoid: Vec<String>,
     lower_lightness: u64,
     upper_lightness: u64,
+    lower_chroma: u64,
+    upper_chroma: u64,
+    preferred_contrast: Option<u64>,
     prefer_background: bool,
 }
 
@@ -62,6 +65,9 @@ pub struct Search {
 pub struct FitBounds {
     pub lower_lightness: f64,
     pub upper_lightness: f64,
+    pub lower_chroma: f64,
+    pub upper_chroma: f64,
+    pub preferred_contrast: Option<f64>,
     pub prefer_background: bool,
 }
 
@@ -70,6 +76,9 @@ impl Default for FitBounds {
         Self {
             lower_lightness: 0.0,
             upper_lightness: 1.0,
+            lower_chroma: 0.0,
+            upper_chroma: f64::INFINITY,
+            preferred_contrast: None,
             prefer_background: false,
         }
     }
@@ -82,6 +91,7 @@ pub struct PairConstraints {
     pub normal_delta: f64,
     pub cvd_delta: f64,
     pub lightness_delta: f64,
+    pub minimum_chroma: f64,
     pub separation_alternative: Option<(f64, f64, f64)>,
     pub prefer_background: bool,
 }
@@ -506,6 +516,9 @@ impl Search {
             let table = search.transform_table(seed)?;
             for (index, candidate) in table.candidates.iter().enumerate() {
                 let metrics = candidate.metrics;
+                if oklab_to_oklch(metrics.lab)[1] < constraints.minimum_chroma - 1e-12 {
+                    continue;
+                }
                 if background_metrics.iter().any(|background| {
                     metrics.contrast(*background) < constraints.foreground_contrast - 1e-12
                 }) || readable_metrics
@@ -681,6 +694,9 @@ impl Search {
             avoid: avoid.to_vec(),
             lower_lightness: bounds.lower_lightness.to_bits(),
             upper_lightness: bounds.upper_lightness.to_bits(),
+            lower_chroma: bounds.lower_chroma.to_bits(),
+            upper_chroma: bounds.upper_chroma.to_bits(),
+            preferred_contrast: bounds.preferred_contrast.map(f64::to_bits),
             prefer_background: bounds.prefer_background,
         };
         if let Some(result) = self.color_results.get(&query) {
@@ -730,6 +746,10 @@ impl Search {
             {
                 return false;
             }
+            let chroma = oklab_to_oklch(candidate.lab)[1];
+            if chroma < bounds.lower_chroma - 1e-12 || chroma > bounds.upper_chroma + 1e-12 {
+                return false;
+            }
             if background_metrics
                 .iter()
                 .any(|background| candidate.contrast(*background) < target - 1e-12)
@@ -745,10 +765,13 @@ impl Search {
             }
             true
         };
-        if passes(source_metrics) && !bounds.prefer_background {
+        if passes(source_metrics)
+            && !bounds.prefer_background
+            && bounds.preferred_contrast.is_none()
+        {
             return Ok(seed.to_owned());
         }
-        if !bounds.prefer_background {
+        if !bounds.prefer_background && bounds.preferred_contrast.is_none() {
             let mut best: Option<(Rgb24, [f64; 3])> = None;
             for candidate in self.transform_table(seed)?.candidates.iter() {
                 if best.as_ref().is_some_and(|(_, rank)| {
@@ -771,6 +794,54 @@ impl Search {
                 }) {
                     best = Some((candidate.metrics.rgb24(), rank));
                 }
+            }
+            return best.map(|(color, _)| color.hex()).ok_or_else(|| {
+                Error(format!(
+                    "no candidate in the defined hue-preserving candidate space for {seed} at {target:.2}:1 over {}",
+                    backgrounds.join(",")
+                ))
+            });
+        }
+        if let Some(preferred_contrast) = bounds.preferred_contrast {
+            let mut best: Option<(Rgb24, [f64; 3])> = None;
+            let preferred_log = preferred_contrast.ln();
+            let mut consider =
+                |candidate: Rgb24, metrics: ColorMetrics, distance: f64, retention: f64| {
+                    if !passes(metrics) {
+                        return;
+                    }
+                    let mean_log_contrast = background_metrics
+                        .iter()
+                        .map(|background| metrics.contrast(*background).ln())
+                        .sum::<f64>()
+                        / background_metrics.len() as f64;
+                    let primary = (mean_log_contrast - preferred_log).abs();
+                    let secondary = if bounds.prefer_background {
+                        (metrics.lab[0] - background_lightness).abs()
+                    } else {
+                        distance
+                    };
+                    let rank = [primary, secondary, -retention];
+                    if best.as_ref().is_none_or(|(best_color, best_rank)| {
+                        rank_cmp(&rank, best_rank).then_with(|| candidate.cmp(best_color))
+                            == Ordering::Less
+                    }) {
+                        best = Some((candidate, rank));
+                    }
+                };
+            consider(
+                Rgb24::from_rgba(source_metrics.rgba.rgba()),
+                source_metrics,
+                0.0,
+                source_retention,
+            );
+            for candidate in self.transform_table(seed)?.candidates.iter() {
+                consider(
+                    candidate.metrics.rgb24(),
+                    candidate.metrics,
+                    candidate.distance,
+                    candidate.retention,
+                );
             }
             return best.map(|(color, _)| color.hex()).ok_or_else(|| {
                 Error(format!(
@@ -1317,4 +1388,80 @@ pub fn cvd_distance(first: &str, second: &str) -> Result<f64> {
 
 pub fn round6(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chroma_bounds_are_enforced_and_part_of_the_query_cache_key() {
+        let mut search = Search::default();
+        let backgrounds = vec!["#101010".to_owned()];
+        let restrained = search
+            .fit_color_bounded(
+                "#ff0000",
+                &backgrounds,
+                3.0,
+                &[],
+                FitBounds {
+                    upper_chroma: 0.05,
+                    ..FitBounds::default()
+                },
+            )
+            .unwrap();
+        let vivid = search
+            .fit_color_bounded(
+                "#ff0000",
+                &backgrounds,
+                3.0,
+                &[],
+                FitBounds {
+                    upper_chroma: 0.20,
+                    ..FitBounds::default()
+                },
+            )
+            .unwrap();
+
+        assert!(oklab_to_oklch(lab(&restrained).unwrap())[1] <= 0.05 + 1e-12);
+        assert!(oklab_to_oklch(lab(&vivid).unwrap())[1] <= 0.20 + 1e-12);
+        assert_ne!(restrained, vivid);
+        assert_eq!(search.color_results.len(), 2);
+    }
+
+    #[test]
+    fn preferred_contrast_is_ranked_and_part_of_the_query_cache_key() {
+        let mut search = Search::default();
+        let backgrounds = vec!["#121212".to_owned()];
+        let subtle = search
+            .fit_color_bounded(
+                "#cccccc",
+                &backgrounds,
+                1.52,
+                &[],
+                FitBounds {
+                    preferred_contrast: Some(2.0),
+                    ..FitBounds::default()
+                },
+            )
+            .unwrap();
+        let focal = search
+            .fit_color_bounded(
+                "#cccccc",
+                &backgrounds,
+                1.52,
+                &[],
+                FitBounds {
+                    preferred_contrast: Some(8.0),
+                    ..FitBounds::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            contrast_ratio(&subtle, &backgrounds[0]).unwrap()
+                < contrast_ratio(&focal, &backgrounds[0]).unwrap()
+        );
+        assert_eq!(search.color_results.len(), 2);
+    }
 }

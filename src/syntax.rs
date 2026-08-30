@@ -1,170 +1,411 @@
-//! Adapts syntax color variety to the distinguishable colors in the Omarchy palette.
+//! Builds deterministic syntax colors from Omarchy theme character.
 //!
-//! Neutral palettes use the built-in light or dark syntax baseline. Authored colors
-//! replace those fallbacks only when they remain distinct and readable. This module
-//! never supplies colors to the Zed interface.
+//! The profile measures authored breadth and intensity, the merge plan fixes
+//! semantic identity, and saliency ranks how the profile's color budget is spent.
+//! Contrast, diff separation, gamut, and validation remain hard constraints.
+
+pub mod plan;
+pub mod policy;
+pub mod profile;
 
 use crate::Result;
-use crate::color::{contrast_ratio, delta_e, lab, oklab_to_oklch};
+use crate::color::{contrast_ratio, delta_e, gamut_map_oklch, lab, oklab_to_oklch};
 use crate::constants::SYNTAX_DIFF_CONTRACT;
-use crate::palette::{Provenance, ResolvedPalette};
-use crate::search::{PairConstraints, Search, cvd_distance, round6};
+use crate::palette::ResolvedPalette;
+use crate::saliency::{PRIMARY_SALIENCY, SaliencyRequest, fit_relative};
+use crate::search::{FitBounds, PairConstraints, Search, cvd_distance, round6};
 use crate::theme::Audit;
+use plan::{MergePlan, SemanticRole};
+use policy::{CAPTURE_POLICIES, SYNTAX_PRIMARY_FLOOR, SYNTAX_SEMANTIC_FLOOR, SYNTAX_SUBDUED_FLOOR};
+use profile::{EvidenceColor, SCAFFOLD_MAXIMUM_CHROMA, SyntaxProfile};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::f64::consts::{PI, TAU};
 
-const SOURCE_KEYS: [&str; 8] = [
+pub use policy::{capture_policy, contrast_floor};
+
+const ORDINARY_NORMAL_SEPARATION: f64 = 0.025;
+const ORDINARY_CVD_SEPARATION: f64 = 0.005;
+const SOURCE_KEY_ORDER: [&str; 8] = [
     "green", "blue", "magenta", "yellow", "red", "cyan", "orange", "accent",
 ];
-const SLOT_KEYS: [&str; 8] = [
-    "declaration",
-    "value",
-    "string",
-    "metadata",
-    "link",
-    "special",
-    "type",
-    "danger",
-];
-const SLOT_SOURCE: [&str; 8] = [
-    "blue", "magenta", "green", "yellow", "accent", "orange", "cyan", "red",
-];
-pub const SYNTAX_PRIMARY_FLOOR: f64 = 4.52;
-pub const SYNTAX_SEMANTIC_FLOOR: f64 = 3.52;
-pub const SYNTAX_SUBDUED_FLOOR: f64 = 3.02;
 
-const LIGHT_FALLBACKS: [&str; 10] = [
-    "#325cc0", "#7a3e9d", "#448c27", "#702c00", "#1f6ae2", "#7a3e9d", "#325cc0", "#db0a37",
-    "#7c7c7c", "#454c54",
-];
-const DARK_FALLBACKS: [&str; 10] = [
-    "#7aa7e6", "#b49bd8", "#82b56d", "#c9a172", "#5ba3f5", "#b49bd8", "#7aa7e6", "#e0757e",
-    "#71808d", "#95a3b0",
-];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Tier {
-    Baseline,
-    Restrained,
-    Broad,
-    Rich,
+#[derive(Clone, Debug)]
+struct FamilyAllocation {
+    family: usize,
+    origin_family: usize,
+    seed: String,
+    seed_kind: &'static str,
+    source: Option<usize>,
+    preferred_chroma: f64,
+    chroma_cap: f64,
+    output: String,
+    preferred_saliency: f64,
+    reference_contrast: f64,
+    preferred_contrast: f64,
+    actual_contrast: f64,
+    measured_saliency: f64,
 }
 
-impl Tier {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Baseline => "baseline",
-            Self::Restrained => "restrained",
-            Self::Broad => "broad",
-            Self::Rich => "rich",
-        }
+type DistanceMatrix = Vec<Vec<f64>>;
+
+fn minimum_contrast(color: &str, contexts: &[String]) -> Result<f64> {
+    contexts
+        .iter()
+        .map(|context| contrast_ratio(color, context))
+        .collect::<Result<Vec<_>>>()
+        .map(|values| values.into_iter().fold(f64::INFINITY, f64::min))
+}
+
+fn role_source_preferences(role: SemanticRole) -> &'static [&'static str] {
+    match role {
+        SemanticRole::Declaration => &["blue", "accent", "cyan", "magenta"],
+        SemanticRole::Type => &["cyan", "blue", "accent", "magenta"],
+        SemanticRole::Member => &["yellow", "cyan", "magenta", "accent"],
+        SemanticRole::Control => &["magenta", "red", "orange", "accent"],
+        SemanticRole::Value => &["magenta", "orange", "yellow", "red"],
+        SemanticRole::String => &["green", "yellow", "cyan"],
+        SemanticRole::Special => &["orange", "magenta", "red", "accent"],
+        SemanticRole::Metadata => &["yellow", "blue", "cyan", "accent"],
+        SemanticRole::Link => &["accent", "blue", "cyan", "magenta"],
+        _ => &[],
     }
 }
 
-struct Richness {
-    tier: Tier,
-    clique: BTreeSet<String>,
-    audit: Value,
+fn source_affinity(roles: &[SemanticRole], source: &EvidenceColor) -> usize {
+    roles
+        .iter()
+        .flat_map(|role| {
+            role_source_preferences(*role)
+                .iter()
+                .enumerate()
+                .filter_map(|(rank, key)| source.keys.contains(key).then_some(rank))
+        })
+        .min()
+        .unwrap_or(usize::MAX / 2)
 }
 
-fn authored_richness(palette: &ResolvedPalette) -> Result<Richness> {
-    let mut candidates = Vec::new();
+fn source_priority(source: &EvidenceColor) -> usize {
+    source
+        .keys
+        .iter()
+        .filter_map(|key| {
+            SOURCE_KEY_ORDER
+                .iter()
+                .position(|candidate| candidate == key)
+        })
+        .min()
+        .unwrap_or(SOURCE_KEY_ORDER.len())
+}
 
-    for key in SOURCE_KEYS {
-        let value = &palette.colors[key];
-        let [lightness, chroma, hue] = oklab_to_oklch(lab(value)?);
-        let provenance = palette
-            .provenance
-            .get(key)
-            .copied()
-            .unwrap_or(Provenance::Derived);
-        if provenance != Provenance::Derived && chroma >= 0.025 - 1e-12 {
-            candidates.push((key, value.clone(), lightness, chroma, hue, provenance));
+fn family_saliency(plan: &MergePlan, family: usize) -> f64 {
+    plan.families[family]
+        .roles
+        .iter()
+        .map(|role| role.saliency())
+        .fold(0.0, f64::max)
+}
+
+fn scaffold_hue(profile: &SyntaxProfile, family: usize) -> f64 {
+    const CHANNEL_STEP: f64 = PI / 2.0;
+    const SECONDARY_OFFSET: f64 = 35.0 * PI / 180.0;
+    (profile.scaffold_phase
+        + (family % 4) as f64 * CHANNEL_STEP
+        + (family / 4) as f64 * SECONDARY_OFFSET)
+        .rem_euclid(TAU)
+}
+
+fn scaffold_lightness(palette: &ResolvedPalette) -> Result<f64> {
+    let background = oklab_to_oklch(lab(&palette.colors["background"])?)[0];
+    let foreground = oklab_to_oklch(lab(&palette.colors["foreground"])?)[0];
+    Ok((background + 0.72 * (foreground - background)).clamp(0.18, 0.82))
+}
+
+fn allocate_families(
+    search: &mut Search,
+    palette: &ResolvedPalette,
+    contexts: &[String],
+    reference: &str,
+    profile: &SyntaxProfile,
+    plan: &MergePlan,
+) -> Result<Vec<FamilyAllocation>> {
+    let mut source_candidates = profile
+        .clusters
+        .iter()
+        .filter_map(|cluster| {
+            let representative = &profile.evidence[cluster.representative];
+            profile
+                .authored_colors
+                .iter()
+                .position(|color| color.value == representative.value)
+        })
+        .collect::<Vec<_>>();
+
+    let mut family_order = (0..plan.families.len()).collect::<Vec<_>>();
+    family_order.sort_by(|left, right| {
+        family_saliency(plan, *right)
+            .total_cmp(&family_saliency(plan, *left))
+            .then_with(|| left.cmp(right))
+    });
+    let mut assigned = vec![None; plan.families.len()];
+    for family in family_order {
+        if source_candidates.is_empty() {
+            break;
         }
+        let best = source_candidates
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                let left = &profile.authored_colors[**left];
+                let right = &profile.authored_colors[**right];
+                source_affinity(&plan.families[family].roles, left)
+                    .cmp(&source_affinity(&plan.families[family].roles, right))
+                    .then_with(|| source_priority(left).cmp(&source_priority(right)))
+                    .then_with(|| left.keys.cmp(&right.keys))
+                    .then_with(|| left.value.cmp(&right.value))
+            })
+            .map(|(position, source)| (position, *source))
+            .unwrap();
+        assigned[family] = Some(best.1);
+        source_candidates.remove(best.0);
     }
 
-    let mut normal = vec![vec![0.0; candidates.len()]; candidates.len()];
+    let scaffold_lightness = scaffold_lightness(palette)?;
+    let mut allocations = Vec::with_capacity(plan.family_count);
+    for (family, assigned_source) in assigned.iter().copied().enumerate() {
+        let saliency = family_saliency(plan, family);
+        let authored_preference = profile.chroma_envelope.target_median
+            + (profile.chroma_envelope.ordinary_maximum - profile.chroma_envelope.target_median)
+                * saliency.powi(2);
+        let (seed, seed_kind, preferred_chroma) = if let Some(source) = assigned_source {
+            let evidence = &profile.authored_colors[source];
+            (
+                gamut_map_oklch(
+                    evidence.lightness,
+                    evidence.chroma.min(authored_preference),
+                    evidence.hue,
+                )
+                .opaque_hex(),
+                "authored_hue",
+                authored_preference,
+            )
+        } else {
+            let scaffold_preference = (profile.chroma_envelope.target_median
+                * (0.80 + 0.40 * saliency))
+                .min(SCAFFOLD_MAXIMUM_CHROMA)
+                .min(profile.chroma_envelope.ordinary_maximum);
+            (
+                gamut_map_oklch(
+                    scaffold_lightness,
+                    scaffold_preference,
+                    scaffold_hue(profile, family),
+                )
+                .opaque_hex(),
+                "dynamic_scaffold",
+                scaffold_preference,
+            )
+        };
+        let chroma_cap = if seed_kind == "dynamic_scaffold" {
+            profile
+                .chroma_envelope
+                .ordinary_maximum
+                .min(SCAFFOLD_MAXIMUM_CHROMA)
+        } else {
+            profile.chroma_envelope.ordinary_maximum
+        };
+        let chroma_floor = (preferred_chroma.min(chroma_cap) * 0.45).min(0.025);
+        let saliency_fit = fit_relative(
+            search,
+            &seed,
+            reference,
+            SaliencyRequest {
+                backgrounds: contexts,
+                hard_floor: SYNTAX_SEMANTIC_FLOOR,
+                preferred_saliency: saliency,
+                avoid: &[],
+                bounds: FitBounds {
+                    lower_chroma: chroma_floor,
+                    upper_chroma: chroma_cap,
+                    ..FitBounds::default()
+                },
+            },
+        )?;
+        let output = saliency_fit.output;
+        let output_chroma = oklab_to_oklch(lab(&output)?)[1];
+        if output_chroma > chroma_cap + 1e-12 {
+            return Err(crate::Error(format!(
+                "syntax family {family} escaped its chroma envelope: {output_chroma:.6} > {:.6}",
+                chroma_cap
+            )));
+        }
+        allocations.push(FamilyAllocation {
+            family,
+            origin_family: family,
+            seed,
+            seed_kind,
+            source: assigned_source,
+            preferred_chroma,
+            chroma_cap,
+            preferred_saliency: saliency_fit.preferred_saliency,
+            reference_contrast: saliency_fit.reference_contrast,
+            preferred_contrast: saliency_fit.preferred_contrast,
+            actual_contrast: saliency_fit.actual_contrast,
+            measured_saliency: saliency_fit.actual_saliency,
+            output,
+        });
+    }
+    Ok(allocations)
+}
+
+fn pair_matrices(colors: &[String]) -> Result<(DistanceMatrix, DistanceMatrix)> {
+    let mut normal = vec![vec![0.0; colors.len()]; colors.len()];
     let mut cvd = normal.clone();
-
-    for left in 0..candidates.len() {
-        for right in left + 1..candidates.len() {
-            normal[left][right] = delta_e(&candidates[left].1, &candidates[right].1)?;
+    for left in 0..colors.len() {
+        for right in left + 1..colors.len() {
+            normal[left][right] = delta_e(&colors[left], &colors[right])?;
             normal[right][left] = normal[left][right];
-            cvd[left][right] = cvd_distance(&candidates[left].1, &candidates[right].1)?;
+            cvd[left][right] = cvd_distance(&colors[left], &colors[right])?;
             cvd[right][left] = cvd[left][right];
         }
     }
+    Ok((normal, cvd))
+}
 
-    let mut best_mask = 0usize;
-    let mut best_size = 0u32;
-    let mut best_priority = 0u16;
-    let mut best_distance = f64::NEG_INFINITY;
-    'masks: for mask in 0usize..(1usize << candidates.len()) {
-        let mut distance = 0.0;
+fn rounded_matrix(matrix: &[Vec<f64>]) -> DistanceMatrix {
+    matrix
+        .iter()
+        .map(|row| row.iter().map(|value| round6(*value)).collect())
+        .collect()
+}
 
-        for left in 0..candidates.len() {
-            if mask & (1 << left) == 0 {
+fn project_matrix(matrix: &[Vec<f64>], indices: &[usize]) -> DistanceMatrix {
+    indices
+        .iter()
+        .map(|left| indices.iter().map(|right| matrix[*left][*right]).collect())
+        .collect()
+}
+
+fn minimum_pair(matrix: &[Vec<f64>]) -> f64 {
+    (0..matrix.len())
+        .flat_map(|left| (left + 1..matrix.len()).map(move |right| matrix[left][right]))
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn separated(normal: &[Vec<f64>], cvd: &[Vec<f64>]) -> bool {
+    (0..normal.len()).all(|left| {
+        (left + 1..normal.len()).all(|right| {
+            normal[left][right] >= ORDINARY_NORMAL_SEPARATION - 1e-12
+                && cvd[left][right] >= ORDINARY_CVD_SEPARATION - 1e-12
+        })
+    })
+}
+
+fn select_separated_plan(
+    requested_families: usize,
+    full_allocations: &[FamilyAllocation],
+    full_normal: &[Vec<f64>],
+    full_cvd: &[Vec<f64>],
+    excluded_outputs: &[String],
+) -> Result<(
+    MergePlan,
+    Vec<FamilyAllocation>,
+    DistanceMatrix,
+    DistanceMatrix,
+)> {
+    for family_count in (4..=requested_families).rev() {
+        let plan = MergePlan::with_family_count(family_count);
+        let mut best: Option<(Vec<usize>, [f64; 3])> = None;
+        for mask in 0_u16..(1_u16 << full_allocations.len()) {
+            if mask.count_ones() as usize != family_count {
                 continue;
             }
-
-            for right in left + 1..candidates.len() {
-                if mask & (1 << right) == 0 {
-                    continue;
-                }
-
-                if normal[left][right] < 0.060 - 1e-12 || cvd[left][right] < 0.030 - 1e-12 {
-                    continue 'masks;
-                }
-
-                distance += cvd[left][right];
+            let indices = (0..full_allocations.len())
+                .filter(|index| {
+                    mask & (1 << index) != 0
+                        && !excluded_outputs.contains(&full_allocations[*index].output)
+                })
+                .collect::<Vec<_>>();
+            if indices.len() != family_count {
+                continue;
+            }
+            let normal = project_matrix(full_normal, &indices);
+            let cvd = project_matrix(full_cvd, &indices);
+            if !separated(&normal, &cvd) {
+                continue;
+            }
+            let score = [
+                minimum_pair(&cvd),
+                minimum_pair(&normal),
+                indices
+                    .iter()
+                    .map(|index| full_allocations[*index].measured_saliency)
+                    .sum(),
+            ];
+            if best.as_ref().is_none_or(|(best_indices, best_score)| {
+                score
+                    .iter()
+                    .zip(best_score)
+                    .find_map(|(left, right)| {
+                        let ordering = left.total_cmp(right);
+                        (!ordering.is_eq()).then_some(ordering.is_gt())
+                    })
+                    .unwrap_or_else(|| indices < *best_indices)
+            }) {
+                best = Some((indices, score));
             }
         }
-
-        let size = mask.count_ones();
-        let priority = (0..candidates.len()).fold(0u16, |score, index| {
-            let key_priority = SOURCE_KEYS
+        if let Some((indices, _)) = best {
+            let mut allocations = indices
                 .iter()
-                .position(|key| *key == candidates[index].0)
-                .unwrap();
-            score | (((mask >> index) & 1) as u16) << (7 - key_priority)
-        });
-
-        if (size, priority) > (best_size, best_priority)
-            || ((size, priority) == (best_size, best_priority) && distance > best_distance)
-        {
-            best_mask = mask;
-            best_size = size;
-            best_priority = priority;
-            best_distance = distance;
+                .map(|index| full_allocations[*index].clone())
+                .collect::<Vec<_>>();
+            allocations.sort_by(|left, right| {
+                right
+                    .measured_saliency
+                    .total_cmp(&left.measured_saliency)
+                    .then_with(|| left.output.cmp(&right.output))
+            });
+            let mut desired_families = (0..plan.family_count).collect::<Vec<_>>();
+            desired_families.sort_by(|left, right| {
+                family_saliency(&plan, *right)
+                    .total_cmp(&family_saliency(&plan, *left))
+                    .then_with(|| left.cmp(right))
+            });
+            for (allocation, family) in allocations.iter_mut().zip(desired_families) {
+                allocation.family = family;
+            }
+            allocations.sort_by_key(|allocation| allocation.family);
+            let ordered_indices = allocations
+                .iter()
+                .map(|allocation| allocation.origin_family)
+                .collect::<Vec<_>>();
+            let normal = project_matrix(full_normal, &ordered_indices);
+            let cvd = project_matrix(full_cvd, &ordered_indices);
+            return Ok((plan, allocations, normal, cvd));
         }
     }
-
-    let clique: BTreeSet<_> = candidates
+    let candidates = full_allocations
         .iter()
-        .enumerate()
-        .filter(|(index, _)| best_mask & (1 << index) != 0)
-        .map(|(_, candidate)| candidate.0.to_owned())
-        .collect();
+        .map(|allocation| {
+            format!(
+                "{}:{}:{:.3}",
+                allocation.seed_kind, allocation.output, allocation.measured_saliency
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(crate::Error(format!(
+        "no subset of the bounded syntax candidate pool satisfies a four-family merge plan (normal {:.3}, CVD {:.3}; candidates {candidates})",
+        ORDINARY_NORMAL_SEPARATION, ORDINARY_CVD_SEPARATION
+    )))
+}
 
-    let tier = match best_size {
-        0 | 1 => Tier::Baseline,
-        2..=4 => Tier::Restrained,
-        5 => Tier::Broad,
-        _ => Tier::Rich,
-    };
-    let candidate_audit: Vec<_> = candidates.iter().map(|(key, value, lightness, chroma, hue, provenance)| json!({
-        "key": key, "value": value, "provenance": format!("{provenance:?}").to_ascii_lowercase(),
-        "oklch": [round6(*lightness), round6(*chroma), round6(*hue)],
-    })).collect();
-
-    Ok(Richness {
-        tier,
-        clique: clique.clone(),
-        audit: json!({
-            "thresholds": {"chroma": 0.025, "normal_delta_e": 0.060, "cvd_delta_e": 0.030},
-            "candidates": candidate_audit, "winning_clique": clique, "R": best_size, "tier": tier.as_str(),
-            "normal_matrix": normal, "cvd_matrix": cvd,
-        }),
+fn saliency_ordered(plan: &MergePlan, allocations: &[FamilyAllocation]) -> bool {
+    allocations.iter().all(|left| {
+        allocations.iter().all(|right| {
+            family_saliency(plan, left.family) <= family_saliency(plan, right.family) + 1e-12
+                || left.measured_saliency >= right.measured_saliency - 1e-12
+        })
     })
 }
 
@@ -172,236 +413,99 @@ pub fn build_syntax(
     search: &mut Search,
     palette: &ResolvedPalette,
     contexts: &[String],
+    saliency_reference: &str,
+    diff_sources: [&str; 3],
     audit: &mut Audit,
 ) -> Result<Map<String, Value>> {
-    let richness = authored_richness(palette)?;
-    audit.syntax_richness = richness.audit;
-
-    let fallbacks = if palette.mode == "dark" {
-        DARK_FALLBACKS
-    } else {
-        LIGHT_FALLBACKS
-    };
-
-    let mut fallback_outputs = Vec::new();
-    let mut source_outputs: Vec<Option<String>> = Vec::new();
-
-    for index in 0..SLOT_KEYS.len() {
-        fallback_outputs.push(search.fit_color(
-            fallbacks[index],
-            contexts,
-            SYNTAX_SEMANTIC_FLOOR,
-        )?);
-        let source_key = SLOT_SOURCE[index];
-        let source = &palette.colors[source_key];
-        let source_lch = oklab_to_oklch(lab(source)?);
-
-        let output = if richness.clique.contains(source_key) {
-            let fitted = search.fit_color(source, contexts, SYNTAX_SEMANTIC_FLOOR)?;
-            let fitted_lch = oklab_to_oklch(lab(&fitted)?);
-            (fitted_lch[1] >= 0.025 - 1e-12
-                && fitted_lch[1] / source_lch[1].max(1e-12) >= 0.35 - 1e-12)
-                .then_some(fitted)
-        } else {
-            None
-        };
-        source_outputs.push(output);
-    }
-
-    let metric_colors: Vec<String> = fallback_outputs
-        .iter()
-        .chain(source_outputs.iter().flatten())
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let metric_indices: BTreeMap<&str, usize> = metric_colors
-        .iter()
-        .enumerate()
-        .map(|(index, color)| (color.as_str(), index))
-        .collect();
-
-    let mut normal_matrix = vec![vec![0.0; metric_colors.len()]; metric_colors.len()];
-    let mut cvd_matrix = normal_matrix.clone();
-
-    for left in 0..metric_colors.len() {
-        for right in left + 1..metric_colors.len() {
-            normal_matrix[left][right] = delta_e(&metric_colors[left], &metric_colors[right])?;
-            normal_matrix[right][left] = normal_matrix[left][right];
-            cvd_matrix[left][right] = cvd_distance(&metric_colors[left], &metric_colors[right])?;
-            cvd_matrix[right][left] = cvd_matrix[left][right];
-        }
-    }
-
-    let mut best_mask = 0usize;
-    let mut best_count = 0u32;
-    let mut best_minimum = f64::NEG_INFINITY;
-    let mut best_transform = f64::INFINITY;
-    'masks: for mask in 0usize..256 {
-        if (0..8).any(|index| mask & (1 << index) != 0 && source_outputs[index].is_none()) {
-            continue;
-        }
-
-        let outputs: Vec<&String> = (0..8)
-            .map(|index| {
-                if mask & (1 << index) != 0 {
-                    source_outputs[index].as_ref().unwrap()
-                } else {
-                    &fallback_outputs[index]
-                }
-            })
-            .collect();
-
-        let mut minimum = f64::INFINITY;
-
-        for left in 0..8 {
-            for right in left + 1..8 {
-                if outputs[left] == outputs[right] {
-                    if mask & (1 << left) != 0 || mask & (1 << right) != 0 {
-                        continue 'masks;
-                    }
-
-                    continue;
-                }
-
-                let left_metric = metric_indices[outputs[left].as_str()];
-                let right_metric = metric_indices[outputs[right].as_str()];
-                let normal = normal_matrix[left_metric][right_metric];
-                let cvd = cvd_matrix[left_metric][right_metric];
-
-                if (mask & (1 << left) != 0 || mask & (1 << right) != 0)
-                    && (normal < 0.035 - 1e-12 || cvd < 0.020 - 1e-12)
-                {
-                    continue 'masks;
-                }
-
-                minimum = minimum.min(normal.min(cvd));
-            }
-        }
-
-        let count = mask.count_ones();
-        let transform = (0..8)
-            .filter(|index| mask & (1 << index) != 0)
-            .map(|index| {
-                delta_e(
-                    &palette.colors[SLOT_SOURCE[index]],
-                    source_outputs[index].as_ref().unwrap(),
-                )
-                .unwrap()
-            })
-            .sum::<f64>();
-
-        if count > best_count
-            || (count == best_count
-                && (minimum > best_minimum
-                    || (minimum == best_minimum && transform < best_transform)))
-        {
-            best_mask = mask;
-            best_count = count;
-            best_minimum = minimum;
-            best_transform = transform;
-        }
-    }
-
-    let mut slots = BTreeMap::new();
-    let chosen_outputs: Vec<_> = (0..8)
-        .map(|index| {
-            let source_selected = best_mask & (1 << index) != 0;
-            let output = if source_selected {
-                source_outputs[index].clone().unwrap()
-            } else {
-                fallback_outputs[index].clone()
-            };
-            (source_selected, output)
-        })
-        .collect();
-
-    for index in 0..8 {
-        let (source_selected, output) = &chosen_outputs[index];
-        let source_key = SLOT_SOURCE[index];
-        let source = &palette.colors[source_key];
-        let output_lch = oklab_to_oklch(lab(output)?);
-        let source_lch = oklab_to_oklch(lab(source)?);
-
-        let disposition = if *source_selected && output == source {
-            "source"
-        } else if *source_selected {
-            "source_repaired"
-        } else if source_outputs[index].is_some() {
-            "collision_fallback"
-        } else {
-            "baseline_fallback"
-        };
-
-        let hue_drift = if source_lch[1] >= 0.005 && output_lch[1] >= 0.005 {
-            let difference = (source_lch[2] - output_lch[2]).abs();
-            Some(difference.min(std::f64::consts::TAU - difference))
-        } else {
-            None
-        };
-        let minimum_normal_separation = chosen_outputs
-            .iter()
-            .enumerate()
-            .filter(|(other, _)| *other != index)
-            .map(|(_, (_, other))| delta_e(output, other).unwrap())
-            .fold(f64::INFINITY, f64::min);
-        let minimum_cvd_separation = chosen_outputs
-            .iter()
-            .enumerate()
-            .filter(|(other, _)| *other != index)
-            .map(|(_, (_, other))| cvd_distance(output, other).unwrap())
-            .fold(f64::INFINITY, f64::min);
-
-        audit.syntax_roles.push(json!({
-            "slot": SLOT_KEYS[index], "fallback_seed": fallbacks[index], "source_key": source_key,
-            "source": source, "output": output, "disposition": disposition,
-            "source_output_delta_e": round6(delta_e(source, output)?),
-            "hue_drift": hue_drift.map(round6),
-            "chroma_retention": round6(output_lch[1] / source_lch[1].max(1e-12)),
-            "minimum_contrast": round6(contexts.iter().map(|context| contrast_ratio(output, context).unwrap()).fold(f64::INFINITY, f64::min)),
-            "minimum_normal_separation": round6(minimum_normal_separation),
-            "minimum_cvd_separation": round6(minimum_cvd_separation),
-        }));
-
-        if disposition != "source" {
-            audit.fidelity_deviations.push(json!({
-                "role": format!("syntax.{}", SLOT_KEYS[index]), "source": source, "output": output,
-                "reason": disposition, "delta_e": round6(delta_e(source, output)?),
-            }));
-        }
-
-        slots.insert(SLOT_KEYS[index], output.clone());
-    }
-
-    let base = search.fit_color(
+    let profile = profile::measure(palette)?;
+    let base_fit = fit_relative(
+        search,
         &palette.colors["foreground"],
-        contexts,
-        SYNTAX_PRIMARY_FLOOR,
+        saliency_reference,
+        SaliencyRequest {
+            backgrounds: contexts,
+            hard_floor: SYNTAX_PRIMARY_FLOOR,
+            preferred_saliency: PRIMARY_SALIENCY,
+            avoid: &[],
+            bounds: FitBounds::default(),
+        },
     )?;
-    let authored_subdued =
-        search.fit_color(&palette.colors["muted"], contexts, SYNTAX_SUBDUED_FLOOR)?;
-
-    let subdued = if delta_e(&base, &authored_subdued)? >= 0.035
-        && cvd_distance(&base, &authored_subdued)? >= 0.020
-    {
-        authored_subdued
-    } else {
-        search.fit_color(fallbacks[8], contexts, SYNTAX_SUBDUED_FLOOR)?
-    };
-
-    let hint = search.fit_color(fallbacks[9], contexts, SYNTAX_SEMANTIC_FLOOR)?;
-
-    let add_seed = if richness.clique.contains("green") {
-        &palette.colors["green"]
-    } else {
-        fallbacks[2]
-    };
-
-    let delete_seed = if richness.clique.contains("red") {
-        &palette.colors["red"]
-    } else {
-        fallbacks[7]
-    };
+    let base = base_fit.output.clone();
+    let mut subdued_fit = fit_relative(
+        search,
+        &palette.colors["muted"],
+        saliency_reference,
+        SaliencyRequest {
+            backgrounds: contexts,
+            hard_floor: SYNTAX_SUBDUED_FLOOR,
+            preferred_saliency: SemanticRole::Subdued.saliency(),
+            avoid: &[],
+            bounds: FitBounds::default(),
+        },
+    )?;
+    let mut subdued = subdued_fit.output.clone();
+    if subdued == base {
+        let seed = gamut_map_oklch(
+            scaffold_lightness(palette)?,
+            profile
+                .chroma_envelope
+                .target_median
+                .min(SCAFFOLD_MAXIMUM_CHROMA)
+                * 0.75,
+            (profile.scaffold_phase + PI).rem_euclid(TAU),
+        )
+        .opaque_hex();
+        subdued_fit = fit_relative(
+            search,
+            &seed,
+            saliency_reference,
+            SaliencyRequest {
+                backgrounds: contexts,
+                hard_floor: SYNTAX_SUBDUED_FLOOR,
+                preferred_saliency: SemanticRole::Subdued.saliency(),
+                avoid: &[],
+                bounds: FitBounds {
+                    upper_chroma: profile.chroma_envelope.ordinary_maximum,
+                    ..FitBounds::default()
+                },
+            },
+        )?;
+        subdued = subdued_fit.output.clone();
+    }
+    if subdued == base {
+        return Err(crate::Error(
+            "base and subdued syntax roles collided exactly".into(),
+        ));
+    }
+    let full_plan = MergePlan::with_family_count(8);
+    let full_allocations = allocate_families(
+        search,
+        palette,
+        contexts,
+        saliency_reference,
+        &profile,
+        &full_plan,
+    )?;
+    let full_colors = full_allocations
+        .iter()
+        .map(|allocation| allocation.output.clone())
+        .collect::<Vec<_>>();
+    let (full_normal, full_cvd) = pair_matrices(&full_colors)?;
+    let (plan, allocations, normal_matrix, cvd_matrix) = select_separated_plan(
+        profile.target_families,
+        &full_allocations,
+        &full_normal,
+        &full_cvd,
+        &[base.clone(), subdued.clone()],
+    )?;
+    for allocation in &allocations {
+        if allocation.output == base || allocation.output == subdued {
+            return Err(crate::Error(format!(
+                "syntax family {} collided exactly with an unmerged base role",
+                allocation.family
+            )));
+        }
+    }
 
     let pair_constraints = PairConstraints {
         foreground_contrast: SYNTAX_SEMANTIC_FLOOR,
@@ -409,148 +513,185 @@ pub fn build_syntax(
         normal_delta: SYNTAX_DIFF_CONTRACT.normal_delta_e,
         cvd_delta: SYNTAX_DIFF_CONTRACT.cvd_delta_e,
         lightness_delta: 0.0,
+        minimum_chroma: 0.025,
         separation_alternative: SYNTAX_DIFF_CONTRACT.separation_alternative,
         prefer_background: false,
     };
+    let [syntax_add, syntax_delete] = search
+        .fit_pair(diff_sources[0], diff_sources[2], contexts, pair_constraints)
+        .map_err(|error| crate::Error(format!("syntax diff semantic pair: {error}")))?;
+    let diff_disposition = "conventional_semantic_anchors";
+    let syntax_change = search.fit_color(diff_sources[1], contexts, SYNTAX_SEMANTIC_FLOOR)?;
 
-    let [syntax_add, syntax_delete] = match search.fit_pair(
-        add_seed,
-        delete_seed,
-        contexts,
-        pair_constraints,
-    ) {
-        Ok(pair) => pair,
-        Err(_) => {
-            audit.syntax_collapses.push(json!({
-                "roles": ["syntax-add", "syntax-delete"], "reason": "authored_pair_failed_hard_invariants",
-                "fallback": "baseline",
-            }));
-            search.fit_pair(fallbacks[2], fallbacks[7], contexts, pair_constraints)?
+    let mut role_colors = BTreeMap::from([
+        (SemanticRole::Base, base.clone()),
+        (SemanticRole::Subdued, subdued.clone()),
+        (SemanticRole::DiffChange, syntax_change.clone()),
+        (SemanticRole::DiffAdd, syntax_add.clone()),
+        (SemanticRole::DiffDelete, syntax_delete.clone()),
+    ]);
+    for allocation in &allocations {
+        for role in &plan.families[allocation.family].roles {
+            role_colors.insert(*role, allocation.output.clone());
         }
-    };
+    }
 
-    slots.insert("base", base);
-    slots.insert("subdued", subdued);
-    slots.insert("hint", hint);
-    slots.insert("syntax-add", syntax_add);
-    slots.insert("syntax-delete", syntax_delete);
+    let distinct_family_colors = allocations
+        .iter()
+        .map(|allocation| allocation.output.clone())
+        .collect::<Vec<_>>();
+    let allocation_audit = allocations
+        .iter()
+        .map(|allocation| -> Result<Value> {
+            let source = allocation
+                .source
+                .map(|index| &profile.authored_colors[index]);
+            let output_lch = oklab_to_oklch(lab(&allocation.output)?);
+            Ok(json!({
+                "family": allocation.family,
+                "candidate_origin_family": allocation.origin_family,
+                "roles": plan.families[allocation.family].roles.iter().map(|role| role.as_str()).collect::<Vec<_>>(),
+                "saliency_preference": round6(family_saliency(&plan, allocation.family)),
+                "candidate_target_saliency": round6(allocation.preferred_saliency),
+                "measured_saliency": round6(allocation.measured_saliency),
+                "reference_contrast": round6(allocation.reference_contrast),
+                "preferred_contrast": round6(allocation.preferred_contrast),
+                "actual_contrast": round6(allocation.actual_contrast),
+                "preferred_chroma": round6(allocation.preferred_chroma),
+                "chroma_cap": round6(allocation.chroma_cap),
+                "seed_kind": allocation.seed_kind,
+                "seed": allocation.seed,
+                "source_value": source.map(|value| value.value.clone()),
+                "source_keys": source.map(|value| value.keys.clone()).unwrap_or_default(),
+                "output": allocation.output,
+                "output_chroma": round6(output_lch[1]),
+                "minimum_contrast": round6(minimum_contrast(&allocation.output, contexts)?),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let capture_audit = CAPTURE_POLICIES
+        .iter()
+        .map(|capture| {
+            json!({
+                "capture": capture.capture,
+                "role": capture.role.as_str(),
+                "family": plan.family_for(capture.role),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut merge_plan_audit = plan.audit();
+    if let Some(object) = merge_plan_audit.as_object_mut() {
+        object.insert(
+            "requested_family_count".into(),
+            profile.target_families.into(),
+        );
+        object.insert("effective_family_count".into(), plan.family_count.into());
+        object.insert(
+            "separation_fallback".into(),
+            (plan.family_count < profile.target_families).into(),
+        );
+    }
+    audit.syntax_policy = json!({
+        "version": 1,
+        "profile": profile.audit(),
+        "merge_plan": merge_plan_audit,
+        "saliency": {
+            "allocation_order": "fit stable candidates to relative contrast preferences, then rank valid outputs against family saliency",
+            "bands_are_preferences": true,
+            "metric": "log(role geometric-mean contrast) / log(editor foreground geometric-mean contrast)",
+            "measured_order_verified": saliency_ordered(&plan, &allocations),
+            "fitted_family_seed_count": full_allocations.len(),
+            "maximum_fitted_family_seeds": 8,
+            "allocations": allocation_audit,
+            "ordinary_pair_metrics": {
+                "colors": distinct_family_colors,
+                "normal_delta_e": rounded_matrix(&normal_matrix),
+                "cvd_delta_e": rounded_matrix(&cvd_matrix),
+                "minimum_normal_delta_e": ORDINARY_NORMAL_SEPARATION,
+                "minimum_cvd_delta_e": ORDINARY_CVD_SEPARATION,
+                "separation_verified": separated(&normal_matrix, &cvd_matrix),
+                "exact_collision_policy": "forbidden_between_effective_families",
+            },
+        },
+        "captures": capture_audit,
+        "diff": {
+            "disposition": diff_disposition,
+            "profile_budgeted": false,
+            "change_source_key": "yellow",
+            "change": syntax_change,
+            "added_source_key": "green",
+            "added": syntax_add,
+            "deleted_source_key": "red",
+            "deleted": syntax_delete,
+            "ordinary_chroma_envelope_exempt": true,
+            "ui_presentation": {
+                "adaptive": false,
+                "scope": "existing editor diff-hunk, version-control, status, fill, hollow-fill, and border behavior is preserved",
+            },
+        },
+    });
+
+    for role in [SemanticRole::Base, SemanticRole::Subdued] {
+        let output = &role_colors[&role];
+        let saliency_fit = if role == SemanticRole::Base {
+            &base_fit
+        } else {
+            &subdued_fit
+        };
+        audit.syntax_roles.push(json!({
+            "role": role.as_str(),
+            "family": Value::Null,
+            "output": output,
+            "minimum_contrast": round6(minimum_contrast(output, contexts)?),
+            "preferred_saliency": round6(saliency_fit.preferred_saliency),
+            "measured_saliency": round6(saliency_fit.actual_saliency),
+        }));
+    }
+    for role in plan.families.iter().flat_map(|family| family.roles.iter()) {
+        let family = plan.family_for(*role).unwrap();
+        let output = &role_colors[role];
+        audit.syntax_roles.push(json!({
+            "role": role.as_str(),
+            "family": family,
+            "merged_with": plan.families[family].roles.iter().filter(|other| *other != role).map(|other| other.as_str()).collect::<Vec<_>>(),
+            "output": output,
+            "minimum_contrast": round6(minimum_contrast(output, contexts)?),
+            "chroma": round6(oklab_to_oklch(lab(output)?)[1]),
+        }));
+    }
+    for (role, output) in [
+        (SemanticRole::DiffChange, &syntax_change),
+        (SemanticRole::DiffAdd, &syntax_add),
+        (SemanticRole::DiffDelete, &syntax_delete),
+    ] {
+        audit.syntax_roles.push(json!({
+            "role": role.as_str(),
+            "family": Value::Null,
+            "output": output,
+            "minimum_contrast": round6(minimum_contrast(output, contexts)?),
+            "disposition": diff_disposition,
+        }));
+    }
 
     let mut output = Map::new();
-    for capture in crate::constants::BASE_SYNTAX_FIELDS
-        .iter()
-        .chain(crate::constants::ADDITIONAL_SYNTAX_FIELDS)
-    {
-        let group = capture_group(capture, richness.tier);
-        let (style, weight) = capture_style(capture);
-        let mut spec = Map::from_iter([("color".into(), slots[group].clone().into())]);
+    for capture in CAPTURE_POLICIES {
+        let color = role_colors.get(&capture.role).ok_or_else(|| {
+            crate::Error(format!(
+                "no syntax color allocated for {}",
+                capture.role.as_str()
+            ))
+        })?;
+        let (style, weight) = capture_style(capture.capture);
+        let mut spec = Map::from_iter([("color".into(), color.clone().into())]);
         if let Some(style) = style {
             spec.insert("font_style".into(), style.into());
         }
-
         if let Some(weight) = weight {
             spec.insert("font_weight".into(), weight.into());
         }
-
-        output.insert((*capture).into(), Value::Object(spec));
+        output.insert(capture.capture.into(), Value::Object(spec));
     }
-
     Ok(output)
-}
-
-fn capture_group(capture: &str, tier: Tier) -> &'static str {
-    if capture == "diff.plus" {
-        return "syntax-add";
-    }
-
-    if capture == "diff.minus" {
-        return "syntax-delete";
-    }
-
-    if matches!(
-        capture,
-        "comment"
-            | "comment.doc"
-            | "predictive"
-            | "strikethrough"
-            | "punctuation"
-            | "punctuation.delimiter"
-            | "punctuation.list_marker"
-            | "punctuation.markup"
-    ) {
-        return "subdued";
-    }
-
-    if capture == "hint" {
-        return "hint";
-    }
-
-    if matches!(capture, "link_text" | "link_uri") {
-        return "link";
-    }
-
-    if matches!(capture, "constant" | "text.literal" | "variant") {
-        return "value";
-    }
-
-    if capture == "string" {
-        return "string";
-    }
-
-    if matches!(
-        capture,
-        "constructor" | "function" | "function.builtin" | "label"
-    ) {
-        return "declaration";
-    }
-
-    if matches!(capture, "warning" | "diff") {
-        return "metadata";
-    }
-
-    match tier {
-        Tier::Baseline | Tier::Restrained => match capture {
-            "boolean" | "number" | "string.escape" | "lifetime" => "value",
-            "string.regex" => "string",
-            "enum" => "metadata",
-            "type" | "concept" | "namespace" | "module" => "declaration",
-            "punctuation.special" => "subdued",
-            _ => "base",
-        },
-        Tier::Broad => match capture {
-            "boolean" | "number" => "value",
-            "string.regex" => "string",
-            "string.escape"
-            | "string.special"
-            | "string.special.symbol"
-            | "variable.special"
-            | "selector.pseudo"
-            | "keyword"
-            | "preproc"
-            | "storageclass"
-            | "punctuation.special" => "special",
-            "lifetime" => "special",
-            "enum" => "metadata",
-            "type" | "concept" | "namespace" | "module" => "type",
-            "attribute" | "property" | "selector" | "tag" => "link",
-            "title" => "declaration",
-            _ => "base",
-        },
-        Tier::Rich => match capture {
-            "boolean"
-            | "number"
-            | "string.escape"
-            | "string.special"
-            | "string.special.symbol"
-            | "punctuation.special" => "special",
-            "string.regex" | "variable.special" | "lifetime" | "property" => "danger",
-            "enum" | "type" | "concept" | "namespace" | "module" => "type",
-            "attribute" | "keyword" | "preproc" | "storageclass" => "value",
-            "selector" => "metadata",
-            "tag" | "title" => "declaration",
-            "selector.pseudo" => "special",
-            _ => "base",
-        },
-    }
 }
 
 fn capture_style(capture: &str) -> (Option<&'static str>, Option<u16>) {
@@ -583,14 +724,5 @@ fn capture_style(capture: &str) -> (Option<&'static str>, Option<u16>) {
     } else {
         None
     };
-
     (italic, weight)
-}
-
-pub fn contrast_floor(capture: &str, tier: Tier) -> f64 {
-    match capture_group(capture, tier) {
-        "base" => SYNTAX_PRIMARY_FLOOR,
-        "subdued" => SYNTAX_SUBDUED_FLOOR,
-        _ => SYNTAX_SEMANTIC_FLOOR,
-    }
 }
