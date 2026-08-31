@@ -43,21 +43,10 @@ pub enum HueStrategy {
     PaletteNative,
 }
 
-impl HueStrategy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Neutral => "neutral",
-            Self::AccentLed => "accent_led",
-            Self::PaletteNative => "palette_native",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct EvidenceColor {
     pub value: String,
     pub keys: Vec<&'static str>,
-    pub provenance: Provenance,
     pub lightness: f64,
     pub chroma: f64,
     pub hue: f64,
@@ -67,7 +56,6 @@ pub struct EvidenceColor {
 #[derive(Clone, Debug)]
 pub struct HueCluster {
     pub members: Vec<usize>,
-    pub weight: f64,
     pub representative: usize,
 }
 
@@ -79,15 +67,9 @@ pub struct ChromaEnvelope {
 
 #[derive(Clone, Debug)]
 pub struct SyntaxProfile {
-    pub authored_breadth: f64,
-    pub authored_intensity: f64,
-    pub effective_hue_families: f64,
-    pub source_median_chroma: f64,
-    pub source_q90_chroma: f64,
     pub requested_hue_family_count: usize,
     pub chroma_envelope: ChromaEnvelope,
     pub hue_strategy: HueStrategy,
-    pub authored_colors: Vec<EvidenceColor>,
     pub evidence: Vec<EvidenceColor>,
     pub clusters: Vec<HueCluster>,
 }
@@ -160,7 +142,6 @@ fn complete_link_clusters(evidence: &[EvidenceColor]) -> Vec<HueCluster> {
     let mut output = clusters
         .into_iter()
         .map(|members| {
-            let weight = members.iter().map(|index| evidence[*index].weight).sum();
             let representative = *members
                 .iter()
                 .min_by(|left, right| {
@@ -172,7 +153,6 @@ fn complete_link_clusters(evidence: &[EvidenceColor]) -> Vec<HueCluster> {
                 .unwrap();
             HueCluster {
                 members,
-                weight,
                 representative,
             }
         })
@@ -191,7 +171,7 @@ fn complete_link_clusters(evidence: &[EvidenceColor]) -> Vec<HueCluster> {
 }
 
 pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
-    let mut deduplicated: BTreeMap<String, (Vec<&'static str>, Provenance)> = BTreeMap::new();
+    let mut deduplicated: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
     for key in EVIDENCE_KEYS {
         let value = palette.colors[key].clone();
         let provenance = palette
@@ -202,24 +182,17 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
         if provenance == Provenance::Derived {
             continue;
         }
-        let entry = deduplicated
-            .entry(value)
-            .or_insert_with(|| (Vec::new(), provenance));
-        entry.0.push(key);
-        if provenance == Provenance::Direct {
-            entry.1 = Provenance::Direct;
-        }
+        deduplicated.entry(value).or_default().push(key);
     }
 
     let mut authored_colors = deduplicated
         .into_iter()
-        .map(|(value, (keys, provenance))| {
+        .map(|(value, keys)| {
             let [lightness, chroma, hue] = oklab_to_oklch(lab(&value)?);
             Ok(
                 (chroma >= ALLOCATION_CHROMA_FLOOR - 1e-12).then_some(EvidenceColor {
                     value,
                     keys,
-                    provenance,
                     lightness,
                     chroma,
                     hue,
@@ -264,8 +237,6 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
             .sum::<f64>();
         1.0 / concentration.max(1e-12)
     };
-    let authored_breadth = ((effective_hue_families - 1.0) / 5.0).clamp(0.0, 1.0);
-
     let mut chromas = evidence
         .iter()
         .map(|color| color.chroma)
@@ -273,10 +244,6 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
     chromas.sort_by(f64::total_cmp);
     let source_median_chroma = quantile(&chromas, 0.5);
     let source_q90_chroma = quantile(&chromas, 0.9);
-    let median_intensity = ((source_median_chroma - CHROMA_EVIDENCE) / 0.115).clamp(0.0, 1.0);
-    let peak_intensity = ((source_q90_chroma - CHROMA_EVIDENCE) / 0.155).clamp(0.0, 1.0);
-    let authored_intensity = 0.55 * median_intensity + 0.45 * peak_intensity;
-
     let native_median = source_median_chroma.clamp(0.045, 0.140);
     let palette_native_weight = smoothstep(1.0, 2.5, effective_hue_families);
     let target_median =
@@ -300,18 +267,12 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
         HueStrategy::PaletteNative => clusters.len(),
     };
     Ok(SyntaxProfile {
-        authored_breadth,
-        authored_intensity,
-        effective_hue_families,
-        source_median_chroma,
-        source_q90_chroma,
         requested_hue_family_count,
         chroma_envelope: ChromaEnvelope {
             target_median,
             ordinary_maximum,
         },
         hue_strategy,
-        authored_colors,
         evidence,
         clusters,
     })
@@ -347,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_rgb_does_not_increase_breadth() {
+    fn duplicate_rgb_produces_one_evidence_color() {
         let distinct = palette(&[
             ("accent", 0.12, 0.2, Provenance::Direct),
             ("blue", 0.12, 2.5, Provenance::Direct),
@@ -356,10 +317,6 @@ mod tests {
         duplicate
             .colors
             .insert("blue".into(), duplicate.colors["accent"].clone());
-        assert!(
-            measure(&duplicate).unwrap().authored_breadth
-                <= measure(&distinct).unwrap().authored_breadth
-        );
         assert_eq!(measure(&duplicate).unwrap().evidence.len(), 1);
     }
 
@@ -370,29 +327,12 @@ mod tests {
             ("blue", 0.18, 3.5, Provenance::Derived),
         ]))
         .unwrap();
-        assert_eq!(profile.effective_hue_families, 0.0);
-        assert_eq!(profile.authored_intensity, 0.0);
+        assert!(profile.evidence.is_empty());
+        assert_eq!(profile.hue_strategy, HueStrategy::Neutral);
     }
 
     #[test]
-    fn reducing_authored_chroma_cannot_increase_intensity() {
-        let vivid = measure(&palette(&[
-            ("red", 0.14, 0.2, Provenance::Direct),
-            ("blue", 0.12, 3.5, Provenance::Direct),
-            ("green", 0.10, 2.1, Provenance::Alias),
-        ]))
-        .unwrap();
-        let soft = measure(&palette(&[
-            ("red", 0.07, 0.2, Provenance::Direct),
-            ("blue", 0.06, 3.5, Provenance::Direct),
-            ("green", 0.05, 2.1, Provenance::Alias),
-        ]))
-        .unwrap();
-        assert!(soft.authored_intensity <= vivid.authored_intensity);
-    }
-
-    #[test]
-    fn evidence_threshold_has_no_large_score_jump() {
+    fn evidence_threshold_has_no_large_envelope_jump() {
         let below = measure(&palette(&[
             ("red", 0.10, 0.2, Provenance::Direct),
             ("blue", CHROMA_EVIDENCE - 0.0002, 3.5, Provenance::Direct),
@@ -403,42 +343,13 @@ mod tests {
             ("blue", CHROMA_EVIDENCE + 0.0002, 3.5, Provenance::Direct),
         ]))
         .unwrap();
-        assert!((above.authored_breadth - below.authored_breadth).abs() < 0.01);
-        assert!((above.authored_intensity - below.authored_intensity).abs() < 0.05);
-    }
-
-    #[test]
-    fn chroma_envelope_preserves_neutral_accent_led_and_palette_native_character() {
-        let neutral = measure(&palette(&[])).unwrap();
-        assert_eq!(neutral.chroma_envelope.target_median, 0.035);
-        assert_eq!(neutral.chroma_envelope.ordinary_maximum, 0.055);
-
-        let accent_led = measure(&palette(&[("accent", 0.14, 0.2, Provenance::Direct)])).unwrap();
-        assert!((accent_led.chroma_envelope.target_median - 0.035).abs() < 1e-12);
         assert!(
-            (accent_led.chroma_envelope.ordinary_maximum
-                - accent_led.source_q90_chroma.clamp(0.070, 0.180))
-            .abs()
-                < 1e-12
-        );
-
-        let native = measure(&palette(&[
-            ("red", 0.08, 0.2, Provenance::Direct),
-            ("green", 0.09, 2.1, Provenance::Direct),
-            ("blue", 0.10, 4.0, Provenance::Direct),
-        ]))
-        .unwrap();
-        assert!(
-            (native.chroma_envelope.target_median
-                - native.source_median_chroma.clamp(0.045, 0.140))
-            .abs()
-                < 1e-12
+            (above.chroma_envelope.target_median - below.chroma_envelope.target_median).abs()
+                < 0.01
         );
         assert!(
-            (native.chroma_envelope.ordinary_maximum
-                - native.source_q90_chroma.clamp(0.070, 0.180))
-            .abs()
-                < 1e-12
+            (above.chroma_envelope.ordinary_maximum - below.chroma_envelope.ordinary_maximum).abs()
+                < 0.01
         );
     }
 
@@ -456,7 +367,6 @@ mod tests {
         )]))
         .unwrap();
         assert!(!weak.evidence.is_empty());
-        assert!(weak.authored_intensity < 0.10);
         assert_eq!(weak.hue_strategy, HueStrategy::AccentLed);
         assert_eq!(weak.requested_hue_family_count, 1);
 
@@ -484,7 +394,6 @@ mod tests {
             ("blue", 0.03, 4.0, Provenance::Direct),
         ]))
         .unwrap();
-        assert!(dominant_cluster.effective_hue_families < 2.5);
         assert_eq!(dominant_cluster.clusters.len(), 3);
         assert_eq!(dominant_cluster.hue_strategy, HueStrategy::PaletteNative);
         assert_eq!(dominant_cluster.requested_hue_family_count, 3);

@@ -1307,19 +1307,6 @@ impl Search {
             .ok_or_else(|| Error(format!("no candidate for fill {seed}")))
     }
 
-    pub fn fit_exact_readable_overlay(
-        &self,
-        seed: &str,
-        request: OverlayFitRequest<'_>,
-    ) -> Result<Option<String>> {
-        let prepared = PreparedFill::new(request)?;
-        let metrics = ColorMetrics::from_hex(seed)?;
-        let alpha_values = PreparedFill::alpha_values(1, u8::MAX);
-        Ok(prepared
-            .best_for(metrics, 0.0, 1.0, &alpha_values)
-            .map(|candidate| candidate.emitted.hex()))
-    }
-
     fn prepare_overlay_pair(
         &mut self,
         first_seed: &str,

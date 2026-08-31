@@ -1,8 +1,4 @@
 {
-  "source": {
-    "name": "omarchy",
-    "commit": "e68994680ab478dceb6f927002861fe4645a8027"
-  },
   "version": 1,
   "palettes": [
     {

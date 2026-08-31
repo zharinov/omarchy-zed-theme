@@ -135,8 +135,6 @@ pub fn resolve_palette(colors_file: &Path, resolver: Option<&Path>) -> Result<Re
 
     let executable = resolver
         .map(ToOwned::to_owned)
-        .or_else(|| std::env::var_os("OMARCHY_ZED_THEME_COLOR_RESOLVER").map(Into::into))
-        .or_else(|| std::env::var_os("OMARCHY_ZED_THEME_COLOR").map(Into::into))
         .unwrap_or_else(|| "omarchy-theme-color".into());
 
     let mut resolved_child = Command::new(&executable)

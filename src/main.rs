@@ -35,7 +35,7 @@ fn print_update(update: ThemeUpdate) {
 fn sync() -> Result<()> {
     let home = home()?;
     let (colors, output) = current_paths(&home);
-    let update = generate_and_publish(&colors, Some(&output), None, None)?;
+    let update = generate_and_publish(&colors, Some(&output), None)?;
 
     print_update(update);
     Ok(())

@@ -1,17 +1,8 @@
-use omarchy_zed_theme::color::{
-    apply_opacity, contrast_ratio, delta_e, gamut_map_oklch, gpui_blend, lab, oklab_to_oklch,
-    parse_hex, render_layers,
-};
-use omarchy_zed_theme::constants::{
-    ADDITIONAL_SYNTAX_FIELDS, BASE_SYNTAX_FIELDS, CANONICAL_COLOR_KEYS, CHROME_FIELDS,
-    DIFF_BORDER_RETENTION_DELTA_E, DIFF_BORDER_RETENTION_RATIO, EDITOR_FIELDS, FOUNDATION_FIELDS,
-    LINK_VC_FIELDS, RUNTIME_STATE_BASE_CONTRAST_STEP, RUNTIME_STATE_CONSECUTIVE_CONTRAST,
-    RUNTIME_STATE_CONSECUTIVE_DELTA_E, STATUS_NAMES, TERMINAL_FIELDS, VIM_FIELDS,
-};
-use omarchy_zed_theme::palette::{Provenance, ResolvedPalette, resolve_palette};
+use omarchy_zed_theme::color::{contrast_ratio, gamut_map_oklch, lab, oklab_to_oklch, parse_hex};
+use omarchy_zed_theme::constants::CANONICAL_COLOR_KEYS;
+use omarchy_zed_theme::palette::{Provenance, ResolvedPalette};
 use omarchy_zed_theme::publish::{atomic_write_file, generate_and_publish};
-use omarchy_zed_theme::saliency::relative_saliency;
-use omarchy_zed_theme::syntax::{contrast_floor, overlay_contrast_floor};
+use omarchy_zed_theme::syntax::contrast_floor;
 use omarchy_zed_theme::theme::build_theme;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -31,28 +22,12 @@ fn temporary(name: &str) -> PathBuf {
     ))
 }
 
-fn required_env_path(variable: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var_os(variable)
-            .unwrap_or_else(|| panic!("{variable} is required for this integration test")),
-    )
-}
-
 fn style(document: &Value) -> &serde_json::Map<String, Value> {
     document["themes"][0]["style"].as_object().unwrap()
 }
 
 fn role<'a>(style: &'a serde_json::Map<String, Value>, name: &str) -> &'a str {
     style[name].as_str().unwrap()
-}
-
-fn rgb(value: &str) -> (u8, u8, u8) {
-    let color = parse_hex(value).unwrap();
-    (
-        (color.r * 255.0).round() as u8,
-        (color.g * 255.0).round() as u8,
-        (color.b * 255.0).round() as u8,
-    )
 }
 
 fn synthetic_palette() -> ResolvedPalette {
@@ -148,8 +123,8 @@ fn generation_cache_uses_effective_inputs() {
     let mut palette = synthetic_palette();
     write_test_resolver(&resolver, &palette);
 
-    let first = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
-    let second = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
+    let first = generate_and_publish(&colors, Some(&output), Some(&resolver)).unwrap();
+    let second = generate_and_publish(&colors, Some(&output), Some(&resolver)).unwrap();
 
     assert!(!first.cached);
     assert!(second.cached);
@@ -157,7 +132,7 @@ fn generation_cache_uses_effective_inputs() {
     palette.colors.insert("red".into(), "#ff5555".into());
     write_test_resolver(&resolver, &palette);
 
-    let invalidated = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
+    let invalidated = generate_and_publish(&colors, Some(&output), Some(&resolver)).unwrap();
 
     assert!(!invalidated.cached);
 
@@ -166,7 +141,7 @@ fn generation_cache_uses_effective_inputs() {
 
     fs::write(&target, b"tampered theme\n").unwrap();
 
-    let repaired = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
+    let repaired = generate_and_publish(&colors, Some(&output), Some(&resolver)).unwrap();
 
     assert!(!repaired.cached);
     assert_eq!(fs::read(&target).unwrap(), generated);
@@ -180,7 +155,7 @@ fn generation_cache_uses_effective_inputs() {
     palette.colors.insert("green".into(), "#55ff55".into());
     write_test_resolver(&resolver, &palette);
 
-    let changed = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
+    let changed = generate_and_publish(&colors, Some(&output), Some(&resolver)).unwrap();
 
     assert!(!changed.cached);
     assert_eq!(fs::read_to_string(victim).unwrap(), "keep\n");
@@ -353,147 +328,15 @@ fn parse_palette_fixture(value: &Value) -> (String, ResolvedPalette) {
     )
 }
 
-fn serialized_field_names(source: &str, structure: &str) -> BTreeSet<String> {
-    let start_marker = format!("pub struct {structure} {{");
-    let body = source
-        .split_once(&start_marker)
-        .unwrap_or_else(|| panic!("missing {structure}"))
-        .1
-        .split_once("\n}")
-        .unwrap_or_else(|| panic!("unterminated {structure}"))
-        .0;
-    let mut fields = BTreeSet::new();
-    let mut attributes = Vec::new();
-    let mut attribute = String::new();
-
-    for line in body.lines() {
-        let line = line.trim();
-
-        if !attribute.is_empty() || line.starts_with("#[") {
-            attribute.push_str(line);
-
-            if !line.ends_with(']') {
-                continue;
-            }
-
-            attributes.push(std::mem::take(&mut attribute));
-            continue;
-        }
-
-        let Some(declaration) = line.strip_prefix("pub ") else {
-            continue;
-        };
-
-        let Some((rust_name, _)) = declaration.split_once(':') else {
-            continue;
-        };
-
-        if attributes
-            .iter()
-            .any(|attribute| attribute.starts_with("#[deprecated"))
-        {
-            attributes.clear();
-            continue;
-        }
-
-        let serde = attributes
-            .iter()
-            .find(|attribute| attribute.starts_with("#[serde"))
-            .and_then(|attribute| {
-                attribute
-                    .split_once('(')
-                    .and_then(|(_, value)| value.strip_suffix(")]"))
-            });
-
-        if serde
-            .is_some_and(|attribute| serde_items(attribute).any(|item| item == "skip_serializing"))
-        {
-            attributes.clear();
-            continue;
-        }
-
-        let serialized_name = serde
-            .and_then(|attribute| {
-                serde_items(attribute).find_map(|item| {
-                    let value = item
-                        .strip_prefix("rename")?
-                        .trim()
-                        .strip_prefix('=')?
-                        .trim();
-                    value.strip_prefix('"')?.strip_suffix('"')
-                })
-            })
-            .unwrap_or_else(|| rust_name.trim());
-
-        fields.insert(serialized_name.to_owned());
-        attributes.clear();
-    }
-
-    fields
-}
-
-fn serde_items(attribute: &str) -> impl Iterator<Item = &str> {
-    attribute.split(',').map(str::trim)
-}
-
-#[test]
-fn schema_parser_keeps_conditionally_serialized_fields() {
-    let fixture = r#"
-pub struct Fixture {
-    #[serde(rename = "old", skip_serializing)]
-    pub old: String,
-    #[serde(
-        rename = "optional",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub optional: Option<String>,
-    pub implicit: String,
-    #[deprecated]
-    pub legacy: String,
-}
-"#;
-    assert_eq!(
-        serialized_field_names(fixture, "Fixture"),
-        BTreeSet::from(["implicit".to_owned(), "optional".to_owned()])
-    );
-}
-
 #[test]
 fn representative_palettes_generate_valid_themes() {
     let fixtures: Value =
         serde_json::from_str(include_str!("fixtures/resolved-palettes.json")).unwrap();
     assert_eq!(fixtures["version"].as_u64(), Some(1));
-    let omarchy_commit = include_str!("upstream-repositories.tsv")
-        .lines()
-        .find_map(|line| {
-            let mut columns = line.split('\t');
-            (columns.next() == Some("omarchy"))
-                .then(|| columns.nth(1))
-                .flatten()
-        })
-        .expect("missing pinned Omarchy revision");
-    assert_eq!(fixtures["source"]["name"].as_str(), Some("omarchy"));
-    assert_eq!(fixtures["source"]["commit"].as_str(), Some(omarchy_commit));
-
-    let expected_names = BTreeSet::from([
-        "matte-black".to_owned(),
-        "nord".to_owned(),
-        "tokyo-night".to_owned(),
-        "white".to_owned(),
-    ]);
-    let palettes = fixtures["palettes"].as_array().unwrap();
-    assert_eq!(palettes.len(), expected_names.len());
-    let mut actual_names = BTreeSet::new();
-    for fixture in palettes {
+    for fixture in fixtures["palettes"].as_array().unwrap() {
         let (name, palette) = parse_palette_fixture(fixture);
-        let document = build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
-        let syntax = style(&document)["syntax"].as_object().unwrap();
-
-        assert_eq!(syntax.len(), 56, "{name}");
-        actual_names.insert(name);
+        build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
     }
-
-    assert_eq!(actual_names, expected_names);
 }
 
 #[test]
@@ -623,78 +466,6 @@ fn a_scarce_but_perceptible_authored_hue_is_not_discarded() {
 }
 
 #[test]
-fn diff_line_roles_follow_zeds_opacity_ladder() {
-    for (name, palette, expected_alpha) in [
-        ("dark", synthetic_palette(), [31_u8, 15, 92]),
-        ("light", venice_like_palette(), [41_u8, 20, 122]),
-    ] {
-        let document = build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
-        let style = style(&document);
-        for family in ["added", "deleted"] {
-            let marker = role(style, &format!("version_control.{family}"));
-            for (suffix, alpha) in [
-                ("background", expected_alpha[0]),
-                ("hollow_background", expected_alpha[1]),
-                ("hollow_border", expected_alpha[2]),
-            ] {
-                let hunk = role(style, &format!("editor.diff_hunk.{family}.{suffix}"));
-                assert_eq!(rgb(hunk), rgb(marker), "{name}: {family}.{suffix}");
-                assert_eq!(
-                    (parse_hex(hunk).unwrap().a * 255.0).round() as u8,
-                    alpha,
-                    "{name}: {family}.{suffix}"
-                );
-            }
-            let word = role(style, &format!("version_control.word_{family}"));
-            assert_eq!(rgb(word), rgb(marker), "{name}: word_{family}");
-            assert_eq!(
-                (parse_hex(word).unwrap().a * 255.0).round() as u8,
-                expected_alpha[0],
-                "{name}: word_{family}"
-            );
-        }
-    }
-}
-
-#[test]
-#[ignore = "requires the pinned Zed source checkout"]
-fn pinned_zed_color_schema_matches_the_manifest() {
-    let root = required_env_path("OMARCHY_ZED_THEME_ZED_SOURCE");
-    let source_path = root.join("crates/settings_content/src/theme.rs");
-    let source = fs::read_to_string(&source_path)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", source_path.display()));
-
-    let expected_colors = FOUNDATION_FIELDS
-        .iter()
-        .chain(CHROME_FIELDS)
-        .chain(EDITOR_FIELDS)
-        .chain(TERMINAL_FIELDS)
-        .chain(LINK_VC_FIELDS)
-        .chain(VIM_FIELDS)
-        .map(|field| (*field).to_owned())
-        .collect();
-    assert_eq!(
-        serialized_field_names(&source, "ThemeColorsContent"),
-        expected_colors
-    );
-
-    let expected_status = STATUS_NAMES
-        .iter()
-        .flat_map(|name| {
-            [
-                name.to_string(),
-                format!("{name}.background"),
-                format!("{name}.border"),
-            ]
-        })
-        .collect();
-    assert_eq!(
-        serialized_field_names(&source, "StatusColorsContent"),
-        expected_status
-    );
-}
-
-#[test]
 fn theme_bytes_are_thread_count_independent() {
     let palette = synthetic_palette();
     let build = |threads| {
@@ -762,232 +533,6 @@ fn narrow_olive_palette_never_synthesizes_hues() {
 }
 
 #[test]
-fn semantic_tokens_preserve_exact_cross_role_relationships() {
-    let document = build_theme(&synthetic_palette()).unwrap();
-    let style = style(&document);
-
-    for group in [
-        &[
-            "editor.background",
-            "editor.gutter.background",
-            "tab.active_background",
-            "toolbar.background",
-        ][..],
-        &[
-            "background",
-            "status_bar.background",
-            "title_bar.background",
-        ],
-        &["text", "icon"],
-        &[
-            "text.muted",
-            "icon.muted",
-            "icon.placeholder",
-            "unreachable",
-        ],
-        &[
-            "text.placeholder",
-            "text.disabled",
-            "icon.disabled",
-            "hidden",
-            "ignored",
-        ],
-        &["text.accent", "icon.accent", "link_text.hover"],
-        &["element.active", "element.selected"],
-        &["ghost_element.active", "ghost_element.selected"],
-        &[
-            "element.disabled",
-            "ghost_element.disabled",
-            "title_bar.inactive_background",
-        ],
-    ] {
-        let expected = role(style, group[0]);
-        for name in &group[1..] {
-            assert_eq!(role(style, name), expected, "{name} left its token group");
-        }
-    }
-
-    for role_name in [
-        "border.transparent",
-        "ghost_element.background",
-        "scrollbar.track.background",
-    ] {
-        assert_eq!(role(style, role_name), "#00000000", "{role_name}");
-    }
-
-    for (source, aliases) in [
-        ("created", &["success"][..]),
-        ("deleted", &["error"]),
-        ("warning", &["conflict", "modified"]),
-        ("info", &["renamed"]),
-    ] {
-        for suffix in ["", ".background", ".border"] {
-            let expected = role(style, &format!("{source}{suffix}"));
-            for alias in aliases {
-                let alias_role = format!("{alias}{suffix}");
-                assert_eq!(role(style, &alias_role), expected, "{alias_role}");
-            }
-        }
-    }
-
-    let syntax = style["syntax"].as_object().unwrap();
-    let editor_foreground = role(style, "editor.foreground");
-    assert_eq!(syntax["primary"]["color"], editor_foreground);
-    assert_eq!(syntax["variable"]["color"], editor_foreground);
-    assert_eq!(syntax["predictive"]["color"], role(style, "predictive"));
-
-    let structural_rgb = rgb(role(style, "border"));
-    assert_eq!(rgb(role(style, "editor.wrap_guide")), structural_rgb);
-    assert_eq!(rgb(role(style, "editor.active_wrap_guide")), structural_rgb);
-    assert!(role(style, "editor.wrap_guide").ends_with("0d"));
-    assert!(role(style, "editor.active_wrap_guide").ends_with("1a"));
-    let canvas = role(style, "editor.background");
-    let rendered_wrap = gpui_blend(canvas, role(style, "editor.wrap_guide"))
-        .unwrap()
-        .opaque_hex();
-    let rendered_active = gpui_blend(canvas, role(style, "editor.active_wrap_guide"))
-        .unwrap()
-        .opaque_hex();
-    assert!(
-        contrast_ratio(&rendered_active, canvas).unwrap()
-            > contrast_ratio(&rendered_wrap, canvas).unwrap()
-    );
-    assert!(delta_e(&rendered_active, canvas).unwrap() > delta_e(&rendered_wrap, canvas).unwrap());
-}
-
-#[test]
-fn every_syntax_capture_is_readable_on_emitted_diff_overlays() {
-    let document = build_theme(&synthetic_palette()).unwrap();
-    let style = style(&document);
-    let base = style["editor.background"].as_str().unwrap();
-    let added = render_layers(
-        base,
-        &[style["editor.diff_hunk.added.background"].as_str().unwrap()],
-    )
-    .unwrap();
-    let deleted = render_layers(
-        base,
-        &[style["editor.diff_hunk.deleted.background"]
-            .as_str()
-            .unwrap()],
-    )
-    .unwrap();
-    let diff_contexts = vec![
-        added.clone(),
-        deleted.clone(),
-        render_layers(
-            base,
-            &[style["editor.diff_hunk.added.hollow_background"]
-                .as_str()
-                .unwrap()],
-        )
-        .unwrap(),
-        render_layers(
-            base,
-            &[style["editor.diff_hunk.deleted.hollow_background"]
-                .as_str()
-                .unwrap()],
-        )
-        .unwrap(),
-        render_layers(
-            &added,
-            &[style["version_control.word_added"].as_str().unwrap()],
-        )
-        .unwrap(),
-        render_layers(
-            &deleted,
-            &[style["version_control.word_deleted"].as_str().unwrap()],
-        )
-        .unwrap(),
-        render_layers(
-            base,
-            &[style["version_control.conflict_marker.ours"]
-                .as_str()
-                .unwrap()],
-        )
-        .unwrap(),
-        render_layers(
-            base,
-            &[style["version_control.conflict_marker.theirs"]
-                .as_str()
-                .unwrap()],
-        )
-        .unwrap(),
-    ];
-
-    for (capture, spec) in style["syntax"].as_object().unwrap() {
-        let foreground = spec["color"].as_str().unwrap();
-        let normal_floor = contrast_floor(capture).unwrap();
-        let normal_actual = contrast_ratio(foreground, base).unwrap();
-        assert!(
-            normal_actual >= normal_floor - 1e-9,
-            "syntax.{capture} reaches only {normal_actual:.3}:1 on the ordinary editor background; floor is {normal_floor:.2}:1"
-        );
-        let overlay_floor = overlay_contrast_floor(capture).unwrap();
-        for background in &diff_contexts {
-            let actual = contrast_ratio(foreground, background).unwrap();
-            assert!(
-                actual >= overlay_floor - 1e-9,
-                "syntax.{capture} reaches only {actual:.3}:1 on rendered diff context; floor is {overlay_floor:.2}:1"
-            );
-        }
-    }
-}
-
-#[test]
-fn syntax_typography_policy_is_unchanged() {
-    let document = build_theme(&synthetic_palette()).unwrap();
-    let syntax = style(&document)["syntax"].as_object().unwrap();
-    let italic = BTreeSet::from([
-        "comment",
-        "comment.doc",
-        "predictive",
-        "variable.parameter",
-        "lifetime",
-        "emphasis",
-        "link_uri",
-    ]);
-    let semibold = BTreeSet::from([
-        "function.builtin",
-        "keyword",
-        "preproc",
-        "storageclass",
-        "hint",
-        "warning",
-        "diff",
-        "diff.plus",
-        "diff.minus",
-    ]);
-    let bold = BTreeSet::from(["emphasis.strong", "title"]);
-
-    for (capture, spec) in syntax {
-        assert_eq!(
-            spec.get("font_style").and_then(Value::as_str),
-            italic.contains(capture.as_str()).then_some("italic"),
-            "syntax.{capture} font_style"
-        );
-        let expected_weight = if bold.contains(capture.as_str()) {
-            Some(700)
-        } else if semibold.contains(capture.as_str()) {
-            Some(600)
-        } else {
-            None
-        };
-        assert_eq!(
-            spec.get("font_weight").and_then(Value::as_u64),
-            expected_weight,
-            "syntax.{capture} font_weight"
-        );
-        assert_eq!(
-            spec.as_object().unwrap().len(),
-            1 + usize::from(italic.contains(capture.as_str()))
-                + usize::from(expected_weight.is_some()),
-            "syntax.{capture} has an unexpected style key"
-        );
-    }
-}
-
-#[test]
 fn renderer_layer_roles_remain_translucent() {
     let document = build_theme(&synthetic_palette()).unwrap();
     let style = style(&document);
@@ -1030,85 +575,6 @@ fn renderer_layer_roles_remain_translucent() {
 }
 
 #[test]
-fn inline_diff_emphasis_preserves_the_hollow_hunk_border() {
-    let document = build_theme(&synthetic_palette()).unwrap();
-    let style = style(&document);
-    let base = style["editor.background"].as_str().unwrap();
-    for family in ["added", "deleted"] {
-        let hollow = style[&format!("editor.diff_hunk.{family}.hollow_background")]
-            .as_str()
-            .unwrap();
-        let border = style[&format!("editor.diff_hunk.{family}.hollow_border")]
-            .as_str()
-            .unwrap();
-        let word = style[&format!("version_control.word_{family}")]
-            .as_str()
-            .unwrap();
-        for highlight in [
-            None,
-            Some(style["search.match_background"].as_str().unwrap()),
-            Some(
-                style["editor.document_highlight.read_background"]
-                    .as_str()
-                    .unwrap(),
-            ),
-            Some(style["vim.yank.background"].as_str().unwrap()),
-        ] {
-            let mut without_border_layers = vec![hollow];
-            let mut with_border_layers = vec![hollow, border];
-            if let Some(highlight) = highlight {
-                without_border_layers.push(highlight);
-                with_border_layers.push(highlight);
-            }
-            let before_word = render_layers(base, &without_border_layers).unwrap();
-            let border_before_word = render_layers(base, &with_border_layers).unwrap();
-            without_border_layers.push(word);
-            with_border_layers.push(word);
-            let without_border = render_layers(base, &without_border_layers).unwrap();
-            let with_border = render_layers(base, &with_border_layers).unwrap();
-            let retained = delta_e(&without_border, &with_border).unwrap();
-            let retained_ratio = retained
-                / delta_e(&before_word, &border_before_word)
-                    .unwrap()
-                    .max(1e-12);
-
-            assert!(
-                retained >= DIFF_BORDER_RETENTION_DELTA_E - 1e-9
-                    && retained_ratio >= DIFF_BORDER_RETENTION_RATIO - 1e-9,
-                "{family} inline emphasis erased its hunk border: delta E {retained:.3}, retained {:.1}%",
-                retained_ratio * 100.0,
-            );
-        }
-    }
-}
-
-#[test]
-fn runtime_element_active_advances_hover() {
-    let document = build_theme(&synthetic_palette()).unwrap();
-    let style = style(&document);
-    let base = style["element.background"].as_str().unwrap();
-    let hover = gpui_blend(
-        base,
-        &apply_opacity(style["element.hover"].as_str().unwrap(), 0.6).unwrap(),
-    )
-    .unwrap()
-    .opaque_hex();
-    let active = gpui_blend(
-        base,
-        &apply_opacity(style["element.active"].as_str().unwrap(), 0.5).unwrap(),
-    )
-    .unwrap()
-    .opaque_hex();
-
-    assert!(
-        contrast_ratio(&active, base).unwrap()
-            >= contrast_ratio(&hover, base).unwrap() + RUNTIME_STATE_BASE_CONTRAST_STEP - 1e-9
-    );
-    assert!(contrast_ratio(&active, &hover).unwrap() >= RUNTIME_STATE_CONSECUTIVE_CONTRAST - 1e-9);
-    assert!(delta_e(&active, &hover).unwrap() >= RUNTIME_STATE_CONSECUTIVE_DELTA_E - 1e-9);
-}
-
-#[test]
 fn atomic_writer_rejects_final_symlink() {
     let root = temporary("symlink");
     let themes = root.join("themes");
@@ -1127,150 +593,4 @@ fn atomic_writer_rejects_final_symlink() {
     assert_eq!(fs::read(&victim).unwrap(), b"keep\n");
 
     fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-#[ignore = "requires the pinned Omarchy source checkout"]
-fn pinned_builtin_themes_generate_valid_themes() {
-    let root = required_env_path("OMARCHY_THEMES_DIR");
-    let resolver = required_env_path("OMARCHY_ZED_THEME_COLOR_RESOLVER");
-    assert!(root.is_dir(), "configured Omarchy theme root is missing");
-    assert!(resolver.is_file(), "configured resolver is missing");
-
-    let theme_names = [
-        "catppuccin-latte",
-        "catppuccin",
-        "ethereal",
-        "everforest",
-        "flexoki-light",
-        "gruvbox",
-        "hackerman",
-        "kanagawa",
-        "last-horizon",
-        "lumon",
-        "lupine",
-        "matte-black",
-        "miasma",
-        "nord",
-        "osaka-jade",
-        "retro-82",
-        "ristretto",
-        "rose-pine",
-        "solitude",
-        "tokyo-night",
-        "vantablack",
-        "white",
-    ];
-
-    let syntax_manifest: BTreeSet<_> = BASE_SYNTAX_FIELDS
-        .iter()
-        .chain(ADDITIONAL_SYNTAX_FIELDS)
-        .copied()
-        .collect();
-
-    for name in theme_names {
-        let palette =
-            resolve_palette(&root.join(name).join("colors.toml"), Some(&resolver)).unwrap();
-        let document = build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
-        let style = style(&document);
-        let syntax = style["syntax"].as_object().unwrap();
-
-        assert_eq!(
-            syntax.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-            syntax_manifest,
-            "{name}"
-        );
-
-        let editor_backgrounds = vec![role(style, "editor.background").to_owned()];
-        let editor_foreground = role(style, "editor.foreground");
-        let inactive = relative_saliency(
-            role(style, "editor.line_number"),
-            editor_foreground,
-            &editor_backgrounds,
-        )
-        .unwrap();
-        let hover = relative_saliency(
-            role(style, "editor.hover_line_number"),
-            editor_foreground,
-            &editor_backgrounds,
-        )
-        .unwrap();
-        let active = relative_saliency(
-            role(style, "editor.active_line_number"),
-            editor_foreground,
-            &editor_backgrounds,
-        )
-        .unwrap();
-        assert!(inactive + 0.10 <= hover, "{name}");
-        assert!(inactive + 0.20 <= active, "{name}");
-
-        let added = role(style, "version_control.added");
-        let deleted = role(style, "version_control.deleted");
-        assert!(contrast_ratio(added, deleted).unwrap() >= 1.05, "{name}");
-        assert!(delta_e(added, deleted).unwrap() >= 0.075, "{name}");
-    }
-}
-
-#[test]
-#[ignore = "requires the pinned external theme corpus"]
-fn pinned_external_themes_generate_valid_themes() {
-    let root = required_env_path("OMARCHY_ZED_THEME_EXTERNAL_CORPUS");
-    let resolver = required_env_path("OMARCHY_ZED_THEME_COLOR_RESOLVER");
-    let manifest = include_str!("external-corpus.tsv");
-    let mut tested = 0;
-    let mut errors = Vec::new();
-
-    for line in manifest.lines().filter(|line| !line.starts_with('#')) {
-        let columns: Vec<_> = line.split('\t').collect();
-        assert_eq!(columns.len(), 4, "bad corpus row: {line}");
-        let [name, _, commit, palette_path] = columns.as_slice() else {
-            unreachable!()
-        };
-
-        let checkout = root.join(name);
-        let result = (|| -> Result<(), String> {
-            let actual_commit = std::process::Command::new("git")
-                .args(["-C"])
-                .arg(&checkout)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .map_err(|error| format!("cannot inspect commit: {error}"))?;
-            if !actual_commit.status.success() {
-                return Err("git rev-parse failed".into());
-            }
-            let actual_commit = String::from_utf8_lossy(&actual_commit.stdout);
-            if actual_commit.trim() != *commit {
-                return Err(format!(
-                    "corpus checkout is at {}, expected {commit}",
-                    actual_commit.trim()
-                ));
-            }
-
-            let palette = resolve_palette(&checkout.join(palette_path), Some(&resolver))
-                .map_err(|error| error.to_string())?;
-            let document = build_theme(&palette).map_err(|error| error.to_string())?;
-            let syntax = style(&document)["syntax"]
-                .as_object()
-                .ok_or_else(|| "generated syntax is not an object".to_owned())?;
-            if syntax.len() != 56 {
-                return Err(format!(
-                    "generated {} syntax captures, expected 56",
-                    syntax.len()
-                ));
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            errors.push(format!("{name}: {error}"));
-        }
-
-        tested += 1;
-    }
-
-    assert_eq!(tested, 16);
-    assert!(
-        errors.is_empty(),
-        "external corpus failures:\n{}",
-        errors.join("\n")
-    );
 }

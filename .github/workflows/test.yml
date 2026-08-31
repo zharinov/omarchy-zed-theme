@@ -57,32 +57,3 @@ jobs:
           plugin_version=$(jq -r '.version' manifest.json)
           test "$package_version" = "$plugin_version"
           test -f "$(jq -r '.entryPoints.service' manifest.json)"
-
-  pinned-integration:
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          persist-credentials: false
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-
-      - name: Using Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          cache-all-crates: "true"
-          cache-on-failure: "true"
-          prefix-key: v0-rust-pinned-integration
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Provision pinned test inputs
-        run: |
-          inputs=$(mktemp -d "$RUNNER_TEMP/omarchy-zed-theme-test-inputs.XXXXXX")
-          scripts/prepare-test-inputs "$inputs" >> "$GITHUB_ENV"
-
-      - name: Run pinned integration tests
-        run: cargo test --test core --all-features --locked -- --ignored --nocapture

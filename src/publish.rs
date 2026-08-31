@@ -209,11 +209,7 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
-fn generation_cache_key(
-    binary_hash: [u8; 32],
-    palette: &ResolvedPalette,
-    appearance_assertion: Option<&str>,
-) -> String {
+fn generation_cache_key(binary_hash: [u8; 32], palette: &ResolvedPalette) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"omarchy-zed-theme-cache-v1");
     hash_field(&mut hasher, &binary_hash);
@@ -235,13 +231,6 @@ fn generation_cache_key(
         }]);
     }
 
-    match appearance_assertion {
-        Some(appearance) => {
-            hasher.update([1]);
-            hash_field(&mut hasher, appearance.as_bytes());
-        }
-        None => hasher.update([0]),
-    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -279,7 +268,6 @@ pub fn generate_and_publish(
     colors_file: &Path,
     output_directory: Option<&Path>,
     resolver: Option<&Path>,
-    appearance_assertion: Option<&str>,
 ) -> Result<ThemeUpdate> {
     let destination =
         output_directory.unwrap_or_else(|| colors_file.parent().unwrap_or_else(|| Path::new(".")));
@@ -323,16 +311,7 @@ pub fn generate_and_publish(
             continue;
         }
 
-        if appearance_assertion.is_some_and(|appearance| appearance != palette.mode) {
-            return Err(Error(format!(
-                "appearance assertion {:?} disagrees with resolved mode {:?}",
-                appearance_assertion.unwrap(),
-                palette.mode
-            )));
-        }
-
-        let cache_key =
-            generation_cache_key(running_binary_hash()?, &palette, appearance_assertion);
+        let cache_key = generation_cache_key(running_binary_hash()?, &palette);
 
         if cache_matches(&cache_path, &target, &cache_key)? {
             if source_identity(colors_file)? != after_resolve {
@@ -466,26 +445,22 @@ mod tests {
             provenance: [("background".into(), Provenance::Direct)].into(),
         };
         let binary = [1; 32];
-        let original = generation_cache_key(binary, &palette, None);
+        let original = generation_cache_key(binary, &palette);
 
-        assert_ne!(original, generation_cache_key([2; 32], &palette, None));
-        assert_ne!(
-            original,
-            generation_cache_key(binary, &palette, Some("dark"))
-        );
+        assert_ne!(original, generation_cache_key([2; 32], &palette));
 
         let mut changed = palette.clone();
         changed.mode = "light".into();
-        assert_ne!(original, generation_cache_key(binary, &changed, None));
+        assert_ne!(original, generation_cache_key(binary, &changed));
 
         let mut changed = palette.clone();
         changed.colors.insert("background".into(), "#202020".into());
-        assert_ne!(original, generation_cache_key(binary, &changed, None));
+        assert_ne!(original, generation_cache_key(binary, &changed));
 
         let mut changed = palette.clone();
         changed
             .provenance
             .insert("background".into(), Provenance::Derived);
-        assert_ne!(original, generation_cache_key(binary, &changed, None));
+        assert_ne!(original, generation_cache_key(binary, &changed));
     }
 }

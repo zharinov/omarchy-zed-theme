@@ -73,13 +73,6 @@ impl SemanticRole {
         }
     }
 
-    pub fn saliency(self) -> f64 {
-        match self {
-            Self::Base | Self::DiffChange | Self::DiffAdd | Self::DiffDelete => 1.0,
-            _ => self.tone_band().saliency(),
-        }
-    }
-
     pub fn tone_band(self) -> ToneBand {
         match self {
             Self::Base
@@ -112,7 +105,6 @@ pub const MAX_SEMANTIC_BUDGET: usize = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Family {
-    pub name: &'static str,
     pub anchor: SemanticRole,
     pub source_preference: SemanticRole,
     pub roles: Vec<SemanticRole>,
@@ -123,7 +115,6 @@ pub struct Family {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MergePlan {
-    pub budget: usize,
     pub families: Vec<Family>,
 }
 
@@ -131,7 +122,6 @@ impl MergePlan {
     pub fn hierarchy(hue_budget: usize) -> Self {
         let hue_budget = hue_budget.clamp(1, 3);
         let mut families = vec![Family {
-            name: "data",
             anchor: SemanticRole::String,
             source_preference: SemanticRole::String,
             roles: vec![SemanticRole::String],
@@ -142,7 +132,6 @@ impl MergePlan {
         let symbol = (hue_budget >= 2).then(|| {
             let index = families.len();
             families.push(Family {
-                name: "symbol",
                 anchor: SemanticRole::Type,
                 source_preference: SemanticRole::Callable,
                 roles: vec![SemanticRole::Type],
@@ -154,7 +143,6 @@ impl MergePlan {
         });
         if hue_budget >= 3 {
             families.push(Family {
-                name: "control",
                 anchor: SemanticRole::Control,
                 source_preference: SemanticRole::Control,
                 roles: vec![SemanticRole::Control],
@@ -164,7 +152,6 @@ impl MergePlan {
             });
         }
         families.push(Family {
-            name: "value",
             anchor: SemanticRole::Value,
             source_preference: SemanticRole::Value,
             roles: vec![SemanticRole::Value],
@@ -175,7 +162,6 @@ impl MergePlan {
         if let Some(symbol) = symbol {
             let runtime = families.len();
             families.push(Family {
-                name: "runtime_symbol",
                 anchor: SemanticRole::Callable,
                 source_preference: SemanticRole::Callable,
                 roles: vec![SemanticRole::Callable],
@@ -184,7 +170,6 @@ impl MergePlan {
                 parent_saliency_delta: 0.12,
             });
             families.push(Family {
-                name: "member",
                 anchor: SemanticRole::Member,
                 source_preference: SemanticRole::Member,
                 roles: vec![SemanticRole::Member],
@@ -193,10 +178,7 @@ impl MergePlan {
                 parent_saliency_delta: 0.10,
             });
         }
-        Self {
-            budget: families.len(),
-            families,
-        }
+        Self { families }
     }
 
     pub fn activate(&self, active: &BTreeSet<usize>) -> Self {
@@ -228,31 +210,22 @@ impl MergePlan {
                 family.parent = family.parent.and_then(|parent| remap.get(&parent).copied());
                 match family.anchor {
                     SemanticRole::String if !value_active => {
-                        family.name = "data";
                         family.roles.push(SemanticRole::Value);
                     }
-                    SemanticRole::String => family.name = "string",
                     SemanticRole::Type if !callable_active => {
-                        family.name = "symbol";
                         family
                             .roles
                             .extend([SemanticRole::Callable, SemanticRole::Member]);
                     }
-                    SemanticRole::Type => family.name = "type",
                     SemanticRole::Callable if !member_active => {
-                        family.name = "runtime_symbol";
                         family.roles.push(SemanticRole::Member);
                     }
-                    SemanticRole::Callable => family.name = "callable",
                     _ => {}
                 }
                 family
             })
             .collect::<Vec<_>>();
-        Self {
-            budget: families.len(),
-            families,
-        }
+        Self { families }
     }
 
     pub fn with_budget(budget: usize) -> Self {
@@ -330,31 +303,6 @@ mod tests {
         assert_eq!(plan.family_for(SemanticRole::Callable), Some(1));
         assert_eq!(plan.family_for(SemanticRole::Type), Some(1));
         assert_eq!(plan.family_for(SemanticRole::Member), Some(1));
-    }
-
-    #[test]
-    fn data_split_preserves_the_first_family_for_strings() {
-        let one = MergePlan::with_budget(1);
-        let four = MergePlan::with_budget(4);
-        assert_eq!(one.families[0].anchor, SemanticRole::String);
-        assert_eq!(four.families[0].anchor, SemanticRole::String);
-        assert!(one.families[0].roles.contains(&SemanticRole::Value));
-        assert!(!four.families[0].roles.contains(&SemanticRole::Value));
-        assert_eq!(four.families[3].roles, vec![SemanticRole::Value]);
-    }
-
-    #[test]
-    fn symbol_split_preserves_the_second_family_for_types() {
-        let two = MergePlan::with_budget(2);
-        let five = MergePlan::with_budget(5);
-        assert_eq!(two.families[1].anchor, SemanticRole::Type);
-        assert_eq!(five.families[1].anchor, SemanticRole::Type);
-        assert!(two.families[1].roles.contains(&SemanticRole::Callable));
-        assert!(!five.families[1].roles.contains(&SemanticRole::Callable));
-        assert_eq!(
-            five.families[4].roles,
-            vec![SemanticRole::Callable, SemanticRole::Member]
-        );
     }
 
     #[test]

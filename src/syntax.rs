@@ -64,7 +64,6 @@ struct FamilyAllocation {
 struct SemanticPlan {
     plan: MergePlan,
     allocations: Vec<FamilyAllocation>,
-    role_families: BTreeMap<SemanticRole, Option<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -186,10 +185,6 @@ fn fit_tone(search: &mut Search, request: ToneFitRequest<'_>) -> Result<Saliency
     let actual_saliency = actual_contrast.ln() / reference_contrast.ln().max(1e-12);
     Ok(SaliencyFit {
         output,
-        reference_contrast,
-        preferred_contrast,
-        actual_contrast,
-        preferred_saliency,
         actual_saliency,
     })
 }
@@ -520,16 +515,7 @@ fn select_semantic_plan(
         let family = &plan.families[family];
         allocation.roles = family.roles.clone();
     }
-    let role_families = plan::ORDINARY_ROLES
-        .iter()
-        .copied()
-        .map(|role| (role, plan.family_for(role)))
-        .collect();
-    Ok(SemanticPlan {
-        plan,
-        allocations,
-        role_families,
-    })
+    Ok(SemanticPlan { plan, allocations })
 }
 
 fn build_tone_allocations(
@@ -768,7 +754,6 @@ pub fn build_syntax(
         let SemanticPlan {
             plan: semantic_plan,
             allocations,
-            role_families,
         } = select_semantic_plan(
             search,
             preference_contexts,
@@ -788,7 +773,7 @@ pub fn build_syntax(
             }
         }
         for role in plan::ORDINARY_ROLES {
-            if role_families[&role].is_none() {
+            if semantic_plan.family_for(role).is_none() {
                 let fallback = semantic_plan.fallback_for(role);
                 role_colors.insert(role, role_colors[&fallback].clone());
             }

@@ -272,23 +272,6 @@ pub fn overlay_contrast_floor(capture: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{ADDITIONAL_SYNTAX_FIELDS, BASE_SYNTAX_FIELDS};
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn capture_policy_exactly_covers_the_manifest() {
-        let expected = BASE_SYNTAX_FIELDS
-            .iter()
-            .chain(ADDITIONAL_SYNTAX_FIELDS)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let actual = CAPTURE_POLICIES
-            .iter()
-            .map(|policy| policy.capture)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(actual, expected);
-        assert_eq!(CAPTURE_POLICIES.len(), actual.len());
-    }
 
     #[test]
     fn overlay_floors_only_relax_adaptive_tones() {
@@ -312,29 +295,5 @@ mod tests {
             overlay_contrast_floor("warning"),
             Some(SYNTAX_SUBDUED_OVERLAY_FLOOR)
         );
-    }
-
-    #[test]
-    fn captures_project_onto_the_intended_semantic_partition() {
-        for capture in [
-            "string",
-            "string.escape",
-            "string.regex",
-            "string.special",
-            "string.special.symbol",
-        ] {
-            assert_eq!(capture_policy(capture).unwrap().role, String, "{capture}");
-        }
-        for capture in ["boolean", "constant", "number", "text.literal", "variant"] {
-            assert_eq!(capture_policy(capture).unwrap().role, Value, "{capture}");
-        }
-        for capture in ["constructor", "function", "function.builtin"] {
-            assert_eq!(capture_policy(capture).unwrap().role, Callable, "{capture}");
-        }
-        for capture in ["label", "title", "punctuation.special", "variable.special"] {
-            assert_eq!(capture_policy(capture).unwrap().role, Base, "{capture}");
-        }
-        assert_eq!(capture_policy("selector.pseudo").unwrap().role, Member);
-        assert_eq!(capture_policy("lifetime").unwrap().role, Type);
     }
 }

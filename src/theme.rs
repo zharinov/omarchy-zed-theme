@@ -2038,10 +2038,9 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         .get("syntax")
         .and_then(Value::as_object)
         .ok_or_else(|| Error("style.syntax is not an object".into()))?;
-    let expected_syntax: BTreeSet<_> = BASE_SYNTAX_FIELDS
+    let expected_syntax: BTreeSet<_> = crate::syntax::policy::CAPTURE_POLICIES
         .iter()
-        .chain(ADDITIONAL_SYNTAX_FIELDS)
-        .copied()
+        .map(|policy| policy.capture)
         .collect();
     let actual_syntax: BTreeSet<_> = syntax.keys().map(String::as_str).collect();
     if actual_syntax != expected_syntax {

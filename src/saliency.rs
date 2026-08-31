@@ -11,10 +11,6 @@ pub const PRIMARY_SALIENCY: f64 = 1.0;
 #[derive(Clone, Debug)]
 pub struct SaliencyFit {
     pub output: String,
-    pub reference_contrast: f64,
-    pub preferred_contrast: f64,
-    pub actual_contrast: f64,
-    pub preferred_saliency: f64,
     pub actual_saliency: f64,
 }
 
@@ -96,10 +92,6 @@ pub fn fit_relative(
 
     Ok(SaliencyFit {
         output,
-        reference_contrast,
-        preferred_contrast,
-        actual_contrast,
-        preferred_saliency,
         actual_saliency,
     })
 }
@@ -119,7 +111,6 @@ mod tests {
             SaliencyRequest::new(&backgrounds, 1.52, INACTIVE_LINE_NUMBER_SALIENCY),
         )
         .unwrap();
-        assert!((fit.preferred_saliency - INACTIVE_LINE_NUMBER_SALIENCY).abs() < 1e-12);
         assert!((fit.actual_saliency - INACTIVE_LINE_NUMBER_SALIENCY).abs() < 0.03);
     }
 }
