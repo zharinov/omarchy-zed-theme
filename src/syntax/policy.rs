@@ -42,7 +42,7 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "constructor",
-        role: Declaration,
+        role: Callable,
     },
     CapturePolicy {
         capture: "diff.minus",
@@ -70,11 +70,11 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "function",
-        role: Declaration,
+        role: Callable,
     },
     CapturePolicy {
         capture: "function.builtin",
-        role: Declaration,
+        role: Callable,
     },
     CapturePolicy {
         capture: "hint",
@@ -86,7 +86,7 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "label",
-        role: Declaration,
+        role: Base,
     },
     CapturePolicy {
         capture: "link_text",
@@ -146,7 +146,7 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "punctuation.special",
-        role: Special,
+        role: Base,
     },
     CapturePolicy {
         capture: "selector",
@@ -154,7 +154,7 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "selector.pseudo",
-        role: Special,
+        role: Member,
     },
     CapturePolicy {
         capture: "string",
@@ -162,7 +162,7 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "string.escape",
-        role: Special,
+        role: String,
     },
     CapturePolicy {
         capture: "string.regex",
@@ -170,11 +170,11 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "string.special",
-        role: Special,
+        role: String,
     },
     CapturePolicy {
         capture: "string.special.symbol",
-        role: Special,
+        role: String,
     },
     CapturePolicy {
         capture: "tag",
@@ -186,7 +186,7 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "title",
-        role: Declaration,
+        role: Base,
     },
     CapturePolicy {
         capture: "type",
@@ -202,7 +202,7 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "variable.special",
-        role: Special,
+        role: Base,
     },
     CapturePolicy {
         capture: "variant",
@@ -218,7 +218,7 @@ pub const CAPTURE_POLICIES: [CapturePolicy; 56] = [
     },
     CapturePolicy {
         capture: "lifetime",
-        role: Special,
+        role: Type,
     },
     CapturePolicy {
         capture: "markup",
@@ -312,5 +312,29 @@ mod tests {
             overlay_contrast_floor("warning"),
             Some(SYNTAX_SUBDUED_OVERLAY_FLOOR)
         );
+    }
+
+    #[test]
+    fn captures_project_onto_the_intended_semantic_partition() {
+        for capture in [
+            "string",
+            "string.escape",
+            "string.regex",
+            "string.special",
+            "string.special.symbol",
+        ] {
+            assert_eq!(capture_policy(capture).unwrap().role, String, "{capture}");
+        }
+        for capture in ["boolean", "constant", "number", "text.literal", "variant"] {
+            assert_eq!(capture_policy(capture).unwrap().role, Value, "{capture}");
+        }
+        for capture in ["constructor", "function", "function.builtin"] {
+            assert_eq!(capture_policy(capture).unwrap().role, Callable, "{capture}");
+        }
+        for capture in ["label", "title", "punctuation.special", "variable.special"] {
+            assert_eq!(capture_policy(capture).unwrap().role, Base, "{capture}");
+        }
+        assert_eq!(capture_policy("selector.pseudo").unwrap().role, Member);
+        assert_eq!(capture_policy("lifetime").unwrap().role, Type);
     }
 }

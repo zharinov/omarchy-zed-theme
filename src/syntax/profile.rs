@@ -1,8 +1,8 @@
 //! Measures the authored Omarchy palette's syntax character.
 //!
 //! Breadth and intensity are independent continuous signals. Provenance decides
-//! which colors are evidence, and the hue strategy only admits authored hues with
-//! enough measured support.
+//! which colors are evidence; normal and bright authored slots participate in the
+//! same perceptual budget.
 
 use crate::Result;
 use crate::color::{lab, oklab_to_oklch};
@@ -17,12 +17,25 @@ const HUE_CLUSTER_LIMIT: f64 = 35.0 * PI / 180.0;
 const HUE_SIMILARITY_FULL: f64 = 25.0 * PI / 180.0;
 const HUE_SIMILARITY_ZERO: f64 = 45.0 * PI / 180.0;
 const ALLOCATION_CHROMA_FLOOR: f64 = 0.005;
-const AUTHORED_HUE_MINIMUM_INTENSITY: f64 = 0.10;
 const NEUTRAL_MEDIAN_CHROMA: f64 = 0.035;
 const NEUTRAL_MAXIMUM_CHROMA: f64 = 0.055;
 
-const EVIDENCE_KEYS: [&str; 8] = [
-    "green", "blue", "magenta", "yellow", "red", "cyan", "orange", "accent",
+const EVIDENCE_KEYS: [&str; 15] = [
+    "green",
+    "blue",
+    "magenta",
+    "yellow",
+    "red",
+    "cyan",
+    "orange",
+    "accent",
+    "brown",
+    "bright_green",
+    "bright_blue",
+    "bright_magenta",
+    "bright_yellow",
+    "bright_red",
+    "bright_cyan",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,11 +289,9 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
     let ordinary_maximum = (NEUTRAL_MAXIMUM_CHROMA
         + envelope_support * (native_maximum - NEUTRAL_MAXIMUM_CHROMA))
         .max(target_median);
-    let hue_strategy = if effective_hue_families <= 1e-12
-        || authored_intensity < AUTHORED_HUE_MINIMUM_INTENSITY - 1e-12
-    {
+    let hue_strategy = if evidence.is_empty() {
         HueStrategy::Neutral
-    } else if effective_hue_families < 2.5 || clusters.len() < 3 {
+    } else if clusters.len() == 1 {
         HueStrategy::AccentLed
     } else {
         HueStrategy::PaletteNative
@@ -288,9 +299,7 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
     let requested_hue_family_count = match hue_strategy {
         HueStrategy::Neutral => 0,
         HueStrategy::AccentLed => 1,
-        HueStrategy::PaletteNative => (effective_hue_families.round() as usize)
-            .clamp(3, 8)
-            .min(clusters.len()),
+        HueStrategy::PaletteNative => clusters.len(),
     };
     Ok(SyntaxProfile {
         authored_breadth,
@@ -344,7 +353,6 @@ impl SyntaxProfile {
         json!({
             "thresholds": {
                 "chroma_evidence": CHROMA_EVIDENCE,
-                "authored_hue_minimum_intensity": AUTHORED_HUE_MINIMUM_INTENSITY,
                 "complete_link_hue_degrees": 35.0,
                 "continuous_hue_similarity_full_degrees": 25.0,
                 "continuous_hue_similarity_zero_degrees": 45.0,
@@ -501,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn hue_strategy_requires_supported_authored_color() {
+    fn every_perceptible_authored_color_contributes_to_the_budget() {
         let neutral = measure(&palette(&[])).unwrap();
         assert_eq!(neutral.hue_strategy, HueStrategy::Neutral);
         assert_eq!(neutral.requested_hue_family_count, 0);
@@ -514,9 +522,9 @@ mod tests {
         )]))
         .unwrap();
         assert!(!weak.evidence.is_empty());
-        assert!(weak.authored_intensity < AUTHORED_HUE_MINIMUM_INTENSITY);
-        assert_eq!(weak.hue_strategy, HueStrategy::Neutral);
-        assert_eq!(weak.requested_hue_family_count, 0);
+        assert!(weak.authored_intensity < 0.10);
+        assert_eq!(weak.hue_strategy, HueStrategy::AccentLed);
+        assert_eq!(weak.requested_hue_family_count, 1);
 
         let accent = measure(&palette(&[("accent", 0.14, 0.2, Provenance::Direct)])).unwrap();
         assert_eq!(accent.hue_strategy, HueStrategy::AccentLed);
@@ -524,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_native_hue_budget_never_exceeds_evidenced_clusters() {
+    fn hue_strategy_has_no_three_cluster_gate() {
         let native = measure(&palette(&[
             ("red", 0.12, 0.2, Provenance::Direct),
             ("green", 0.12, 2.1, Provenance::Direct),
@@ -535,6 +543,18 @@ mod tests {
         assert_eq!(native.requested_hue_family_count, 3);
         assert_eq!(native.requested_hue_family_count, native.clusters.len());
 
+        let dominant_cluster = measure(&palette(&[
+            ("red", 0.18, 0.1, Provenance::Direct),
+            ("orange", 0.18, 0.2, Provenance::Direct),
+            ("green", 0.03, 2.1, Provenance::Direct),
+            ("blue", 0.03, 4.0, Provenance::Direct),
+        ]))
+        .unwrap();
+        assert!(dominant_cluster.effective_hue_families < 2.5);
+        assert_eq!(dominant_cluster.clusters.len(), 3);
+        assert_eq!(dominant_cluster.hue_strategy, HueStrategy::PaletteNative);
+        assert_eq!(dominant_cluster.requested_hue_family_count, 3);
+
         let two_clusters = measure(&palette(&[
             ("red", 0.12, 0.0, Provenance::Direct),
             ("orange", 0.12, 34.0 * PI / 180.0, Provenance::Direct),
@@ -543,8 +563,8 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(two_clusters.clusters.len(), 2);
-        assert_eq!(two_clusters.hue_strategy, HueStrategy::AccentLed);
-        assert_eq!(two_clusters.requested_hue_family_count, 1);
+        assert_eq!(two_clusters.hue_strategy, HueStrategy::PaletteNative);
+        assert_eq!(two_clusters.requested_hue_family_count, 2);
     }
 
     #[test]

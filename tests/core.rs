@@ -104,6 +104,59 @@ fn synthetic_palette() -> ResolvedPalette {
     }
 }
 
+fn narrow_multicluster_palette() -> ResolvedPalette {
+    let mut palette = synthetic_palette();
+    for (key, value) in [
+        ("background", "#0B0C16"),
+        ("color0", "#0B0C16"),
+        ("dark_background", "#080910"),
+        ("darker_background", "#06060c"),
+        ("color8", "#06060c"),
+        ("lighter_background", "#151828"),
+        ("foreground", "#ddf7ff"),
+        ("color7", "#ddf7ff"),
+        ("dark_foreground", "#6a6e95"),
+        ("light_foreground", "#b5c5db"),
+        ("bright_foreground", "#ddf7ff"),
+        ("color15", "#ddf7ff"),
+        ("accent", "#82FB9C"),
+        ("selection", "#1f253a"),
+        ("selection_background", "#1f253a"),
+        ("selection_foreground", "#ddf7ff"),
+        ("muted", "#2d3450"),
+        ("cursor", "#82FB9C"),
+        ("red", "#50f872"),
+        ("color1", "#50f872"),
+        ("yellow", "#50f7d4"),
+        ("color3", "#50f7d4"),
+        ("orange", "#50f7a3"),
+        ("green", "#4fe88f"),
+        ("color2", "#4fe88f"),
+        ("cyan", "#7cf8f7"),
+        ("color6", "#7cf8f7"),
+        ("blue", "#829dd4"),
+        ("color4", "#829dd4"),
+        ("magenta", "#86a7df"),
+        ("color5", "#86a7df"),
+        ("brown", "#287b51"),
+        ("bright_red", "#85ff9d"),
+        ("color9", "#85ff9d"),
+        ("bright_yellow", "#a4ffec"),
+        ("color11", "#a4ffec"),
+        ("bright_green", "#9cf7c2"),
+        ("color10", "#9cf7c2"),
+        ("bright_cyan", "#d1fffe"),
+        ("color14", "#d1fffe"),
+        ("bright_blue", "#c4d2ed"),
+        ("color12", "#c4d2ed"),
+        ("bright_magenta", "#cddbf4"),
+        ("color13", "#cddbf4"),
+    ] {
+        palette.colors.insert(key.into(), value.into());
+    }
+    palette
+}
+
 fn venice_like_palette() -> ResolvedPalette {
     let mut palette = synthetic_palette();
     palette.mode = "light".into();
@@ -364,132 +417,131 @@ fn representative_palettes_generate_valid_themes() {
 }
 
 #[test]
-fn minimal_profiles_use_one_hue_budget_and_three_tones() {
+fn neutral_profile_spends_one_perceptual_slot_on_data() {
     let fixtures: Value =
         serde_json::from_str(include_str!("fixtures/resolved-palettes.json")).unwrap();
-    for (name, strategy, hue_count, seed_kind) in [
-        ("white", "neutral", 0_u64, "shared_editor_hue"),
-        ("matte-black", "accent_led", 1_u64, "authored_hue"),
-    ] {
-        let fixture = fixtures["palettes"]
+    let (name, strategy, hue_count, seed_kind) = ("white", "neutral", 0_u64, "shared_editor_hue");
+    let fixture = fixtures["palettes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fixture| fixture["name"] == name)
+        .unwrap();
+    let (_, palette) = parse_palette_fixture(fixture);
+    let (document, audit) = build_theme(&palette).unwrap();
+    let profile = &audit.syntax_analysis["profile"];
+    let hue_plan = &audit.syntax_analysis["hue_plan"];
+    assert_eq!(profile["hue_strategy"].as_str(), Some(strategy), "{name}");
+    assert_eq!(
+        profile["requested_hue_family_count"].as_u64(),
+        Some(hue_count),
+        "{name}"
+    );
+    assert_eq!(
+        hue_plan["effective_hue_family_count"].as_u64(),
+        Some(hue_count),
+        "{name}"
+    );
+    assert_eq!(
+        hue_plan["effective_semantic_family_count"].as_u64(),
+        Some(1),
+        "{name}"
+    );
+
+    let allocations = audit.syntax_analysis["saliency"]["allocations"]
+        .as_array()
+        .unwrap();
+    assert_eq!(allocations.len(), 1, "{name}");
+    assert_eq!(
+        allocations
+            .iter()
+            .map(|allocation| allocation["tone_band"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["secondary"],
+        "{name}"
+    );
+    assert_eq!(
+        allocations
+            .iter()
+            .map(|allocation| allocation["default_saliency_preference"].as_f64().unwrap())
+            .collect::<Vec<_>>(),
+        [0.78],
+        "{name}"
+    );
+    assert!(
+        allocations
+            .iter()
+            .all(|allocation| allocation["seed_kind"] == seed_kind),
+        "{name}"
+    );
+    assert_eq!(
+        allocations
+            .iter()
+            .map(|allocation| allocation["seed"].as_str().unwrap())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "{name}"
+    );
+    if strategy == "neutral" {
+        assert!(
+            allocations.iter().all(|allocation| {
+                allocation["output_chroma"].as_f64().unwrap() <= 0.005 + 1e-9
+            }),
+            "{name} introduced a chromatic neutral tone"
+        );
+    } else {
+        let seed_hue = oklab_to_oklch(lab(allocations[0]["seed"].as_str().unwrap()).unwrap())[2];
+        assert!(
+            allocations.iter().all(|allocation| {
+                let output_hue =
+                    oklab_to_oklch(lab(allocation["output"].as_str().unwrap()).unwrap())[2];
+                let difference = (seed_hue - output_hue).abs();
+                difference.min(std::f64::consts::TAU - difference) <= 0.03
+            }),
+            "{name} left its one evidenced hue family"
+        );
+    }
+    assert!(
+        allocations.windows(2).all(|pair| {
+            pair[0]["measured_saliency"].as_f64().unwrap()
+                >= pair[1]["measured_saliency"].as_f64().unwrap() + 0.08 - 1e-6
+        }),
+        "{name}"
+    );
+    assert_eq!(
+        audit.syntax_analysis["saliency"]["ordinary_pair_metrics"]["colors"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|fixture| fixture["name"] == name)
-            .unwrap();
-        let (_, palette) = parse_palette_fixture(fixture);
-        let (document, audit) = build_theme(&palette).unwrap();
-        let profile = &audit.syntax_analysis["profile"];
-        let hue_plan = &audit.syntax_analysis["hue_plan"];
-        assert_eq!(profile["hue_strategy"].as_str(), Some(strategy), "{name}");
-        assert_eq!(
-            profile["requested_hue_family_count"].as_u64(),
-            Some(hue_count),
-            "{name}"
+            .map(|color| color.as_str().unwrap())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "{name}"
+    );
+    if name == "white" {
+        assert_ne!(
+            allocations[0]["output"],
+            style(&document)["editor.foreground"],
+            "the data family should remain distinguishable from ordinary code"
         );
-        assert_eq!(
-            hue_plan["effective_hue_family_count"].as_u64(),
-            Some(hue_count),
-            "{name}"
-        );
-        assert_eq!(hue_plan["tone_count"].as_u64(), Some(3), "{name}");
-
-        let allocations = audit.syntax_analysis["saliency"]["allocations"]
-            .as_array()
-            .unwrap();
-        assert_eq!(allocations.len(), 3, "{name}");
-        assert_eq!(
-            allocations
-                .iter()
-                .map(|allocation| allocation["tone_band"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["primary", "secondary", "subdued"],
-            "{name}"
-        );
-        assert_eq!(
-            allocations
-                .iter()
-                .map(|allocation| allocation["default_saliency_preference"].as_f64().unwrap())
-                .collect::<Vec<_>>(),
-            [1.0, 0.65, 0.40],
-            "{name}"
-        );
-        assert!(
-            allocations
-                .iter()
-                .all(|allocation| allocation["seed_kind"] == seed_kind),
-            "{name}"
-        );
-        assert_eq!(
-            allocations
-                .iter()
-                .map(|allocation| allocation["seed"].as_str().unwrap())
-                .collect::<BTreeSet<_>>()
-                .len(),
-            1,
-            "{name}"
-        );
-        if strategy == "neutral" {
-            assert!(
-                allocations.iter().all(|allocation| {
-                    allocation["output_chroma"].as_f64().unwrap() <= 0.005 + 1e-9
-                }),
-                "{name} introduced a chromatic neutral tone"
-            );
-        } else {
-            let seed_hue =
-                oklab_to_oklch(lab(allocations[0]["seed"].as_str().unwrap()).unwrap())[2];
-            assert!(
-                allocations.iter().all(|allocation| {
-                    let output_hue =
-                        oklab_to_oklch(lab(allocation["output"].as_str().unwrap()).unwrap())[2];
-                    let difference = (seed_hue - output_hue).abs();
-                    difference.min(std::f64::consts::TAU - difference) <= 0.03
-                }),
-                "{name} left its one evidenced hue family"
-            );
-        }
         assert!(
             allocations.windows(2).all(|pair| {
-                pair[0]["measured_saliency"].as_f64().unwrap()
-                    >= pair[1]["measured_saliency"].as_f64().unwrap() + 0.08 - 1e-6
-            }),
-            "{name}"
-        );
-        assert_eq!(
-            audit.syntax_analysis["saliency"]["ordinary_pair_metrics"]["colors"]
-                .as_array()
+                delta_e(
+                    pair[0]["output"].as_str().unwrap(),
+                    pair[1]["output"].as_str().unwrap(),
+                )
                 .unwrap()
-                .iter()
-                .map(|color| color.as_str().unwrap())
-                .collect::<BTreeSet<_>>()
-                .len(),
-            3,
-            "{name}"
+                    >= 0.09
+            }),
+            "white should have visibly stepped neutral tones: {allocations:?}"
         );
-        if name == "white" {
-            assert_eq!(
-                allocations[0]["output"],
-                style(&document)["editor.foreground"],
-                "the primary neutral tone should use the normal reading color"
-            );
-            assert!(
-                allocations.windows(2).all(|pair| {
-                    delta_e(
-                        pair[0]["output"].as_str().unwrap(),
-                        pair[1]["output"].as_str().unwrap(),
-                    )
-                    .unwrap()
-                        >= 0.09
-                }),
-                "white should have visibly stepped neutral tones: {allocations:?}"
-            );
-        }
     }
 }
 
 #[test]
-fn strong_two_cluster_profile_still_builds_an_accent_tone_ladder() {
+fn strong_two_cluster_profile_enters_the_semantic_budget_path() {
     let mut palette = synthetic_palette();
     for (key, value) in [
         ("green", "#ff0000"),
@@ -507,52 +559,136 @@ fn strong_two_cluster_profile_still_builds_an_accent_tone_ladder() {
     let (_, audit) = build_theme(&palette).unwrap();
     assert_eq!(
         audit.syntax_analysis["profile"]["hue_strategy"].as_str(),
-        Some("accent_led")
+        Some("palette_native")
+    );
+    assert_eq!(
+        audit.syntax_analysis["hue_plan"]["strategy"].as_str(),
+        Some("semantic_budget")
     );
     let allocations = audit.syntax_analysis["saliency"]["allocations"]
         .as_array()
         .unwrap();
-    assert_eq!(allocations.len(), 3);
-    assert!(allocations.windows(2).all(|pair| {
-        pair[0]["measured_saliency"].as_f64().unwrap()
-            >= pair[1]["measured_saliency"].as_f64().unwrap() + 0.08 - 1e-6
-    }));
+    assert!(allocations.len() >= 2);
+    assert_eq!(allocations[0]["anchor"], "string");
+    assert_eq!(allocations[1]["anchor"], "type");
 }
 
 #[test]
-fn palette_native_syntax_enforces_tone_order() {
+fn narrow_multicluster_palette_uses_a_fixed_semantic_forest() {
+    let (document, audit) = build_theme(&narrow_multicluster_palette()).unwrap();
+    let profile = &audit.syntax_analysis["profile"];
+    let hue_plan = &audit.syntax_analysis["hue_plan"];
+    assert_eq!(profile["hue_strategy"].as_str(), Some("palette_native"));
+    assert_eq!(hue_plan["strategy"].as_str(), Some("semantic_budget"));
+    assert_eq!(
+        hue_plan["profile_strategy"].as_str(),
+        Some("palette_native")
+    );
+    let allocations = audit.syntax_analysis["saliency"]["allocations"]
+        .as_array()
+        .unwrap();
+    assert!((2..=6).contains(&allocations.len()));
+    let expected = ["string", "type", "control", "value", "callable", "member"];
+    assert_eq!(
+        allocations
+            .iter()
+            .map(|allocation| allocation["anchor"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for allocation in allocations {
+        if let Some(parent) = allocation["parent"].as_u64() {
+            assert_eq!(
+                allocation["source_value"], allocations[parent as usize]["source_value"],
+                "a semantic branch acquired a hue outside its trunk"
+            );
+            assert_eq!(allocation["seed_kind"], "authored_trunk_variant");
+        } else {
+            assert_eq!(allocation["seed_kind"], "authored_semantic_trunk");
+        }
+    }
+    assert_eq!(
+        hue_plan["effective_semantic_family_count"].as_u64(),
+        Some(allocations.len() as u64)
+    );
+
+    let style = style(&document);
+    let syntax = style["syntax"].as_object().unwrap();
+    let editor_foreground = style["editor.foreground"].as_str().unwrap();
+    let editor_background = style["editor.background"].as_str().unwrap();
+    assert_eq!(
+        syntax["variable"]["color"].as_str(),
+        Some(editor_foreground)
+    );
+    assert_eq!(
+        syntax["comment"]["color"],
+        syntax["punctuation.delimiter"]["color"]
+    );
+    assert_ne!(syntax["comment"]["color"], syntax["string"]["color"]);
+
+    let visible_channels = ["variable", "function", "type", "property", "string"]
+        .map(|capture| syntax[capture]["color"].as_str().unwrap())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert!(visible_channels.len() <= allocations.len() + 1);
+    for capture in ["function", "type", "property", "string"] {
+        let color = syntax[capture]["color"].as_str().unwrap();
+        assert!(
+            contrast_ratio(color, editor_background).unwrap()
+                >= contrast_floor(capture).unwrap() - 1e-9,
+            "syntax.{capture} lost its ordinary-editor contrast floor"
+        );
+    }
+    assert_eq!(
+        audit.syntax_analysis["saliency"]["ordinary_pair_metrics"]["separation_verified"].as_bool(),
+        Some(true)
+    );
+}
+
+#[test]
+fn palette_native_syntax_preserves_branch_sources() {
     let (_, audit) = build_theme(&synthetic_palette()).unwrap();
     assert_eq!(
         audit.syntax_analysis["profile"]["hue_strategy"].as_str(),
         Some("palette_native")
     );
     assert_eq!(
-        audit.syntax_analysis["saliency"]["measured_order_verified"].as_bool(),
+        audit.syntax_analysis["saliency"]["semantic_above_subdued_verified"].as_bool(),
         Some(true)
     );
 
     let allocations = audit.syntax_analysis["saliency"]["allocations"]
         .as_array()
         .unwrap();
-    for left in allocations {
-        for right in allocations {
-            if left["saliency_preference"].as_f64().unwrap()
-                > right["saliency_preference"].as_f64().unwrap() + 1e-12
-            {
-                assert!(
-                    left["measured_saliency"].as_f64().unwrap()
-                        >= right["measured_saliency"].as_f64().unwrap() + 0.03 - 1e-6
-                );
-            }
+    for allocation in allocations {
+        if let Some(parent) = allocation["parent"].as_u64() {
+            assert_eq!(
+                allocation["source_value"],
+                allocations[parent as usize]["source_value"]
+            );
         }
     }
 }
 
 #[test]
-fn weak_authored_hue_is_not_used_as_a_syntax_seed() {
+fn a_scarce_but_perceptible_authored_hue_is_not_discarded() {
     let mut palette = synthetic_palette();
     for key in [
-        "green", "blue", "magenta", "yellow", "red", "cyan", "orange", "accent",
+        "green",
+        "blue",
+        "magenta",
+        "yellow",
+        "red",
+        "cyan",
+        "orange",
+        "accent",
+        "brown",
+        "bright_green",
+        "bright_blue",
+        "bright_magenta",
+        "bright_yellow",
+        "bright_red",
+        "bright_cyan",
     ] {
         palette.provenance.insert(key.into(), Provenance::Derived);
     }
@@ -567,14 +703,17 @@ fn weak_authored_hue_is_not_used_as_a_syntax_seed() {
     let (_, audit) = build_theme(&palette).unwrap();
     assert_eq!(
         audit.syntax_analysis["profile"]["hue_strategy"].as_str(),
-        Some("neutral")
+        Some("accent_led")
     );
     assert!(
         audit.syntax_analysis["saliency"]["allocations"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|allocation| allocation["seed_kind"] == "shared_editor_hue")
+            .all(|allocation| matches!(
+                allocation["seed_kind"].as_str(),
+                Some("authored_semantic_trunk" | "authored_trunk_variant")
+            ))
     );
 }
 
@@ -728,11 +867,10 @@ fn narrow_olive_palette_never_synthesizes_hues() {
             .iter()
             .all(|allocation| allocation["seed_kind"] != "dynamic_scaffold")
     );
-    assert!(
-        allocations
-            .iter()
-            .all(|allocation| allocation["seed_kind"] == "authored_hue")
-    );
+    assert!(allocations.iter().all(|allocation| matches!(
+        allocation["seed_kind"].as_str(),
+        Some("authored_semantic_trunk" | "authored_trunk_variant")
+    )));
 }
 
 #[test]
@@ -1170,7 +1308,7 @@ fn pinned_builtin_themes_generate_valid_themes() {
             ),
         );
         let hue_plan = &audit.syntax_analysis["hue_plan"];
-        let strategy = profile["hue_strategy"].as_str().unwrap();
+        let plan_strategy = hue_plan["strategy"].as_str().unwrap();
         let requested_hue_count = profile["requested_hue_family_count"].as_u64().unwrap();
         let effective_hue_count = hue_plan["effective_hue_family_count"].as_u64().unwrap();
         assert_eq!(
@@ -1181,19 +1319,22 @@ fn pinned_builtin_themes_generate_valid_themes() {
         let ordinary_colors = audit.syntax_analysis["saliency"]["ordinary_pair_metrics"]["colors"]
             .as_array()
             .unwrap();
-        if strategy == "palette_native" {
-            assert!(effective_hue_count <= requested_hue_count, "{name}");
-            assert!((3..=8).contains(&effective_hue_count), "{name}");
-            assert_eq!(
-                ordinary_colors.len(),
-                effective_hue_count as usize,
-                "{name}"
-            );
-        } else {
-            assert_eq!(effective_hue_count, requested_hue_count, "{name}");
-            assert_eq!(hue_plan["tone_count"].as_u64(), Some(3), "{name}");
-            assert_eq!(ordinary_colors.len(), 3, "{name}");
-        }
+        let semantic_family_count = hue_plan["effective_semantic_family_count"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(plan_strategy, "semantic_budget", "{name}");
+        assert!(effective_hue_count <= requested_hue_count, "{name}");
+        assert!((1..=6).contains(&semantic_family_count), "{name}");
+        assert_eq!(
+            ordinary_colors.len(),
+            semantic_family_count as usize,
+            "{name}"
+        );
+        assert_eq!(
+            hue_plan["semantic_merge_plan"]["nested"].as_bool(),
+            Some(true),
+            "{name}"
+        );
         assert_eq!(
             ordinary_colors
                 .iter()
@@ -1252,7 +1393,7 @@ fn pinned_builtin_themes_generate_valid_themes() {
             "{name}"
         );
         assert_eq!(
-            audit.syntax_analysis["saliency"]["measured_order_verified"].as_bool(),
+            audit.syntax_analysis["saliency"]["semantic_above_subdued_verified"].as_bool(),
             Some(true),
             "{name}"
         );
@@ -1340,7 +1481,7 @@ fn pinned_builtin_themes_generate_valid_themes() {
             syntax_manifest,
             "{name}"
         );
-        if matches!(name, "white" | "vantablack" | "solitude") {
+        if matches!(name, "white" | "vantablack") {
             assert_eq!(profile["hue_strategy"].as_str(), Some("neutral"), "{name}");
             assert_eq!(requested_hue_count, 0, "{name}");
             assert_eq!(effective_hue_count, 0, "{name}");
@@ -1359,15 +1500,76 @@ fn pinned_builtin_themes_generate_valid_themes() {
                     .all(|allocation| allocation["seed_kind"] == "shared_editor_hue"),
                 "{name} did not use the editor foreground hue"
             );
+            assert_eq!(semantic_family_count, 1, "{name}");
+            assert_eq!(syntax["string"]["color"], syntax["constant"]["color"]);
+            assert_ne!(syntax["string"]["color"].as_str(), Some(editor_foreground));
+        }
+        if name == "solitude" {
+            assert_eq!(profile["hue_strategy"].as_str(), Some("accent_led"));
+            assert!((1..=2).contains(&semantic_family_count));
             assert!(
                 audit.syntax_analysis["saliency"]["allocations"]
                     .as_array()
                     .unwrap()
-                    .windows(2)
-                    .all(|pair| pair[0]["measured_saliency"].as_f64().unwrap()
-                        >= pair[1]["measured_saliency"].as_f64().unwrap() + 0.08 - 1e-6),
-                "{name} has no three-tone saliency ladder"
+                    .iter()
+                    .all(|allocation| allocation["source_keys"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|key| key == "bright_red")),
+                "solitude discarded its authored warm accent"
             );
+            assert_ne!(syntax["string"]["color"], editor_foreground);
+            if semantic_family_count == 1 {
+                assert_eq!(syntax["constant"]["color"], syntax["string"]["color"]);
+            } else {
+                assert_ne!(syntax["constant"]["color"], syntax["string"]["color"]);
+            }
+            for capture in ["function", "type", "property", "keyword"] {
+                assert_eq!(
+                    syntax[capture]["color"].as_str(),
+                    Some(editor_foreground),
+                    "solitude colored inactive semantic category {capture}"
+                );
+            }
+            assert_eq!(
+                syntax["comment"]["color"],
+                syntax["punctuation.delimiter"]["color"]
+            );
+        }
+        if name == "hackerman" {
+            let allocations = audit.syntax_analysis["saliency"]["allocations"]
+                .as_array()
+                .unwrap();
+            let string = allocations
+                .iter()
+                .find(|allocation| allocation["name"] == "string")
+                .unwrap();
+            let symbol = allocations
+                .iter()
+                .find(|allocation| allocation["name"] == "type")
+                .unwrap();
+            assert_ne!(string["source_cluster"], symbol["source_cluster"]);
+            assert!(
+                string["source_keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|key| key == "green")
+            );
+            assert!(
+                symbol["source_keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|key| key == "blue")
+            );
+            assert!(
+                symbol["output_chroma"].as_f64().unwrap()
+                    >= symbol["preferred_chroma"].as_f64().unwrap() * 0.60 - 1e-6
+            );
+            assert_ne!(syntax["string"]["color"], syntax["type"]["color"]);
+            assert_ne!(syntax["type"]["color"], syntax["function"]["color"]);
         }
 
         assert!(
@@ -1391,7 +1593,7 @@ fn pinned_builtin_themes_generate_valid_themes() {
     let nord = &profile_summary["nord"];
     let tokyo = &profile_summary["tokyo-night"];
     let catppuccin = &profile_summary["catppuccin"];
-    assert_eq!(matte.2, "accent_led");
+    assert_eq!(matte.2, "palette_native");
     assert_eq!(nord.2, "palette_native");
     assert!(matte.0 < nord.0, "matte-black should be narrower than nord");
     assert!(
