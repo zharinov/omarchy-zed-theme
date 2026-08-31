@@ -69,13 +69,12 @@ impl Rgb24 {
         )
     }
 
-    pub(crate) fn rgba(self) -> Rgba {
-        Rgba {
-            r: f64::from((self.0 >> 16) as u8) / 255.0,
-            g: f64::from((self.0 >> 8) as u8) / 255.0,
-            b: f64::from(self.0 as u8) / 255.0,
-            a: 1.0,
-        }
+    fn from_linear([r, g, b]: [f64; 3]) -> Self {
+        Self(
+            (u32::from(linear_byte(r)) << 16)
+                | (u32::from(linear_byte(g)) << 8)
+                | u32::from(linear_byte(b)),
+        )
     }
 
     fn channel(self, shift: u32) -> u8 {
@@ -229,7 +228,7 @@ impl ColorMetrics {
     }
 
     pub(crate) fn from_rgb24(rgb: Rgb24) -> Self {
-        Self::from_rgba(rgb.rgba())
+        Self::prepare_packed(Rgba32::from_rgb_alpha(rgb, u8::MAX)).metrics()
     }
 
     pub(crate) fn blend_rgb24(base: Self, overlay: Rgb24, alpha: u8) -> PreparedColor {
@@ -301,6 +300,35 @@ fn byte(value: f64) -> u8 {
 fn linear_channel_table() -> &'static [f64; 256] {
     static TABLE: OnceLock<[f64; 256]> = OnceLock::new();
     TABLE.get_or_init(|| std::array::from_fn(|value| srgb_to_linear(value as f64 / 255.0)))
+}
+
+fn linear_byte_boundary(value: u8) -> f64 {
+    // The analytic inverse can land a few binary64 values away from the old
+    // forward-transfer boundary, so calibrate it against that exact operation.
+    let mut boundary = srgb_to_linear((f64::from(value) + 0.5) / 255.0);
+    if byte(linear_to_srgb(boundary)) <= value {
+        loop {
+            boundary = f64::from_bits(boundary.to_bits() + 1);
+            if byte(linear_to_srgb(boundary)) > value {
+                return boundary;
+            }
+        }
+    }
+
+    loop {
+        let previous = f64::from_bits(boundary.to_bits() - 1);
+        if byte(linear_to_srgb(previous)) <= value {
+            return boundary;
+        }
+        boundary = previous;
+    }
+}
+
+fn linear_byte(channel: f64) -> u8 {
+    static THRESHOLDS: OnceLock<[f64; 255]> = OnceLock::new();
+    let thresholds =
+        THRESHOLDS.get_or_init(|| std::array::from_fn(|value| linear_byte_boundary(value as u8)));
+    thresholds.partition_point(|threshold| *threshold <= channel.clamp(0.0, 1.0)) as u8
 }
 
 pub(crate) fn linear_rgb(rgba: Rgba) -> [f64; 3] {
@@ -482,6 +510,19 @@ pub(crate) fn gamut_chroma_limit_with_components(
     low
 }
 
+pub(crate) fn oklch_in_gamut_with_components(
+    lightness: f64,
+    chroma: f64,
+    hue_cos: f64,
+    hue_sin: f64,
+) -> bool {
+    in_gamut([
+        lightness.clamp(0.0, 1.0),
+        chroma.max(0.0) * hue_cos,
+        chroma.max(0.0) * hue_sin,
+    ])
+}
+
 pub fn gamut_map_oklch_with_limit(
     lightness: f64,
     chroma: f64,
@@ -508,6 +549,22 @@ pub(crate) fn gamut_map_oklch_with_components(
         ],
         1.0,
     )
+}
+
+pub(crate) fn gamut_map_oklch_rgb24_with_components(
+    lightness: f64,
+    chroma: f64,
+    hue_cos: f64,
+    hue_sin: f64,
+    chroma_limit: f64,
+) -> Rgb24 {
+    let lightness = lightness.clamp(0.0, 1.0);
+    let chroma = chroma.max(0.0).min(chroma_limit);
+    Rgb24::from_linear(oklab_to_linear_rgb([
+        lightness,
+        chroma * hue_cos,
+        chroma * hue_sin,
+    ]))
 }
 
 pub fn lab(value: &str) -> Result<[f64; 3]> {
@@ -631,6 +688,66 @@ mod tests {
                 let value = mantissa * 2.0_f64.powi(exponent);
                 let expected = value.cbrt();
                 assert!((color_cbrt(value) - expected).abs() <= 7e-9, "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn linear_byte_matches_srgb_quantization() {
+        for index in 0..=100_000 {
+            let channel = f64::from(index) / 100_000.0;
+            assert_eq!(linear_byte(channel), byte(linear_to_srgb(channel)));
+        }
+
+        let thresholds = std::array::from_fn::<_, 255, _>(|value| {
+            let mut low = 0.0_f64.to_bits();
+            let mut high = 1.0_f64.to_bits();
+            while low + 1 < high {
+                let middle = low + (high - low) / 2;
+                if byte(linear_to_srgb(f64::from_bits(middle))) <= value as u8 {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            f64::from_bits(high)
+        });
+        for threshold in thresholds {
+            for bits in threshold.to_bits() - 1..=threshold.to_bits() + 1 {
+                let channel = f64::from_bits(bits);
+                assert_eq!(linear_byte(channel), byte(linear_to_srgb(channel)));
+            }
+        }
+    }
+
+    #[test]
+    fn direct_rgb24_gamut_mapping_matches_rgba_mapping() {
+        for lightness_index in 0..=32 {
+            let lightness = f64::from(lightness_index) / 32.0;
+            for chroma_index in 0..=16 {
+                let chroma = f64::from(chroma_index) * 0.025;
+                for hue_index in 0..36 {
+                    let hue = f64::from(hue_index) * TAU / 36.0;
+                    let (hue_cos, hue_sin) = (hue.cos(), hue.sin());
+                    let limit = gamut_chroma_limit_with_components(lightness, hue_cos, hue_sin);
+                    for chroma_limit in [limit, f64::INFINITY] {
+                        let direct = gamut_map_oklch_rgb24_with_components(
+                            lightness,
+                            chroma,
+                            hue_cos,
+                            hue_sin,
+                            chroma_limit,
+                        );
+                        let rgba = Rgb24::from_rgba(gamut_map_oklch_with_components(
+                            lightness,
+                            chroma,
+                            hue_cos,
+                            hue_sin,
+                            chroma_limit,
+                        ));
+                        assert_eq!(direct, rgba, "L={lightness} C={chroma} h={hue}");
+                    }
+                }
             }
         }
     }

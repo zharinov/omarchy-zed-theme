@@ -6,7 +6,8 @@
 
 use crate::color::{
     ColorMetrics, Rgb24, Rgba, Rgba32, contrast_ratio, delta_e, endpoint_chroma_taper,
-    gamut_chroma_limit_with_components, gamut_map_oklch_with_components, lab, oklab_to_oklch,
+    gamut_chroma_limit_with_components, gamut_map_oklch_rgb24_with_components, lab, oklab_to_oklch,
+    oklch_in_gamut_with_components,
 };
 use crate::constants::*;
 use crate::theme::Audit;
@@ -15,6 +16,11 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
+
+// The widest gamut bracket is 2.0, so 32 bisections can leave less than
+// 2 / 2^32 chroma below the true boundary. This larger margin makes skipping
+// that search preserve the old lower-bound clamp.
+const GAMUT_LIMIT_SKIP_MARGIN: f64 = 1e-9;
 
 struct TransformCandidate {
     distance: f64,
@@ -638,16 +644,27 @@ impl Search {
         );
         for tone_index in 0..=CANDIDATE_LIGHTNESS_STEPS {
             let lightness = f64::from(tone_index) / f64::from(CANDIDATE_LIGHTNESS_STEPS);
-            let chroma_limit = gamut_chroma_limit_with_components(lightness, hue_cos, hue_sin);
+            let taper = endpoint_chroma_taper(lightness);
+            let maximum_chroma = chroma * taper;
+            let chroma_limit = if oklch_in_gamut_with_components(
+                lightness,
+                maximum_chroma + GAMUT_LIMIT_SKIP_MARGIN,
+                hue_cos,
+                hue_sin,
+            ) {
+                f64::INFINITY
+            } else {
+                gamut_chroma_limit_with_components(lightness, hue_cos, hue_sin)
+            };
             for chroma_index in 0..=CANDIDATE_CHROMA_STEPS {
                 let scale = 1.0 - f64::from(chroma_index) / f64::from(CANDIDATE_CHROMA_STEPS);
-                unique.push(Rgb24::from_rgba(gamut_map_oklch_with_components(
+                unique.push(gamut_map_oklch_rgb24_with_components(
                     lightness,
-                    chroma * scale * endpoint_chroma_taper(lightness),
+                    chroma * scale * taper,
                     hue_cos,
                     hue_sin,
                     chroma_limit,
-                )));
+                ));
             }
         }
         unique.sort_unstable();
@@ -662,15 +679,15 @@ impl Search {
             .into_iter()
             .map(|color| {
                 let metrics = ColorMetrics::from_rgb24(color);
-                Ok(TransformCandidate {
+                TransformCandidate {
                     distance: lab_distance(metrics.lab, source_lab),
                     retention: lab_chroma(metrics.lab) / seed_chroma.max(1e-12),
                     metrics,
-                })
+                }
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
-        table.sort_by(|left, right| {
+        table.sort_unstable_by(|left, right| {
             left.distance
                 .total_cmp(&right.distance)
                 .then_with(|| left.metrics.rgb24().cmp(&right.metrics.rgb24()))
@@ -1343,13 +1360,15 @@ impl Search {
 
         let first_table = self.transform_table(first_seed)?;
         let second_table = self.transform_table(second_seed)?;
-        let first_candidates = collect(first_seed, &first_table, &first, maximum_alpha)?;
-        let second_candidates = collect(second_seed, &second_table, &second, maximum_alpha)?;
+        let (first_candidates, second_candidates) = rayon::join(
+            || collect(first_seed, &first_table, &first, maximum_alpha),
+            || collect(second_seed, &second_table, &second, maximum_alpha),
+        );
         Ok(PreparedOverlayPair {
             first,
             second,
-            first_candidates,
-            second_candidates,
+            first_candidates: first_candidates?,
+            second_candidates: second_candidates?,
         })
     }
 

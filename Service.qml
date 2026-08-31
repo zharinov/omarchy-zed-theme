@@ -150,7 +150,7 @@ Item {
 
   Timer {
     id: syncTimer
-    interval: 100
+    interval: 10
     onTriggered: root.startSync()
   }
 
