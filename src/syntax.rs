@@ -1,9 +1,9 @@
 //! Builds deterministic syntax colors from Omarchy theme character.
 //!
-//! A fixed semantic hierarchy decides which syntax distinctions matter. The
-//! authored palette only determines how many perceptually distinct families can
-//! be expressed and which colors carry them. Contrast, diff separation, gamut,
-//! and validation remain hard constraints.
+//! A fixed semantic hierarchy decides which syntax distinctions matter. Authored
+//! hues and neutral tones decide how those domains are rendered, while missing
+//! chromatic lineages fall back to the foreground's tone family. Contrast, diff
+//! separation, gamut, and validation remain hard constraints.
 
 pub mod plan;
 pub mod policy;
@@ -14,13 +14,13 @@ use crate::color::{contrast_ratio, delta_e, gamut_map_oklch, lab, oklab_to_oklch
 use crate::constants::SYNTAX_DIFF_CONTRACT;
 use crate::palette::ResolvedPalette;
 use crate::saliency::SaliencyFit;
-use crate::search::{FitBounds, PairConstraints, Search, cvd_distance, round6};
-use plan::{MergePlan, SemanticRole, ToneBand};
+use crate::search::{FitBounds, PairConstraints, Search, cvd_distance};
+use plan::{MergePlan, SemanticRole};
 use policy::{
     CAPTURE_POLICIES, SYNTAX_ADAPTIVE_OVERLAY_FLOOR, SYNTAX_PRIMARY_FLOOR, SYNTAX_SEMANTIC_FLOOR,
     SYNTAX_SUBDUED_FLOOR, SYNTAX_SUBDUED_OVERLAY_FLOOR,
 };
-use profile::{EvidenceColor, HueStrategy, SyntaxProfile};
+use profile::{CHROMA_EVIDENCE, EvidenceColor, SyntaxProfile};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,12 +28,9 @@ pub use policy::{capture_policy, contrast_floor, overlay_contrast_floor};
 
 const ORDINARY_NORMAL_SEPARATION: f64 = 0.025;
 const ORDINARY_CVD_SEPARATION: f64 = 0.020;
-const MINIMUM_TONE_SALIENCY_GAP: f64 = 0.08;
 const MINIMUM_SEMANTIC_SALIENCY_GAP: f64 = 0.03;
 const MINIMUM_AUTHORED_CHROMA_RETENTION: f64 = 0.60;
-const MINIMUM_TRUNK_SALIENCY: f64 = 0.62;
-const MAXIMUM_TRUNK_SALIENCY: f64 = 0.95;
-const MAX_FAMILY_SOURCE_CANDIDATES: usize = 4;
+const SUBDUED_SALIENCY: f64 = 0.55;
 const SOURCE_KEY_ORDER: [&str; 15] = [
     "green",
     "blue",
@@ -52,7 +49,7 @@ const SOURCE_KEY_ORDER: [&str; 15] = [
     "bright_cyan",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct FamilyAllocation {
     family: usize,
     roles: Vec<SemanticRole>,
@@ -64,12 +61,6 @@ struct FamilyAllocation {
 struct SemanticPlan {
     plan: MergePlan,
     allocations: Vec<FamilyAllocation>,
-}
-
-#[derive(Clone, Debug)]
-struct ToneAllocation {
-    band: ToneBand,
-    fit: SaliencyFit,
 }
 
 struct ToneFitRequest<'a> {
@@ -91,15 +82,12 @@ struct FamilyFitRequest<'a> {
     family: usize,
     source: Option<usize>,
     preferred_saliency: f64,
-    inherited: bool,
 }
 
 pub struct SyntaxContexts<'a> {
     pub ordinary: &'a [String],
     pub rendered: &'a [String],
 }
-
-type DistanceMatrix = Vec<Vec<f64>>;
 
 fn minimum_contrast(color: &str, contexts: &[String]) -> Result<f64> {
     contexts.iter().try_fold(f64::INFINITY, |minimum, context| {
@@ -208,6 +196,14 @@ fn ranked_sources(profile: &SyntaxProfile, role: SemanticRole) -> Vec<usize> {
     sources
 }
 
+fn root_sources(profile: &SyntaxProfile, role: SemanticRole) -> Vec<Option<usize>> {
+    ranked_sources(profile, role)
+        .into_iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .collect()
+}
+
 fn source_cluster(profile: &SyntaxProfile, source: usize) -> Option<usize> {
     profile
         .clusters
@@ -216,25 +212,18 @@ fn source_cluster(profile: &SyntaxProfile, source: usize) -> Option<usize> {
 }
 
 fn allocate_family(search: &mut Search, request: FamilyFitRequest<'_>) -> Result<FamilyAllocation> {
-    let saliency = if let Some(source) = request.source.filter(|_| !request.inherited) {
-        let source_contrast = geometric_contrast(
-            &request.profile.evidence[source].value,
-            request.preference_contexts,
-        )?;
-        let reference_contrast =
-            geometric_contrast(request.reference, request.preference_contexts)?;
-        (source_contrast.ln() / reference_contrast.ln().max(1e-12))
-            .clamp(MINIMUM_TRUNK_SALIENCY, MAXIMUM_TRUNK_SALIENCY)
-    } else {
-        request.preferred_saliency
-    };
+    let saliency = request.preferred_saliency;
     let authored_preference = request.profile.chroma_envelope.target_median
         + (request.profile.chroma_envelope.ordinary_maximum
             - request.profile.chroma_envelope.target_median)
             * saliency.powi(2);
     let (seed, chroma_cap, chroma_floor) = if let Some(source) = request.source {
         let evidence = &request.profile.evidence[source];
-        let chroma_cap = request.profile.chroma_envelope.ordinary_maximum;
+        let chroma_cap = if evidence.chroma < CHROMA_EVIDENCE - 1e-12 {
+            evidence.chroma.max(0.005)
+        } else {
+            request.profile.chroma_envelope.ordinary_maximum
+        };
         let preferred_chroma = evidence.chroma.min(authored_preference).min(chroma_cap);
         (
             gamut_map_oklch(evidence.lightness, preferred_chroma, evidence.hue).opaque_hex(),
@@ -282,36 +271,6 @@ fn allocate_family(search: &mut Search, request: FamilyFitRequest<'_>) -> Result
     })
 }
 
-fn pair_matrices(colors: &[String]) -> Result<(DistanceMatrix, DistanceMatrix)> {
-    let mut normal = vec![vec![0.0; colors.len()]; colors.len()];
-    let mut cvd = normal.clone();
-    for left in 0..colors.len() {
-        for right in left + 1..colors.len() {
-            normal[left][right] = delta_e(&colors[left], &colors[right])?;
-            normal[right][left] = normal[left][right];
-            cvd[left][right] = cvd_distance(&colors[left], &colors[right])?;
-            cvd[right][left] = cvd[left][right];
-        }
-    }
-    Ok((normal, cvd))
-}
-
-fn rounded_matrix(matrix: &[Vec<f64>]) -> DistanceMatrix {
-    matrix
-        .iter()
-        .map(|row| row.iter().map(|value| round6(*value)).collect())
-        .collect()
-}
-
-fn separated(normal: &[Vec<f64>], cvd: &[Vec<f64>]) -> bool {
-    (0..normal.len()).all(|left| {
-        (left + 1..normal.len()).all(|right| {
-            normal[left][right] >= ORDINARY_NORMAL_SEPARATION - 1e-12
-                && cvd[left][right] >= ORDINARY_CVD_SEPARATION - 1e-12
-        })
-    })
-}
-
 fn separated_from(
     candidate: &str,
     existing: impl IntoIterator<Item = impl AsRef<str>>,
@@ -343,17 +302,161 @@ struct SemanticSearchRequest<'a> {
     subdued_saliency: f64,
 }
 
-fn semantic_score(hierarchy: &MergePlan, active: &BTreeSet<usize>) -> (usize, usize) {
-    let mut trunk_priority = 0;
-    let mut branch_count = 0;
+// Derived ordering makes this field order the search objective, from strongest
+// feasibility requirement to weakest deterministic tie-break.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct SemanticScore {
+    trunk_count: usize,
+    hue_cluster_count: usize,
+    branch_count: usize,
+    authored_trunk_count: usize,
+    source_preference: usize,
+    active_priority: usize,
+}
+
+fn source_preference_value(role: SemanticRole, evidence: &EvidenceColor) -> usize {
+    let affinity = source_affinity(role, evidence)
+        .map(|rank| role_source_preferences(role).len() - rank)
+        .unwrap_or(0);
+    let priority = SOURCE_KEY_ORDER
+        .len()
+        .saturating_sub(source_priority(evidence));
+    affinity * (SOURCE_KEY_ORDER.len() + 1) + priority
+}
+
+fn semantic_score(
+    hierarchy: &MergePlan,
+    profile: &SyntaxProfile,
+    allocations: &[FamilyAllocation],
+) -> SemanticScore {
+    let active = allocations
+        .iter()
+        .map(|allocation| allocation.family)
+        .collect::<BTreeSet<_>>();
+
+    let mut score = SemanticScore::default();
+    let mut clusters = BTreeSet::new();
+
     for (family, semantic) in hierarchy.families.iter().enumerate() {
+        score.active_priority =
+            (score.active_priority << 1) | usize::from(active.contains(&family));
+        if !active.contains(&family) {
+            continue;
+        }
+
         if semantic.parent.is_none() {
-            trunk_priority = (trunk_priority << 1) | usize::from(active.contains(&family));
-        } else if active.contains(&family) {
-            branch_count += 1;
+            score.trunk_count += 1;
+            let allocation = allocations
+                .iter()
+                .find(|allocation| allocation.family == family)
+                .unwrap();
+            if let Some(source) = allocation.source {
+                score.authored_trunk_count += 1;
+                if let Some(cluster) = source_cluster(profile, source) {
+                    clusters.insert(cluster);
+                }
+                let evidence = &profile.evidence[source];
+                score.source_preference +=
+                    source_preference_value(semantic.source_preference, evidence);
+            }
+        } else {
+            score.branch_count += 1;
         }
     }
-    (trunk_priority, branch_count)
+
+    score.hue_cluster_count = clusters.len();
+    score
+}
+
+fn optimistic_semantic_score(
+    hierarchy: &MergePlan,
+    profile: &SyntaxProfile,
+    next_family: usize,
+    allocations: &[FamilyAllocation],
+) -> SemanticScore {
+    let mut score = semantic_score(hierarchy, profile, allocations);
+    let remaining = &hierarchy.families[next_family..];
+    let remaining_trunks = remaining
+        .iter()
+        .filter(|semantic| semantic.parent.is_none())
+        .count();
+
+    let used_sources = allocations
+        .iter()
+        .filter(|allocation| hierarchy.families[allocation.family].parent.is_none())
+        .filter_map(|allocation| allocation.source)
+        .collect::<BTreeSet<_>>();
+    let used_clusters = used_sources
+        .iter()
+        .filter_map(|source| source_cluster(profile, *source))
+        .collect::<BTreeSet<_>>();
+
+    let available_sources = (0..profile.evidence.len())
+        .filter(|source| {
+            !used_sources.contains(source)
+                && source_cluster(profile, *source)
+                    .is_none_or(|cluster| !used_clusters.contains(&cluster))
+        })
+        .collect::<Vec<_>>();
+    let available_clusters = available_sources
+        .iter()
+        .filter_map(|source| source_cluster(profile, *source))
+        .collect::<BTreeSet<_>>();
+    let available_neutral_sources = available_sources
+        .iter()
+        .filter(|source| source_cluster(profile, **source).is_none())
+        .count();
+
+    score.trunk_count += remaining_trunks;
+    score.hue_cluster_count += remaining_trunks.min(available_clusters.len());
+
+    score.branch_count += remaining
+        .iter()
+        .filter(|semantic| semantic.parent.is_some())
+        .count();
+
+    score.authored_trunk_count +=
+        remaining_trunks.min(available_clusters.len() + available_neutral_sources);
+    score.source_preference += remaining
+        .iter()
+        .filter(|semantic| semantic.parent.is_none())
+        .map(|semantic| {
+            available_sources
+                .iter()
+                .map(|source| {
+                    source_preference_value(semantic.source_preference, &profile.evidence[*source])
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .sum::<usize>();
+
+    score.active_priority = (1 << hierarchy.families.len()) - 1;
+    score
+}
+
+fn root_source_is_available(
+    hierarchy: &MergePlan,
+    profile: &SyntaxProfile,
+    allocations: &[FamilyAllocation],
+    source: Option<usize>,
+) -> bool {
+    let Some(source) = source else {
+        // Generated foreground tones form the palette's shared neutral lineage.
+        return true;
+    };
+    allocations
+        .iter()
+        .filter(|allocation| hierarchy.families[allocation.family].parent.is_none())
+        .all(|allocation| {
+            allocation.source != Some(source)
+                && source_cluster(profile, source).is_none_or(|cluster| {
+                    allocation
+                        .source
+                        .and_then(|source| source_cluster(profile, source))
+                        != Some(cluster)
+                })
+        })
 }
 
 fn search_semantic_forest(
@@ -362,35 +465,22 @@ fn search_semantic_forest(
     family: usize,
     allocations: &mut Vec<FamilyAllocation>,
     best: &mut Vec<FamilyAllocation>,
+    prune: bool,
 ) -> Result<()> {
     if family == request.hierarchy.families.len() {
-        let active = allocations
-            .iter()
-            .map(|allocation| allocation.family)
-            .collect::<BTreeSet<_>>();
-        let best_active = best
-            .iter()
-            .map(|allocation| allocation.family)
-            .collect::<BTreeSet<_>>();
-        if semantic_score(request.hierarchy, &active)
-            > semantic_score(request.hierarchy, &best_active)
+        if semantic_score(request.hierarchy, request.profile, allocations)
+            > semantic_score(request.hierarchy, request.profile, best)
         {
             *best = allocations.clone();
         }
         return Ok(());
     }
 
-    let mut potential = allocations
-        .iter()
-        .map(|allocation| allocation.family)
-        .collect::<BTreeSet<_>>();
-    potential.extend(family..request.hierarchy.families.len());
-    let best_active = best
-        .iter()
-        .map(|allocation| allocation.family)
-        .collect::<BTreeSet<_>>();
-    if semantic_score(request.hierarchy, &potential)
-        <= semantic_score(request.hierarchy, &best_active)
+    // The bound deliberately overestimates every remaining score component, so
+    // pruning cannot remove a feasible improvement.
+    if prune
+        && optimistic_semantic_score(request.hierarchy, request.profile, family, allocations)
+            <= semantic_score(request.hierarchy, request.profile, best)
     {
         return Ok(());
     }
@@ -401,36 +491,20 @@ fn search_semantic_forest(
             .iter()
             .find(|allocation| allocation.family == parent)
         else {
-            return search_semantic_forest(search, request, family + 1, allocations, best);
+            return search_semantic_forest(search, request, family + 1, allocations, best, prune);
         };
         vec![parent.source]
-    } else if request.profile.evidence.is_empty() {
-        vec![None]
     } else {
-        let mut sources = ranked_sources(request.profile, semantic.source_preference);
-        let used_trunk_clusters = allocations
-            .iter()
-            .filter(|allocation| {
-                request.hierarchy.families[allocation.family]
-                    .parent
-                    .is_none()
-            })
-            .filter_map(|allocation| allocation.source)
-            .filter_map(|source| source_cluster(request.profile, source))
-            .collect::<BTreeSet<_>>();
-        if sources.iter().any(|source| {
-            source_cluster(request.profile, *source)
-                .is_some_and(|cluster| !used_trunk_clusters.contains(&cluster))
-        }) {
-            sources.sort_by_key(|source| {
-                source_cluster(request.profile, *source)
-                    .is_none_or(|cluster| used_trunk_clusters.contains(&cluster))
-            });
-        }
-        sources.truncate(MAX_FAMILY_SOURCE_CANDIDATES);
-        sources.into_iter().map(Some).collect()
+        root_sources(request.profile, semantic.source_preference)
     };
+
     for source in sources {
+        if semantic.parent.is_none()
+            && !root_source_is_available(request.hierarchy, request.profile, allocations, source)
+        {
+            continue;
+        }
+
         let preferred_saliency = semantic
             .parent
             .map(|parent| {
@@ -452,46 +526,49 @@ fn search_semantic_forest(
                 family,
                 source,
                 preferred_saliency,
-                inherited: semantic.parent.is_some(),
             },
         ) else {
             continue;
         };
+
         allocations.push(candidate);
-        let readable_hierarchy = semantic_above_subdued(allocations, request.subdued_saliency);
-        let separated = if readable_hierarchy {
-            let candidate = allocations.last().unwrap();
-            let existing = request.fixed_outputs.iter().copied().chain(
-                allocations[..allocations.len() - 1]
-                    .iter()
-                    .map(|allocation| allocation.output.as_str()),
-            );
-            separated_from(&candidate.output, existing)?
-        } else {
-            false
-        };
-        if separated {
-            search_semantic_forest(search, request, family + 1, allocations, best)?;
+
+        if !semantic_above_subdued(allocations, request.subdued_saliency) {
+            allocations.pop();
+            continue;
         }
+
+        let candidate = allocations.last().unwrap();
+        let existing = request.fixed_outputs.iter().copied().chain(
+            allocations[..allocations.len() - 1]
+                .iter()
+                .map(|allocation| allocation.output.as_str()),
+        );
+        if separated_from(&candidate.output, existing)? {
+            search_semantic_forest(search, request, family + 1, allocations, best, prune)?;
+        }
+
         allocations.pop();
     }
-    search_semantic_forest(search, request, family + 1, allocations, best)?;
+
+    search_semantic_forest(search, request, family + 1, allocations, best, prune)?;
     Ok(())
 }
 
-fn select_semantic_plan(
+fn select_semantic_plan_with_pruning(
     search: &mut Search,
     preference_contexts: &[String],
     required_contexts: &[String],
     reference: &str,
     profile: &SyntaxProfile,
     fixed_outputs: [&str; 2],
+    prune: bool,
 ) -> Result<SemanticPlan> {
     let subdued_saliency = geometric_contrast(fixed_outputs[1], preference_contexts)?.ln()
         / geometric_contrast(reference, preference_contexts)?
             .ln()
             .max(1e-12);
-    let hierarchy = MergePlan::hierarchy(profile.requested_hue_family_count.clamp(1, 3));
+    let hierarchy = MergePlan::hierarchy();
     let request = SemanticSearchRequest {
         preference_contexts,
         required_contexts,
@@ -503,7 +580,7 @@ fn select_semantic_plan(
     };
     let mut current = Vec::with_capacity(hierarchy.families.len());
     let mut allocations = Vec::with_capacity(hierarchy.families.len());
-    search_semantic_forest(search, &request, 0, &mut current, &mut allocations)?;
+    search_semantic_forest(search, &request, 0, &mut current, &mut allocations, prune)?;
 
     let active = allocations
         .iter()
@@ -518,134 +595,83 @@ fn select_semantic_plan(
     Ok(SemanticPlan { plan, allocations })
 }
 
-fn build_tone_allocations(
+fn select_semantic_plan(
     search: &mut Search,
     preference_contexts: &[String],
     required_contexts: &[String],
     reference: &str,
     profile: &SyntaxProfile,
-) -> Result<Vec<ToneAllocation>> {
-    let reference_chroma = oklab_to_oklch(lab(reference)?)[1];
-    let (seed, preferred_chroma, chroma_cap) = match profile.hue_strategy {
-        HueStrategy::Neutral => (
-            reference.to_owned(),
-            reference_chroma,
-            // Byte-quantized neutral colors carry a small numerical Oklab chroma.
-            // Leave enough headroom for the grayscale lightness ladder without
-            // turning that quantization residue into an authored hue.
-            reference_chroma.max(0.005),
-        ),
-        HueStrategy::AccentLed => {
-            let evidence = profile
-                .evidence
-                .iter()
-                .max_by(|left, right| {
-                    left.chroma
-                        .total_cmp(&right.chroma)
-                        .then_with(|| right.value.cmp(&left.value))
-                })
-                .ok_or_else(|| crate::Error("accent-led syntax has no evidenced hue".into()))?;
-            let preferred_chroma = evidence
-                .chroma
-                .min(profile.chroma_envelope.ordinary_maximum);
-            (
-                gamut_map_oklch(evidence.lightness, preferred_chroma, evidence.hue).opaque_hex(),
-                preferred_chroma,
-                profile.chroma_envelope.ordinary_maximum,
-            )
-        }
-        HueStrategy::PaletteNative => {
-            return Err(crate::Error(
-                "palette-native syntax cannot use the single-hue tone allocator".into(),
-            ));
-        }
-    };
-    let chroma_floor = if profile.hue_strategy == HueStrategy::Neutral {
-        0.0
+    fixed_outputs: [&str; 2],
+) -> Result<SemanticPlan> {
+    select_semantic_plan_with_pruning(
+        search,
+        preference_contexts,
+        required_contexts,
+        reference,
+        profile,
+        fixed_outputs,
+        true,
+    )
+}
+
+fn fit_subdued(
+    search: &mut Search,
+    palette: &ResolvedPalette,
+    profile: &SyntaxProfile,
+    preference_contexts: &[String],
+    required_contexts: &[String],
+    reference: &str,
+) -> Result<SaliencyFit> {
+    let muted_chroma = oklab_to_oklch(lab(&palette.colors["muted"])?)[1];
+    let subdued_chroma_cap = if profile.clusters.is_empty() {
+        muted_chroma.max(0.005)
     } else {
-        (preferred_chroma * 0.45).min(0.025)
+        profile.chroma_envelope.ordinary_maximum
     };
-
-    let reference_contrast = geometric_contrast(reference, preference_contexts)?;
-    let floor_saliency = SYNTAX_SEMANTIC_FLOOR.ln() / reference_contrast.ln().max(1e-12);
-    let subdued_saliency = ToneBand::Subdued.single_hue_saliency().max(floor_saliency);
-    let secondary_saliency = ToneBand::Secondary
-        .single_hue_saliency()
-        .max(subdued_saliency + MINIMUM_TONE_SALIENCY_GAP);
-    let primary_saliency = ToneBand::Primary
-        .single_hue_saliency()
-        .max(secondary_saliency + MINIMUM_TONE_SALIENCY_GAP);
-    if primary_saliency > 1.0 + 1e-12 {
-        return Err(crate::Error(format!(
-            "editor foreground leaves no room for three readable syntax tones: floor saliency {floor_saliency:.3}"
-        )));
-    }
-
-    let mut allocations = Vec::new();
-    for (band, preferred_saliency) in [
-        (ToneBand::Primary, primary_saliency),
-        (ToneBand::Secondary, secondary_saliency),
-        (ToneBand::Subdued, subdued_saliency),
-    ] {
-        let required_floor = match band {
-            ToneBand::Subdued => SYNTAX_SUBDUED_OVERLAY_FLOOR,
-            ToneBand::Primary | ToneBand::Secondary => SYNTAX_ADAPTIVE_OVERLAY_FLOOR,
-        };
-        let fit = fit_tone(
-            search,
-            ToneFitRequest {
-                seed: &seed,
-                reference,
-                preference_contexts,
-                required_contexts,
-                preference_floor: SYNTAX_SEMANTIC_FLOOR,
-                required_floor,
-                preferred_saliency,
-                bounds: FitBounds {
-                    lower_chroma: chroma_floor,
-                    upper_chroma: chroma_cap,
-                    ..FitBounds::default()
-                },
+    let fit = fit_tone(
+        search,
+        ToneFitRequest {
+            seed: &palette.colors["muted"],
+            reference,
+            preference_contexts,
+            required_contexts,
+            preference_floor: SYNTAX_SUBDUED_FLOOR,
+            required_floor: SYNTAX_SUBDUED_OVERLAY_FLOOR,
+            preferred_saliency: SUBDUED_SALIENCY,
+            bounds: FitBounds {
+                upper_chroma: subdued_chroma_cap,
+                ..FitBounds::default()
             },
-        )?;
-        allocations.push(ToneAllocation { band, fit });
+        },
+    )?;
+    if fit.output != reference {
+        return Ok(fit);
     }
 
-    let colors = allocations
-        .iter()
-        .map(|allocation| allocation.fit.output.clone())
-        .collect::<Vec<_>>();
-    let (normal, cvd) = pair_matrices(&colors)?;
-    if !separated(&normal, &cvd) {
-        return Err(crate::Error(format!(
-            "three-tone syntax ladder is not perceptually separated (normal {:.3}, CVD {:.3}; colors {}; normal {:?}; CVD {:?})",
-            ORDINARY_NORMAL_SEPARATION,
-            ORDINARY_CVD_SEPARATION,
-            colors.join(", "),
-            rounded_matrix(&normal),
-            rounded_matrix(&cvd),
-        )));
-    }
-    if allocations.windows(2).any(|pair| {
-        pair[0].fit.actual_saliency
-            < pair[1].fit.actual_saliency + MINIMUM_TONE_SALIENCY_GAP - 1e-12
-    }) {
-        return Err(crate::Error(format!(
-            "three-tone syntax ladder has less than {:.2} relative-saliency separation: {}",
-            MINIMUM_TONE_SALIENCY_GAP,
-            allocations
-                .iter()
-                .map(|allocation| format!(
-                    "{}={:.3}",
-                    allocation.band.as_str(),
-                    allocation.fit.actual_saliency
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+    let reference_chroma = oklab_to_oklch(lab(reference)?)[1];
+    let fit = fit_tone(
+        search,
+        ToneFitRequest {
+            seed: reference,
+            reference,
+            preference_contexts,
+            required_contexts,
+            preference_floor: SYNTAX_SUBDUED_FLOOR,
+            required_floor: SYNTAX_SUBDUED_OVERLAY_FLOOR,
+            preferred_saliency: SUBDUED_SALIENCY,
+            bounds: FitBounds {
+                upper_chroma: reference_chroma.max(1e-9),
+                ..FitBounds::default()
+            },
+        },
+    )?;
+    if fit.output == reference {
+        return Err(crate::Error(
+            "base and subdued syntax roles collided exactly".into(),
+        ));
     }
 
-    Ok(allocations)
+    Ok(fit)
 }
 
 pub fn build_syntax(
@@ -660,126 +686,51 @@ pub fn build_syntax(
     let required_contexts = contexts.rendered;
     let profile = profile::measure(palette)?;
     let base = saliency_reference.to_owned();
+
     if minimum_contrast(&base, required_contexts)? < SYNTAX_PRIMARY_FLOOR - 1e-12 {
         return Err(crate::Error(
             "editor primary does not meet the syntax-primary floor".into(),
         ));
     }
 
-    let mut role_colors = if profile.hue_strategy == HueStrategy::Neutral {
-        let tones = build_tone_allocations(
-            search,
-            preference_contexts,
-            required_contexts,
-            saliency_reference,
-            &profile,
-        )?;
-        let tone_color = |band| {
-            tones
-                .iter()
-                .find(|allocation| allocation.band == band)
-                .map(|allocation| allocation.fit.output.clone())
-                .unwrap()
-        };
-        let subdued_fit = tones
-            .iter()
-            .find(|allocation| allocation.band == ToneBand::Subdued)
-            .unwrap()
-            .fit
-            .clone();
-        let secondary = tone_color(ToneBand::Secondary);
-        let mut semantic_budget =
-            usize::from(separated_from(&secondary, [&base, &subdued_fit.output])?);
-        if semantic_budget == 1 {
-            let primary = tone_color(ToneBand::Primary);
-            if separated_from(&primary, [&base, &subdued_fit.output, &secondary])? {
-                semantic_budget = 2;
-            }
+    let subdued_fit = fit_subdued(
+        search,
+        palette,
+        &profile,
+        preference_contexts,
+        required_contexts,
+        saliency_reference,
+    )?;
+    let SemanticPlan {
+        plan: semantic_plan,
+        allocations,
+    } = select_semantic_plan(
+        search,
+        preference_contexts,
+        required_contexts,
+        saliency_reference,
+        &profile,
+        [&base, &subdued_fit.output],
+    )?;
+
+    let mut role_colors = BTreeMap::from([
+        (SemanticRole::Base, base.clone()),
+        (SemanticRole::Subdued, subdued_fit.output.clone()),
+        (SemanticRole::Predictive, predictive.to_owned()),
+    ]);
+    for allocation in &allocations {
+        for role in &allocation.roles {
+            role_colors.insert(*role, allocation.output.clone());
         }
-        let semantic_plan = MergePlan::with_budget(semantic_budget);
-        let mut role_colors = BTreeMap::from([
-            (SemanticRole::Base, base.clone()),
-            (SemanticRole::Subdued, subdued_fit.output.clone()),
-            (SemanticRole::Predictive, predictive.to_owned()),
-        ]);
-        for role in plan::ORDINARY_ROLES {
-            let color = semantic_plan
-                .family_for(role)
-                .map(|family| tone_color(semantic_plan.families[family].anchor.tone_band()))
-                .unwrap_or_else(|| role_colors[&semantic_plan.fallback_for(role)].clone());
-            role_colors.insert(role, color);
+    }
+    for role in plan::ORDINARY_ROLES {
+        if semantic_plan.family_for(role).is_some() {
+            continue;
         }
-        role_colors
-    } else {
-        let mut subdued_fit = fit_tone(
-            search,
-            ToneFitRequest {
-                seed: &palette.colors["muted"],
-                reference: saliency_reference,
-                preference_contexts,
-                required_contexts,
-                preference_floor: SYNTAX_SUBDUED_FLOOR,
-                required_floor: SYNTAX_SUBDUED_OVERLAY_FLOOR,
-                preferred_saliency: ToneBand::Subdued.saliency(),
-                bounds: FitBounds {
-                    upper_chroma: profile.chroma_envelope.ordinary_maximum,
-                    ..FitBounds::default()
-                },
-            },
-        )?;
-        if subdued_fit.output == base {
-            let reference_chroma = oklab_to_oklch(lab(saliency_reference)?)[1];
-            subdued_fit = fit_tone(
-                search,
-                ToneFitRequest {
-                    seed: saliency_reference,
-                    reference: saliency_reference,
-                    preference_contexts,
-                    required_contexts,
-                    preference_floor: SYNTAX_SUBDUED_FLOOR,
-                    required_floor: SYNTAX_SUBDUED_OVERLAY_FLOOR,
-                    preferred_saliency: ToneBand::Subdued.saliency(),
-                    bounds: FitBounds {
-                        upper_chroma: reference_chroma.max(1e-9),
-                        ..FitBounds::default()
-                    },
-                },
-            )?;
-        }
-        if subdued_fit.output == base {
-            return Err(crate::Error(
-                "base and subdued syntax roles collided exactly".into(),
-            ));
-        }
-        let SemanticPlan {
-            plan: semantic_plan,
-            allocations,
-        } = select_semantic_plan(
-            search,
-            preference_contexts,
-            required_contexts,
-            saliency_reference,
-            &profile,
-            [&base, &subdued_fit.output],
-        )?;
-        let mut role_colors = BTreeMap::from([
-            (SemanticRole::Base, base.clone()),
-            (SemanticRole::Subdued, subdued_fit.output.clone()),
-            (SemanticRole::Predictive, predictive.to_owned()),
-        ]);
-        for allocation in &allocations {
-            for role in &allocation.roles {
-                role_colors.insert(*role, allocation.output.clone());
-            }
-        }
-        for role in plan::ORDINARY_ROLES {
-            if semantic_plan.family_for(role).is_none() {
-                let fallback = semantic_plan.fallback_for(role);
-                role_colors.insert(role, role_colors[&fallback].clone());
-            }
-        }
-        role_colors
-    };
+
+        let fallback = semantic_plan.fallback_for(role);
+        role_colors.insert(role, role_colors[&fallback].clone());
+    }
 
     let pair_constraints =
         PairConstraints::from_contract(SYNTAX_SEMANTIC_FLOOR, SYNTAX_DIFF_CONTRACT)
@@ -858,21 +809,111 @@ fn capture_style(capture: &str) -> (Option<&'static str>, Option<u16>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::gamut_map_oklch;
+    use crate::palette::Provenance;
+
+    fn allocation(family: usize) -> FamilyAllocation {
+        FamilyAllocation {
+            family,
+            roles: Vec::new(),
+            source: None,
+            output: format!("#{family:06x}"),
+            measured_saliency: 0.8,
+        }
+    }
+
+    fn five_source_profile() -> SyntaxProfile {
+        let mut colors = BTreeMap::new();
+        let mut provenance = BTreeMap::new();
+        for key in SOURCE_KEY_ORDER {
+            colors.insert(key.to_owned(), "#777777".to_owned());
+            provenance.insert(key.to_owned(), Provenance::Derived);
+        }
+        for (index, key) in SOURCE_KEY_ORDER[..5].iter().enumerate() {
+            colors.insert(
+                (*key).to_owned(),
+                gamut_map_oklch(0.65, 0.10, index as f64).opaque_hex(),
+            );
+            provenance.insert((*key).to_owned(), Provenance::Direct);
+        }
+        profile::measure(&ResolvedPalette {
+            mode: "dark".into(),
+            colors,
+            provenance,
+        })
+        .unwrap()
+    }
 
     #[test]
-    fn semantic_score_preserves_trunk_priority_before_branch_count() {
-        let hierarchy = MergePlan::hierarchy(3);
-        let data_and_symbol = BTreeSet::from([0, 1]);
-        let data_control_and_all_available_branches = BTreeSet::from([0, 2, 3]);
+    fn semantic_score_preserves_roots_before_refinements() {
+        let hierarchy = MergePlan::hierarchy();
+        let profile = SyntaxProfile {
+            chroma_envelope: profile::ChromaEnvelope {
+                target_median: 0.035,
+                ordinary_maximum: 0.055,
+            },
+            evidence: Vec::new(),
+            clusters: Vec::new(),
+        };
+        let three_roots = [allocation(0), allocation(1), allocation(2)];
+        let two_roots_and_all_branches = [
+            allocation(0),
+            allocation(1),
+            allocation(3),
+            allocation(4),
+            allocation(5),
+        ];
         assert!(
-            semantic_score(&hierarchy, &data_and_symbol)
-                > semantic_score(&hierarchy, &data_control_and_all_available_branches)
+            semantic_score(&hierarchy, &profile, &three_roots)
+                > semantic_score(&hierarchy, &profile, &two_roots_and_all_branches)
         );
 
-        let data_symbol_and_value = BTreeSet::from([0, 1, 3]);
+        let two_roots = [allocation(0), allocation(1)];
+        let two_roots_and_value = [allocation(0), allocation(1), allocation(3)];
         assert!(
-            semantic_score(&hierarchy, &data_symbol_and_value)
-                > semantic_score(&hierarchy, &data_and_symbol)
+            semantic_score(&hierarchy, &profile, &two_roots_and_value)
+                > semantic_score(&hierarchy, &profile, &two_roots)
         );
+    }
+
+    #[test]
+    fn root_sources_never_truncates_authored_candidates() {
+        let profile = five_source_profile();
+        let sources = root_sources(&profile, SemanticRole::Callable);
+        assert_eq!(sources.len(), 6);
+        assert_eq!(
+            sources.into_iter().collect::<BTreeSet<_>>(),
+            (0..5).map(Some).chain(std::iter::once(None)).collect()
+        );
+    }
+
+    #[test]
+    fn branch_and_bound_matches_exhaustive_search() {
+        let profile = five_source_profile();
+        let contexts = vec!["#111111".to_owned()];
+        let mut pruned_search = Search::default();
+        let mut exhaustive_search = Search::default();
+        let pruned = select_semantic_plan_with_pruning(
+            &mut pruned_search,
+            &contexts,
+            &contexts,
+            "#eeeeee",
+            &profile,
+            ["#eeeeee", "#777777"],
+            true,
+        )
+        .unwrap();
+        let exhaustive = select_semantic_plan_with_pruning(
+            &mut exhaustive_search,
+            &contexts,
+            &contexts,
+            "#eeeeee",
+            &profile,
+            ["#eeeeee", "#777777"],
+            false,
+        )
+        .unwrap();
+        assert_eq!(pruned.plan, exhaustive.plan);
+        assert_eq!(pruned.allocations, exhaustive.allocations);
     }
 }

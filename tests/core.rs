@@ -340,7 +340,7 @@ fn representative_palettes_generate_valid_themes() {
 }
 
 #[test]
-fn neutral_profile_spends_one_perceptual_slot_on_data() {
+fn neutral_profile_expresses_fixed_semantic_domains_as_tones() {
     let fixtures: Value =
         serde_json::from_str(include_str!("fixtures/resolved-palettes.json")).unwrap();
     let name = "white";
@@ -355,8 +355,15 @@ fn neutral_profile_spends_one_perceptual_slot_on_data() {
     let style = style(&document);
     let syntax = style["syntax"].as_object().unwrap();
     let editor_foreground = role(style, "editor.foreground");
-    assert_ne!(syntax["string"]["color"].as_str(), Some(editor_foreground));
-    for capture in ["comment", "string", "constant"] {
+    let semantic_roots = ["string", "type", "keyword"]
+        .map(|capture| syntax[capture]["color"].as_str().unwrap())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(semantic_roots.len(), 3);
+    assert!(!semantic_roots.contains(editor_foreground));
+    for capture in [
+        "comment", "string", "constant", "type", "function", "property", "keyword",
+    ] {
         let color = syntax[capture]["color"].as_str().unwrap();
         assert!(
             oklab_to_oklch(lab(color).unwrap())[1] <= 0.005 + 1e-9,
@@ -366,7 +373,31 @@ fn neutral_profile_spends_one_perceptual_slot_on_data() {
 }
 
 #[test]
-fn strong_two_cluster_profile_enters_the_semantic_budget_path() {
+fn palette_without_authored_syntax_sources_keeps_fixed_semantic_domains() {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/resolved-palettes.json")).unwrap();
+    let fixture = fixtures["palettes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fixture| fixture["name"] == "white")
+        .unwrap();
+    let (_, mut palette) = parse_palette_fixture(fixture);
+    for provenance in palette.provenance.values_mut() {
+        *provenance = Provenance::Derived;
+    }
+
+    let document = build_theme(&palette).unwrap();
+    let syntax = style(&document)["syntax"].as_object().unwrap();
+    let semantic_roots = ["string", "type", "keyword"]
+        .map(|capture| syntax[capture]["color"].as_str().unwrap())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(semantic_roots.len(), 3);
+}
+
+#[test]
+fn strong_two_cluster_profile_assigns_distinct_semantic_roots() {
     let mut palette = synthetic_palette();
     for (key, value) in [
         ("green", "#ff0000"),
@@ -463,6 +494,12 @@ fn a_scarce_but_perceptible_authored_hue_is_not_discarded() {
         style["syntax"]["string"]["color"],
         style["editor.foreground"]
     );
+    let syntax = style["syntax"].as_object().unwrap();
+    let semantic_roots = ["string", "type", "keyword"]
+        .map(|capture| syntax[capture]["color"].as_str().unwrap())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(semantic_roots.len(), 3);
 }
 
 #[test]
@@ -523,13 +560,59 @@ fn syntax_profile_does_not_reassign_diff_source_families() {
 
 #[test]
 fn narrow_olive_palette_never_synthesizes_hues() {
-    let document = build_theme(&venice_like_palette()).unwrap();
+    let palette = venice_like_palette();
+    let document = build_theme(&palette).unwrap();
     let syntax = style(&document)["syntax"].as_object().unwrap();
-    let hues = ["string", "type", "function", "constant"]
-        .map(|capture| syntax[capture]["color"].as_str().unwrap())
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    assert!((2..=4).contains(&hues.len()));
+    let captures = [
+        "string",
+        "constant",
+        "type",
+        "function",
+        "property",
+        "keyword",
+        "link_text",
+    ];
+    let colors = captures.map(|capture| syntax[capture]["color"].as_str().unwrap());
+    assert!(colors.iter().copied().collect::<BTreeSet<_>>().len() >= 4);
+
+    let authored_hues = [
+        "foreground",
+        "green",
+        "blue",
+        "magenta",
+        "yellow",
+        "red",
+        "cyan",
+        "orange",
+        "accent",
+        "brown",
+        "bright_green",
+        "bright_blue",
+        "bright_magenta",
+        "bright_yellow",
+        "bright_red",
+        "bright_cyan",
+    ]
+    .map(|key| oklab_to_oklch(lab(&palette.colors[key]).unwrap()))
+    .into_iter()
+    .filter(|source| source[1] >= 0.025)
+    .map(|source| source[2])
+    .collect::<Vec<_>>();
+    for (capture, color) in captures.into_iter().zip(colors) {
+        let output = oklab_to_oklch(lab(color).unwrap());
+        if output[1] < 0.025 {
+            continue;
+        }
+        let nearest = authored_hues
+            .iter()
+            .map(|hue| {
+                (output[2] - hue)
+                    .abs()
+                    .min(std::f64::consts::TAU - (output[2] - hue).abs())
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(nearest <= 0.08, "{capture} synthesized a new hue");
+    }
 }
 
 #[test]

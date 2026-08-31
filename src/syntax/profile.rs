@@ -14,7 +14,6 @@ pub const CHROMA_EVIDENCE: f64 = 0.025;
 const HUE_CLUSTER_LIMIT: f64 = 35.0 * PI / 180.0;
 const HUE_SIMILARITY_FULL: f64 = 25.0 * PI / 180.0;
 const HUE_SIMILARITY_ZERO: f64 = 45.0 * PI / 180.0;
-const ALLOCATION_CHROMA_FLOOR: f64 = 0.005;
 const NEUTRAL_MEDIAN_CHROMA: f64 = 0.035;
 const NEUTRAL_MAXIMUM_CHROMA: f64 = 0.055;
 
@@ -35,13 +34,6 @@ const EVIDENCE_KEYS: [&str; 15] = [
     "bright_red",
     "bright_cyan",
 ];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HueStrategy {
-    Neutral,
-    AccentLed,
-    PaletteNative,
-}
 
 #[derive(Clone, Debug)]
 pub struct EvidenceColor {
@@ -67,9 +59,7 @@ pub struct ChromaEnvelope {
 
 #[derive(Clone, Debug)]
 pub struct SyntaxProfile {
-    pub requested_hue_family_count: usize,
     pub chroma_envelope: ChromaEnvelope,
-    pub hue_strategy: HueStrategy,
     pub evidence: Vec<EvidenceColor>,
     pub clusters: Vec<HueCluster>,
 }
@@ -99,7 +89,12 @@ fn hue_similarity(distance: f64) -> f64 {
 }
 
 fn complete_link_clusters(evidence: &[EvidenceColor]) -> Vec<HueCluster> {
-    let mut clusters: Vec<Vec<usize>> = (0..evidence.len()).map(|index| vec![index]).collect();
+    let mut clusters = evidence
+        .iter()
+        .enumerate()
+        .filter(|(_, color)| color.chroma >= CHROMA_EVIDENCE - 1e-12)
+        .map(|(index, _)| vec![index])
+        .collect::<Vec<_>>();
 
     loop {
         let mut best: Option<(f64, Vec<usize>, usize, usize)> = None;
@@ -179,41 +174,33 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
             .get(key)
             .copied()
             .unwrap_or(Provenance::Derived);
+
         if provenance == Provenance::Derived {
             continue;
         }
+
         deduplicated.entry(value).or_default().push(key);
     }
 
-    let mut authored_colors = deduplicated
+    let mut evidence = deduplicated
         .into_iter()
         .map(|(value, keys)| {
             let [lightness, chroma, hue] = oklab_to_oklch(lab(&value)?);
-            Ok(
-                (chroma >= ALLOCATION_CHROMA_FLOOR - 1e-12).then_some(EvidenceColor {
-                    value,
-                    keys,
-                    lightness,
-                    chroma,
-                    hue,
-                    weight: (chroma - CHROMA_EVIDENCE).max(0.0),
-                }),
-            )
+            Ok(EvidenceColor {
+                value,
+                keys,
+                lightness,
+                chroma,
+                hue,
+                weight: (chroma - CHROMA_EVIDENCE).max(0.0),
+            })
         })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    authored_colors.sort_by(|left, right| {
+        .collect::<Result<Vec<_>>>()?;
+    evidence.sort_by(|left, right| {
         left.hue
             .total_cmp(&right.hue)
             .then_with(|| left.value.cmp(&right.value))
     });
-    let evidence = authored_colors
-        .iter()
-        .filter(|color| color.chroma >= CHROMA_EVIDENCE - 1e-12)
-        .cloned()
-        .collect::<Vec<_>>();
 
     let clusters = complete_link_clusters(&evidence);
 
@@ -237,13 +224,16 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
             .sum::<f64>();
         1.0 / concentration.max(1e-12)
     };
+
     let mut chromas = evidence
         .iter()
+        .filter(|color| color.chroma >= CHROMA_EVIDENCE - 1e-12)
         .map(|color| color.chroma)
         .collect::<Vec<_>>();
     chromas.sort_by(f64::total_cmp);
     let source_median_chroma = quantile(&chromas, 0.5);
     let source_q90_chroma = quantile(&chromas, 0.9);
+
     let native_median = source_median_chroma.clamp(0.045, 0.140);
     let palette_native_weight = smoothstep(1.0, 2.5, effective_hue_families);
     let target_median =
@@ -254,25 +244,12 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
     let ordinary_maximum = (NEUTRAL_MAXIMUM_CHROMA
         + envelope_support * (native_maximum - NEUTRAL_MAXIMUM_CHROMA))
         .max(target_median);
-    let hue_strategy = if evidence.is_empty() {
-        HueStrategy::Neutral
-    } else if clusters.len() == 1 {
-        HueStrategy::AccentLed
-    } else {
-        HueStrategy::PaletteNative
-    };
-    let requested_hue_family_count = match hue_strategy {
-        HueStrategy::Neutral => 0,
-        HueStrategy::AccentLed => 1,
-        HueStrategy::PaletteNative => clusters.len(),
-    };
+
     Ok(SyntaxProfile {
-        requested_hue_family_count,
         chroma_envelope: ChromaEnvelope {
             target_median,
             ordinary_maximum,
         },
-        hue_strategy,
         evidence,
         clusters,
     })
@@ -328,7 +305,7 @@ mod tests {
         ]))
         .unwrap();
         assert!(profile.evidence.is_empty());
-        assert_eq!(profile.hue_strategy, HueStrategy::Neutral);
+        assert!(profile.clusters.is_empty());
     }
 
     #[test]
@@ -354,10 +331,9 @@ mod tests {
     }
 
     #[test]
-    fn every_perceptible_authored_color_contributes_to_the_budget() {
+    fn every_perceptible_authored_color_contributes_a_hue_cluster() {
         let neutral = measure(&palette(&[])).unwrap();
-        assert_eq!(neutral.hue_strategy, HueStrategy::Neutral);
-        assert_eq!(neutral.requested_hue_family_count, 0);
+        assert!(neutral.clusters.is_empty());
 
         let weak = measure(&palette(&[(
             "accent",
@@ -367,25 +343,21 @@ mod tests {
         )]))
         .unwrap();
         assert!(!weak.evidence.is_empty());
-        assert_eq!(weak.hue_strategy, HueStrategy::AccentLed);
-        assert_eq!(weak.requested_hue_family_count, 1);
+        assert_eq!(weak.clusters.len(), 1);
 
         let accent = measure(&palette(&[("accent", 0.14, 0.2, Provenance::Direct)])).unwrap();
-        assert_eq!(accent.hue_strategy, HueStrategy::AccentLed);
-        assert_eq!(accent.requested_hue_family_count, 1);
+        assert_eq!(accent.clusters.len(), 1);
     }
 
     #[test]
-    fn hue_strategy_has_no_three_cluster_gate() {
+    fn hue_clustering_has_no_three_cluster_gate() {
         let native = measure(&palette(&[
             ("red", 0.12, 0.2, Provenance::Direct),
             ("green", 0.12, 2.1, Provenance::Direct),
             ("blue", 0.12, 4.0, Provenance::Direct),
         ]))
         .unwrap();
-        assert_eq!(native.hue_strategy, HueStrategy::PaletteNative);
-        assert_eq!(native.requested_hue_family_count, 3);
-        assert_eq!(native.requested_hue_family_count, native.clusters.len());
+        assert_eq!(native.clusters.len(), 3);
 
         let dominant_cluster = measure(&palette(&[
             ("red", 0.18, 0.1, Provenance::Direct),
@@ -395,8 +367,6 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(dominant_cluster.clusters.len(), 3);
-        assert_eq!(dominant_cluster.hue_strategy, HueStrategy::PaletteNative);
-        assert_eq!(dominant_cluster.requested_hue_family_count, 3);
 
         let two_clusters = measure(&palette(&[
             ("red", 0.12, 0.0, Provenance::Direct),
@@ -406,8 +376,13 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(two_clusters.clusters.len(), 2);
-        assert_eq!(two_clusters.hue_strategy, HueStrategy::PaletteNative);
-        assert_eq!(two_clusters.requested_hue_family_count, 2);
+    }
+
+    #[test]
+    fn authored_neutral_colors_are_tone_evidence_not_hue_clusters() {
+        let profile = measure(&palette(&[("accent", 0.0, 0.0, Provenance::Direct)])).unwrap();
+        assert_eq!(profile.evidence.len(), 1);
+        assert!(profile.clusters.is_empty());
     }
 
     #[test]
