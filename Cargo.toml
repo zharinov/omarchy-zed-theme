@@ -13,6 +13,7 @@ jsonc-parser = { version = "0.33.1", features = ["cst", "serde_json"] }
 libc = "0.2"
 rayon = "1.11"
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10.9"
 
 [profile.release]
 overflow-checks = true

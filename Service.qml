@@ -11,37 +11,35 @@ Item {
   property bool initialized: false
   property bool binaryReady: false
   property bool syncPending: false
-  property bool initialSyncPending: false
-  property bool markAfterActivation: false
+  property bool activationPending: false
   property bool ownershipClaimReady: false
+
   property string pluginVersion: ""
   property string target: ""
   property string asset: ""
   property string expectedChecksum: ""
   property string downloadPath: ""
+
   property string pluginDirectory: ""
   property string runtimeDirectory: ""
   property string binaryPath: ""
-  property string syncMarkerPath: ""
   property string temporaryPrefix: ""
   property string ownershipToken: ""
 
   readonly property string home: Quickshell.env("HOME")
-  readonly property string xdgConfigHome: Quickshell.env("XDG_CONFIG_HOME")
-  readonly property string configHome: xdgConfigHome.charAt(0) === "/"
-    ? xdgConfigHome : home + "/.config"
   readonly property string themeNamePath: home + "/.local/state/omarchy/current/theme.name"
-  readonly property string generatedThemePath: configHome + "/zed/themes/omarchy.json"
   readonly property string ownershipClaimPath: home
     + "/.local/state/omarchy/.zed-theme-owner"
 
   function fail(message) {
     console.warn("Omarchy Zed Theme: " + message)
+
     if (downloadPath && downloadPath.indexOf(temporaryPrefix) === 0) {
       cleanupProcess.command = ["rm", "-f", "--", downloadPath]
       cleanupProcess.running = true
       downloadPath = ""
     }
+
     notificationProcess.command = [
       "omarchy-notification-send",
       "Omarchy Zed Theme: " + message,
@@ -56,6 +54,7 @@ Item {
     initialized = true
     pluginVersion = String(manifest.version || "")
     pluginDirectory = String(manifest.__sourceDir || "")
+
     if (!pluginVersion.match(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/)) {
       fail("invalid plugin version")
       return
@@ -64,9 +63,9 @@ Item {
       fail("cannot locate its plugin directory")
       return
     }
+
     runtimeDirectory = pluginDirectory + "/.runtime"
     binaryPath = runtimeDirectory + "/omarchy-zed-theme"
-    syncMarkerPath = runtimeDirectory + "/synced-" + pluginVersion
     temporaryPrefix = pluginDirectory.slice(0, pluginDirectory.lastIndexOf("/") + 1)
       + ".omarchy-zed-theme-download."
     ownershipToken = pluginVersion + "-" + Date.now().toString(36) + "-"
@@ -104,10 +103,8 @@ Item {
 
   function acceptBinary() {
     binaryReady = true
-    initialSyncCheckProcess.command = [
-      "test", "-f", syncMarkerPath, "-a", "-s", generatedThemePath
-    ]
-    initialSyncCheckProcess.running = true
+    activationPending = true
+    requestSync()
   }
 
   function expectedChecksumFrom(text) {
@@ -174,6 +171,7 @@ Item {
         root.fail("cannot detect CPU architecture")
         return
       }
+
       var architecture = String(architectureOutput.text || "").trim()
       if (architecture === "x86_64" || architecture === "amd64") {
         root.target = "x86_64-unknown-linux-musl"
@@ -213,6 +211,7 @@ Item {
         root.acceptBinary()
         return
       }
+
       createRuntimeProcess.command = ["mkdir", "-p", root.runtimeDirectory]
       createRuntimeProcess.running = true
     }
@@ -223,25 +222,9 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0) {
         root.fail("cannot select the Omarchy theme in Zed")
-        return
+      } else {
+        root.activationPending = false
       }
-      if (root.markAfterActivation) {
-        root.markAfterActivation = false
-        markInitialSyncProcess.command = ["touch", root.syncMarkerPath]
-        markInitialSyncProcess.running = true
-      }
-    }
-  }
-
-  Process {
-    id: initialSyncCheckProcess
-    onExited: function(exitCode) {
-      if (exitCode === 0 && !root.syncPending) {
-        root.beginActivation()
-        return
-      }
-      root.initialSyncPending = true
-      root.requestSync()
     }
   }
 
@@ -252,6 +235,7 @@ Item {
         root.fail("cannot create its runtime directory")
         return
       }
+
       checksumDownloadProcess.command = [
         "curl", "--proto", "=https", "--tlsv1.2", "-fsSL", "--max-time", "60",
         "https://github.com/zharinov/omarchy-zed-theme/releases/download/v"
@@ -272,11 +256,13 @@ Item {
         root.fail("cannot download release checksums")
         return
       }
+
       root.expectedChecksum = root.expectedChecksumFrom(checksumDownloadOutput.text)
       if (!root.expectedChecksum) {
         root.fail("release checksum is missing")
         return
       }
+
       temporaryFileProcess.command = ["mktemp", root.temporaryPrefix + "XXXXXX"]
       temporaryFileProcess.running = true
     }
@@ -296,6 +282,7 @@ Item {
         root.fail("cannot create a temporary download")
         return
       }
+
       binaryDownloadProcess.command = [
         "curl", "--proto", "=https", "--tlsv1.2", "-fsSL", "--max-time", "120",
         "https://github.com/zharinov/omarchy-zed-theme/releases/download/v"
@@ -313,6 +300,7 @@ Item {
         root.fail("cannot download its release binary")
         return
       }
+
       digestProcess.command = ["sha256sum", root.downloadPath]
       digestProcess.running = true
     }
@@ -330,6 +318,7 @@ Item {
         root.fail("release checksum verification failed")
         return
       }
+
       makeExecutableProcess.command = ["chmod", "755", root.downloadPath]
       makeExecutableProcess.running = true
     }
@@ -342,6 +331,7 @@ Item {
         root.fail("cannot make its release binary executable")
         return
       }
+
       candidateVersionProcess.command = [root.downloadPath, "--version"]
       candidateVersionProcess.running = true
     }
@@ -358,6 +348,7 @@ Item {
         root.fail("release binary has an unexpected version")
         return
       }
+
       publishBinaryProcess.command = ["mv", "-f", root.downloadPath, root.binaryPath]
       publishBinaryProcess.running = true
     }
@@ -370,15 +361,9 @@ Item {
         root.fail("cannot publish its release binary")
         return
       }
+
       root.downloadPath = ""
       root.acceptBinary()
-    }
-  }
-
-  Process {
-    id: markInitialSyncProcess
-    onExited: function(exitCode) {
-      if (exitCode !== 0) root.fail("cannot record its initial synchronization")
     }
   }
 
@@ -393,11 +378,11 @@ Item {
         console.warn("Omarchy Zed Theme sync error: "
           + String(syncErrorOutput.text || "").trim())
         root.fail("cannot update Zed")
-      } else if (root.initialSyncPending) {
-        root.initialSyncPending = false
-        root.markAfterActivation = true
+      } else if (root.activationPending && !root.syncPending
+          && !activationProcess.running) {
         root.beginActivation()
       }
+
       if (root.syncPending) syncTimer.restart()
     }
   }

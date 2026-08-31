@@ -9,13 +9,14 @@ use omarchy_zed_theme::constants::{
     RUNTIME_STATE_CONSECUTIVE_DELTA_E, STATUS_NAMES, TERMINAL_FIELDS, VIM_FIELDS,
 };
 use omarchy_zed_theme::palette::{Provenance, ResolvedPalette, resolve_palette};
-use omarchy_zed_theme::publish::atomic_write_file;
+use omarchy_zed_theme::publish::{atomic_write_file, generate_and_publish};
 use omarchy_zed_theme::saliency::relative_saliency;
 use omarchy_zed_theme::syntax::{contrast_floor, overlay_contrast_floor};
 use omarchy_zed_theme::theme::build_theme;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -102,6 +103,114 @@ fn synthetic_palette() -> ResolvedPalette {
             .map(|key| ((*key).to_owned(), Provenance::Direct))
             .collect(),
     }
+}
+
+fn write_test_resolver(path: &std::path::Path, palette: &ResolvedPalette) {
+    let mut output = String::new();
+    for (key, value) in &palette.colors {
+        output.push_str(&format!("{key}\t{value}\n"));
+    }
+    output.push_str(&format!("mode\t{}\n", palette.mode));
+    fs::write(path.with_extension("output"), output).unwrap();
+    fs::write(
+        path,
+        "#!/usr/bin/env bash\nset -euo pipefail\ncat -- \"${BASH_SOURCE[0]}.output\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn malformed_resolved_palettes_are_rejected() {
+    let mut missing = synthetic_palette();
+    missing.colors.remove("foreground");
+
+    assert!(
+        build_theme(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("omitted canonical keys: foreground")
+    );
+
+    let mut invalid_mode = synthetic_palette();
+    invalid_mode.mode = "sepia".into();
+
+    assert!(
+        build_theme(&invalid_mode)
+            .unwrap_err()
+            .to_string()
+            .contains("resolved mode must be 'dark' or 'light'")
+    );
+
+    let mut invalid_color = synthetic_palette();
+    invalid_color
+        .colors
+        .insert("foreground".into(), "#€éa".into());
+
+    assert!(build_theme(&invalid_color).is_err());
+}
+
+#[test]
+fn generation_cache_uses_effective_inputs() {
+    let root = temporary("generation-cache");
+    let colors = root.join("colors.toml");
+    let resolver = root.join("resolver");
+    let output = root.join("themes");
+    fs::create_dir(&root).unwrap();
+    fs::write(&colors, "unused by the test resolver\n").unwrap();
+
+    let mut palette = synthetic_palette();
+    write_test_resolver(&resolver, &palette);
+
+    let first = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
+    let second = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
+
+    assert!(!first.cached);
+    assert!(first.audit.is_some());
+    assert!(second.cached);
+    assert!(second.audit.is_none());
+
+    palette.colors.insert("red".into(), "#ff5555".into());
+    write_test_resolver(&resolver, &palette);
+
+    let invalidated = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
+
+    assert!(!invalidated.cached);
+    assert!(invalidated.audit.is_some());
+
+    let target = output.join("omarchy.json");
+    let generated = fs::read(&target).unwrap();
+
+    fs::write(&target, b"tampered theme\n").unwrap();
+
+    let repaired = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
+
+    assert!(!repaired.cached);
+    assert!(repaired.audit.is_some());
+    assert_eq!(fs::read(&target).unwrap(), generated);
+
+    let cache = output.join(".omarchy-zed-theme.cache");
+    let victim = root.join("cache-victim");
+    fs::remove_file(&cache).unwrap();
+    fs::write(&victim, "keep\n").unwrap();
+    symlink(&victim, &cache).unwrap();
+
+    palette.colors.insert("green".into(), "#55ff55".into());
+    write_test_resolver(&resolver, &palette);
+
+    let changed = generate_and_publish(&colors, Some(&output), Some(&resolver), None).unwrap();
+
+    assert!(!changed.cached);
+    assert!(changed.audit.is_some());
+    assert_eq!(fs::read_to_string(victim).unwrap(), "keep\n");
+    assert!(
+        fs::symlink_metadata(&cache)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn narrow_multicluster_palette() -> ResolvedPalette {

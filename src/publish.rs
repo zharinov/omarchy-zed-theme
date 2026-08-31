@@ -3,15 +3,20 @@
 //! A theme update holds one lock, verifies source identity after validation,
 //! rejects a symlink at the destination, and atomically replaces changed output.
 
-use crate::palette::resolve_palette;
+use crate::palette::{Provenance, ResolvedPalette, resolve_palette};
 use crate::theme::{Audit, build_theme};
 use crate::{Error, Result};
 use fs2::FileExt;
+use sha2::{Digest, Sha256};
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -66,7 +71,7 @@ fn replaceable_target(path: &Path) -> Result<()> {
 pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
     let mut file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -115,6 +120,7 @@ fn atomic_write_file_inner(
     {
         return Ok(None);
     }
+
     if current.as_deref() == Some(content) {
         return Ok(Some(false));
     }
@@ -138,6 +144,7 @@ fn atomic_write_file_inner(
         {
             return Ok(false);
         }
+
         fs::rename(&temporary, target)?;
         File::open(parent)?.sync_all()?;
         Ok(true)
@@ -165,8 +172,101 @@ pub fn atomic_write_file_if_unchanged(
 
 pub struct ThemeUpdate {
     pub target: PathBuf,
-    pub audit: Audit,
+    pub audit: Option<Audit>,
     pub changed: bool,
+    pub cached: bool,
+}
+
+fn running_binary_hash() -> Result<[u8; 32]> {
+    static HASH: OnceLock<[u8; 32]> = OnceLock::new();
+    if let Some(hash) = HASH.get() {
+        return Ok(*hash);
+    }
+
+    let path = Path::new("/proc/self/exe");
+    let mut file = File::open(path)
+        .or_else(|_| std::env::current_exe().and_then(File::open))
+        .map_err(|error| Error(format!("cannot open the running executable: {error}")))?;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let length = file
+            .read(&mut buffer)
+            .map_err(|error| Error(format!("cannot hash the running executable: {error}")))?;
+        if length == 0 {
+            break;
+        }
+        hasher.update(&buffer[..length]);
+    }
+
+    let hash = hasher.finalize().into();
+    let _ = HASH.set(hash);
+    Ok(hash)
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn generation_cache_key(
+    binary_hash: [u8; 32],
+    palette: &ResolvedPalette,
+    appearance_assertion: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"omarchy-zed-theme-cache-v1");
+    hash_field(&mut hasher, &binary_hash);
+    hash_field(&mut hasher, palette.mode.as_bytes());
+
+    hasher.update((palette.colors.len() as u64).to_le_bytes());
+    for (key, value) in &palette.colors {
+        hash_field(&mut hasher, key.as_bytes());
+        hash_field(&mut hasher, value.as_bytes());
+    }
+
+    hasher.update((palette.extras.len() as u64).to_le_bytes());
+    for (key, value) in &palette.extras {
+        hash_field(&mut hasher, key.as_bytes());
+        hash_field(&mut hasher, value.as_bytes());
+    }
+
+    hasher.update((palette.provenance.len() as u64).to_le_bytes());
+    for (key, provenance) in &palette.provenance {
+        hash_field(&mut hasher, key.as_bytes());
+        hasher.update([match provenance {
+            Provenance::Direct => 0,
+            Provenance::Alias => 1,
+            Provenance::Derived => 2,
+        }]);
+    }
+
+    hash_field(&mut hasher, palette.resolver_stderr.as_bytes());
+    match appearance_assertion {
+        Some(appearance) => {
+            hasher.update([1]);
+            hash_field(&mut hasher, appearance.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn cache_record(key: &str, output: &[u8]) -> Vec<u8> {
+    format!("v1\n{key}\n{:x}\n", Sha256::digest(output)).into_bytes()
+}
+
+fn cache_matches(cache_path: &Path, target: &Path, key: &str) -> Result<bool> {
+    let record = match read_regular_nofollow(cache_path) {
+        Ok(Some(record)) => record,
+        Ok(None) | Err(_) => return Ok(false),
+    };
+
+    let Some(output) = read_regular_nofollow(target)? else {
+        return Ok(false);
+    };
+    Ok(record == cache_record(key, &output))
 }
 
 fn publish_if_source_unchanged(
@@ -192,6 +292,7 @@ pub fn generate_and_publish(
     let destination =
         output_directory.unwrap_or_else(|| colors_file.parent().unwrap_or_else(|| Path::new(".")));
     let target = destination.join("omarchy.json");
+    let cache_path = destination.join(".omarchy-zed-theme.cache");
     let lock_parent = destination.parent().unwrap_or(destination);
 
     fs::create_dir_all(lock_parent)?;
@@ -238,6 +339,21 @@ pub fn generate_and_publish(
             )));
         }
 
+        let cache_key =
+            generation_cache_key(running_binary_hash()?, &palette, appearance_assertion);
+
+        if cache_matches(&cache_path, &target, &cache_key)? {
+            if source_identity(colors_file)? != after_resolve {
+                continue;
+            }
+            return Ok(ThemeUpdate {
+                target,
+                audit: None,
+                changed: false,
+                cached: true,
+            });
+        }
+
         let (document, audit) = build_theme(&palette)?;
         let mut content = serde_json::to_vec_pretty(&document)?;
         content.push(b'\n');
@@ -247,11 +363,13 @@ pub fn generate_and_publish(
         else {
             continue;
         };
+        let _ = atomic_write_file(&cache_path, &cache_record(&cache_key, &content));
 
         return Ok(ThemeUpdate {
             target,
-            audit,
+            audit: Some(audit),
             changed,
+            cached: false,
         });
     }
 
@@ -264,6 +382,7 @@ pub fn generate_and_publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn temporary(name: &str) -> PathBuf {
         let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -312,5 +431,80 @@ mod tests {
         assert_eq!(result, None);
         assert_eq!(fs::read(&target).unwrap(), b"newer");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_requires_the_key_and_output_bytes_to_match() {
+        let root = temporary("cache-match");
+        let target = root.join("themes/omarchy.json");
+        let cache = root.join("themes/.omarchy-zed-theme.cache");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"theme-a").unwrap();
+        fs::write(&cache, cache_record("input-a", b"theme-a")).unwrap();
+
+        assert!(cache_matches(&cache, &target, "input-a").unwrap());
+        assert!(!cache_matches(&cache, &target, "input-b").unwrap());
+        fs::write(&target, b"theme-b").unwrap();
+        assert!(!cache_matches(&cache, &target, "input-a").unwrap());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regular_reader_rejects_a_fifo_without_blocking() {
+        let root = temporary("fifo");
+        let fifo = root.join("cache");
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(read_regular_nofollow(&fifo).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_key_covers_the_binary_and_effective_inputs() {
+        let mut palette = ResolvedPalette {
+            mode: "dark".into(),
+            colors: [("background".into(), "#101010".into())].into(),
+            extras: [("custom".into(), "value".into())].into(),
+            resolver_stderr: "warning".into(),
+            provenance: [("background".into(), Provenance::Direct)].into(),
+        };
+        let binary = [1; 32];
+        let original = generation_cache_key(binary, &palette, None);
+
+        assert_ne!(original, generation_cache_key([2; 32], &palette, None));
+        assert_ne!(
+            original,
+            generation_cache_key(binary, &palette, Some("dark"))
+        );
+
+        let mut changed = palette.clone();
+        changed.mode = "light".into();
+        assert_ne!(original, generation_cache_key(binary, &changed, None));
+
+        let mut changed = palette.clone();
+        changed.colors.insert("background".into(), "#202020".into());
+        assert_ne!(original, generation_cache_key(binary, &changed, None));
+
+        let mut changed = palette.clone();
+        changed.extras.insert("custom".into(), "other".into());
+        assert_ne!(original, generation_cache_key(binary, &changed, None));
+
+        let mut changed = palette.clone();
+        changed
+            .provenance
+            .insert("background".into(), Provenance::Derived);
+        assert_ne!(original, generation_cache_key(binary, &changed, None));
+
+        palette.resolver_stderr = "other warning".into();
+        assert_ne!(original, generation_cache_key(binary, &palette, None));
     }
 }

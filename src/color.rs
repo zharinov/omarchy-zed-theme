@@ -346,9 +346,13 @@ fn linear_rgb24(rgb: Rgb24) -> [f64; 3] {
 
 pub fn parse_hex(value: &str) -> Result<Rgba> {
     let bytes = value.as_bytes();
-    if (bytes.len() != 7 && bytes.len() != 9) || bytes.first() != Some(&b'#') {
+    if (bytes.len() != 7 && bytes.len() != 9)
+        || bytes.first() != Some(&b'#')
+        || !bytes[1..].iter().all(u8::is_ascii_hexdigit)
+    {
         return Err(Error(format!("invalid hex color: {value:?}")));
     }
+
     let parse = |range: std::ops::Range<usize>| {
         u8::from_str_radix(&value[range], 16)
             .map(|part| part as f64 / 255.0)
@@ -678,6 +682,11 @@ mod tests {
             gpui_blend("#000000", "#ffffff80").unwrap().opaque_hex(),
             "#808080"
         );
+    }
+
+    #[test]
+    fn malformed_non_ascii_hex_is_rejected() {
+        assert!(parse_hex("#€éa").is_err());
     }
 
     #[test]

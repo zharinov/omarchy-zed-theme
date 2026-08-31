@@ -9,7 +9,7 @@ use self::tokens::{
 };
 use crate::color::{
     apply_opacity, contrast_ratio, delta_e, gamut_map_oklch, gpui_blend, lab, lightness,
-    oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
+    normalize_hex, oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
 };
 use crate::constants::*;
 use crate::palette::ResolvedPalette;
@@ -627,6 +627,29 @@ fn derive_semantics(
 }
 
 pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
+    if palette.mode != "dark" && palette.mode != "light" {
+        return Err(Error(format!(
+            "resolved mode must be 'dark' or 'light', got {:?}",
+            palette.mode
+        )));
+    }
+
+    let missing = CANONICAL_COLOR_KEYS
+        .iter()
+        .filter(|key| !palette.colors.contains_key(**key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(Error(format!(
+            "resolved palette omitted canonical keys: {}",
+            missing.join(", ")
+        )));
+    }
+
+    for key in CANONICAL_COLOR_KEYS {
+        normalize_hex(&palette.colors[*key], key)?;
+    }
+
     let mut search = Search::default();
     search.prewarm(palette.colors.values().map(String::as_str))?;
     let mut audit = Audit::new(palette);

@@ -368,6 +368,10 @@ impl PreparedFill {
     }
 
     fn new(request: OverlayFitRequest<'_>) -> Result<Self> {
+        if request.backgrounds.is_empty() {
+            return Err(Error("overlay fit requires at least one background".into()));
+        }
+
         let backgrounds = request
             .backgrounds
             .iter()
@@ -788,6 +792,10 @@ impl Search {
         constraints: PairConstraints,
         readable_foregrounds: &[(String, f64)],
     ) -> Result<[String; 2]> {
+        if first_backgrounds.is_empty() || second_backgrounds.is_empty() {
+            return Err(Error("fit_pair requires at least one background".into()));
+        }
+
         let collect = |search: &mut Self,
                        seed: &str,
                        backgrounds: &[String]|
@@ -1595,6 +1603,10 @@ impl Search {
         minimum_delta_e: f64,
         references: &[(String, f64, f64)],
     ) -> Result<String> {
+        if backgrounds.is_empty() {
+            return Err(Error("fit_state requires at least one background".into()));
+        }
+
         let background_metrics = backgrounds
             .iter()
             .map(|background| ColorMetrics::from_hex(background))
@@ -2035,6 +2047,46 @@ mod tests {
     #[test]
     fn empty_cvd_order_is_empty() {
         assert!(cvd_greedy_order(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fits_require_a_background() {
+        let backgrounds = Vec::new();
+        let request = || OverlayFitRequest::new(&backgrounds, 1.1, 0.01);
+        let mut search = Search::default();
+
+        assert!(search.fit_readable_overlay("#ffffff", request()).is_err());
+
+        assert!(
+            search
+                .fit_state("#ffffff", &backgrounds, 1.1, 0.01, &[])
+                .is_err()
+        );
+
+        assert!(
+            search
+                .fit_overlay_pair(
+                    "#ffffff",
+                    "#000000",
+                    OverlayPairRequest::new(
+                        request(),
+                        request(),
+                        PairConstraints::new(1.1, 1.01, 0.01, 0.01),
+                    ),
+                )
+                .is_err()
+        );
+
+        assert!(
+            search
+                .fit_pair(
+                    "#ffffff",
+                    "#000000",
+                    &backgrounds,
+                    PairConstraints::new(1.1, 1.01, 0.01, 0.01),
+                )
+                .is_err()
+        );
     }
 
     #[test]
