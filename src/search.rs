@@ -5,12 +5,11 @@
 //! that reach a pair comparison. Independent source tables are prepared in parallel.
 
 use crate::color::{
-    ColorMetrics, Rgb24, Rgba, Rgba32, contrast_ratio, delta_e, endpoint_chroma_taper,
+    ColorMetrics, Rgb24, Rgba, Rgba32, contrast_ratio, endpoint_chroma_taper,
     gamut_chroma_limit_with_components, gamut_map_oklch_rgb24_with_components, lab, oklab_to_oklch,
     oklch_in_gamut_with_components,
 };
 use crate::constants::*;
-use crate::theme::Audit;
 use crate::{Error, Result};
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -1722,7 +1721,6 @@ impl Search {
         seeds: &[String],
         backgrounds: &[String],
         target: f64,
-        audit: &mut Audit,
         role: &str,
     ) -> Result<Vec<String>> {
         let mut chosen: Vec<String> = Vec::new();
@@ -1856,28 +1854,6 @@ impl Search {
                         "no distinct passing color remains for {role}[{index}]"
                     ))
                 })?;
-
-            let actual_normal = chosen
-                .iter()
-                .map(|reference| delta_e(&output, reference))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .fold(f64::INFINITY, f64::min);
-            let actual_cvd = chosen
-                .iter()
-                .map(|reference| cvd_distance(&output, reference))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .fold(f64::INFINITY, f64::min);
-
-            if actual_normal < ACCENT_NORMAL_DELTA_E - 1e-12
-                || actual_cvd < ACCENT_CVD_DELTA_E - 1e-12
-            {
-                audit.degradation(format!("{role}[{index}]"), "palette_separation", serde_json::json!({
-                    "normal_goal": ACCENT_NORMAL_DELTA_E, "normal_actual": round6(actual_normal),
-                    "cvd_goal": ACCENT_CVD_DELTA_E, "cvd_actual": round6(actual_cvd),
-                }));
-            }
 
             chosen.push(output);
         }
@@ -2043,6 +2019,7 @@ pub fn round6(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::delta_e;
 
     #[test]
     fn empty_cvd_order_is_empty() {

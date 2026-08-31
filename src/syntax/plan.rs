@@ -1,6 +1,5 @@
 //! Defines stable semantic syntax roles and a nested distinction budget.
 
-use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -274,30 +273,6 @@ impl MergePlan {
         } else {
             SemanticRole::Base
         }
-    }
-
-    pub fn audit(&self) -> Value {
-        json!({
-            "budget": self.budget,
-            "selection": "fixed semantic refinement forest with independent trunk and branch activation",
-            "families": self.families.iter().enumerate().map(|(id, family)| json!({
-                "id": id,
-                "name": family.name,
-                "anchor": family.anchor.as_str(),
-                "source_preference": family.source_preference.as_str(),
-                "roles": family.roles.iter().map(|role| role.as_str()).collect::<Vec<_>>(),
-                "parent": family.parent,
-                "fallback_saliency": family.fallback_saliency,
-                "parent_saliency_delta": family.parent_saliency_delta,
-                "tone_band": family.anchor.tone_band().as_str(),
-            })).collect::<Vec<_>>(),
-            "inactive_roles": ORDINARY_ROLES.iter().copied().filter(|role| self.family_for(*role).is_none()).map(|role| json!({
-                "role": role.as_str(),
-                "fallback": self.fallback_for(role).as_str(),
-            })).collect::<Vec<_>>(),
-            "nested": true,
-            "comments_consume_chromatic_budget": false,
-        })
     }
 }
 

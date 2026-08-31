@@ -7,8 +7,6 @@
 use crate::Result;
 use crate::color::{lab, oklab_to_oklch};
 use crate::palette::{Provenance, ResolvedPalette};
-use crate::search::round6;
-use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::f64::consts::{PI, TAU};
 
@@ -319,68 +317,6 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
     })
 }
 
-impl SyntaxProfile {
-    pub fn audit(&self) -> Value {
-        let color_audit = |colors: &[EvidenceColor]| {
-            colors
-                .iter()
-                .map(|color| {
-                    json!({
-                        "value": color.value,
-                        "keys": color.keys,
-                        "provenance": format!("{:?}", color.provenance).to_ascii_lowercase(),
-                        "oklch": [round6(color.lightness), round6(color.chroma), round6(color.hue)],
-                        "breadth_weight": round6(color.weight),
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-        let authored_colors = color_audit(&self.authored_colors);
-        let evidence = color_audit(&self.evidence);
-
-        let clusters = self
-            .clusters
-            .iter()
-            .map(|cluster| {
-                json!({
-                    "members": cluster.members.iter().map(|index| self.evidence[*index].value.clone()).collect::<Vec<_>>(),
-                    "weight": round6(cluster.weight),
-                    "representative": self.evidence[cluster.representative].value,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        json!({
-            "thresholds": {
-                "chroma_evidence": CHROMA_EVIDENCE,
-                "complete_link_hue_degrees": 35.0,
-                "continuous_hue_similarity_full_degrees": 25.0,
-                "continuous_hue_similarity_zero_degrees": 45.0,
-                "neutral_target_median_chroma": NEUTRAL_MEDIAN_CHROMA,
-                "neutral_maximum_ordinary_chroma": NEUTRAL_MAXIMUM_CHROMA,
-            },
-            "scores": {
-                "authored_breadth": round6(self.authored_breadth),
-                "authored_intensity": round6(self.authored_intensity),
-                "effective_hue_families": round6(self.effective_hue_families),
-            },
-            "source_chroma": {
-                "median": round6(self.source_median_chroma),
-                "q90": round6(self.source_q90_chroma),
-            },
-            "chroma_envelope": {
-                "target_median_chroma": round6(self.chroma_envelope.target_median),
-                "maximum_ordinary_chroma": round6(self.chroma_envelope.ordinary_maximum),
-            },
-            "requested_hue_family_count": self.requested_hue_family_count,
-            "hue_strategy": self.hue_strategy.as_str(),
-            "authored_colors": authored_colors,
-            "evidence": evidence,
-            "hue_clusters": clusters,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,8 +342,6 @@ mod tests {
         ResolvedPalette {
             mode: "dark".into(),
             colors,
-            extras: BTreeMap::new(),
-            resolver_stderr: String::new(),
             provenance,
         }
     }

@@ -1,7 +1,7 @@
 use crate::color::normalize_hex;
 use crate::constants::{CANONICAL_COLOR_KEYS, COLOR_ALIASES};
 use crate::{Error, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -9,8 +9,6 @@ use std::process::{Command, Stdio};
 pub struct ResolvedPalette {
     pub mode: String,
     pub colors: BTreeMap<String, String>,
-    pub extras: BTreeMap<String, String>,
-    pub resolver_stderr: String,
     pub provenance: BTreeMap<String, Provenance>,
 }
 
@@ -50,7 +48,6 @@ fn parse_tsv(output: &str) -> Result<BTreeMap<String, String>> {
 fn parse_resolved_records(
     records: BTreeMap<String, String>,
     raw: BTreeMap<String, String>,
-    stderr: &str,
 ) -> Result<ResolvedPalette> {
     let missing: Vec<_> = CANONICAL_COLOR_KEYS
         .iter()
@@ -96,17 +93,6 @@ fn parse_resolved_records(
         ));
     }
 
-    let recognized: BTreeSet<&str> = CANONICAL_COLOR_KEYS
-        .iter()
-        .copied()
-        .chain(COLOR_ALIASES.iter().map(|(alias, _)| *alias))
-        .chain(["mode", "theme_type"])
-        .collect();
-    let extras = records
-        .into_iter()
-        .filter(|(key, _)| !recognized.contains(key.as_str()))
-        .collect();
-
     let alias_sources = BTreeMap::from([
         ("red", &["color1"][..]),
         ("green", &["color2"]),
@@ -135,8 +121,6 @@ fn parse_resolved_records(
     Ok(ResolvedPalette {
         mode,
         colors,
-        extras,
-        resolver_stderr: stderr.trim().to_owned(),
         provenance,
     })
 }
@@ -219,6 +203,5 @@ pub fn resolve_palette(colors_file: &Path, resolver: Option<&Path>) -> Result<Re
     parse_resolved_records(
         parse_tsv(&String::from_utf8_lossy(&output.stdout))?,
         parse_tsv(&String::from_utf8_lossy(&raw_output.stdout))?,
-        &String::from_utf8_lossy(&output.stderr),
     )
 }

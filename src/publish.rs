@@ -4,7 +4,7 @@
 //! rejects a symlink at the destination, and atomically replaces changed output.
 
 use crate::palette::{Provenance, ResolvedPalette, resolve_palette};
-use crate::theme::{Audit, build_theme};
+use crate::theme::build_theme;
 use crate::{Error, Result};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -172,7 +172,6 @@ pub fn atomic_write_file_if_unchanged(
 
 pub struct ThemeUpdate {
     pub target: PathBuf,
-    pub audit: Option<Audit>,
     pub changed: bool,
     pub cached: bool,
 }
@@ -226,12 +225,6 @@ fn generation_cache_key(
         hash_field(&mut hasher, value.as_bytes());
     }
 
-    hasher.update((palette.extras.len() as u64).to_le_bytes());
-    for (key, value) in &palette.extras {
-        hash_field(&mut hasher, key.as_bytes());
-        hash_field(&mut hasher, value.as_bytes());
-    }
-
     hasher.update((palette.provenance.len() as u64).to_le_bytes());
     for (key, provenance) in &palette.provenance {
         hash_field(&mut hasher, key.as_bytes());
@@ -242,7 +235,6 @@ fn generation_cache_key(
         }]);
     }
 
-    hash_field(&mut hasher, palette.resolver_stderr.as_bytes());
     match appearance_assertion {
         Some(appearance) => {
             hasher.update([1]);
@@ -348,13 +340,12 @@ pub fn generate_and_publish(
             }
             return Ok(ThemeUpdate {
                 target,
-                audit: None,
                 changed: false,
                 cached: true,
             });
         }
 
-        let (document, audit) = build_theme(&palette)?;
+        let document = build_theme(&palette)?;
         let mut content = serde_json::to_vec_pretty(&document)?;
         content.push(b'\n');
 
@@ -367,7 +358,6 @@ pub fn generate_and_publish(
 
         return Ok(ThemeUpdate {
             target,
-            audit: Some(audit),
             changed,
             cached: false,
         });
@@ -470,11 +460,9 @@ mod tests {
 
     #[test]
     fn cache_key_covers_the_binary_and_effective_inputs() {
-        let mut palette = ResolvedPalette {
+        let palette = ResolvedPalette {
             mode: "dark".into(),
             colors: [("background".into(), "#101010".into())].into(),
-            extras: [("custom".into(), "value".into())].into(),
-            resolver_stderr: "warning".into(),
             provenance: [("background".into(), Provenance::Direct)].into(),
         };
         let binary = [1; 32];
@@ -495,16 +483,9 @@ mod tests {
         assert_ne!(original, generation_cache_key(binary, &changed, None));
 
         let mut changed = palette.clone();
-        changed.extras.insert("custom".into(), "other".into());
-        assert_ne!(original, generation_cache_key(binary, &changed, None));
-
-        let mut changed = palette.clone();
         changed
             .provenance
             .insert("background".into(), Provenance::Derived);
         assert_ne!(original, generation_cache_key(binary, &changed, None));
-
-        palette.resolver_stderr = "other warning".into();
-        assert_ne!(original, generation_cache_key(binary, &palette, None));
     }
 }

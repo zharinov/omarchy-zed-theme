@@ -1,7 +1,7 @@
 //! Builds a complete Zed theme and rejects output that violates its color constraints.
 //!
 //! Omarchy supplies every UI color. Built-in colors may repair syntax roles only.
-//! Search can record an unmet preference, but it cannot downgrade a failed validation.
+//! Preference fallbacks cannot downgrade a failed validation.
 
 use self::tokens::{
     ContentTokens, DerivedTokens, InteractionTokens, OpaqueColor, OverlayColor, PaintColor,
@@ -19,7 +19,6 @@ use crate::saliency::{
 };
 use crate::search::{
     FitBounds, OverlayFitRequest, OverlayPairRequest, PairConstraints, Search, cvd_greedy_order,
-    round6,
 };
 use crate::syntax::{SyntaxContexts, build_syntax, contrast_floor, overlay_contrast_floor};
 use crate::{Error, Result};
@@ -27,77 +26,6 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 mod tokens;
-
-#[derive(Clone, Debug)]
-pub struct Audit {
-    pub mode: String,
-    pub extras: Vec<String>,
-    pub surface_changes: Vec<Value>,
-    pub repairs: Vec<Value>,
-    pub degradations: Vec<Value>,
-    pub minimums: BTreeMap<String, f64>,
-    pub warnings: Vec<String>,
-    pub saliency: Vec<Value>,
-    pub syntax_analysis: Value,
-    pub syntax_roles: Vec<Value>,
-    pub syntax_collapses: Vec<Value>,
-    pub diff_metrics: Vec<Value>,
-    pub interaction_ladders: Vec<Value>,
-    pub fidelity_deviations: Vec<Value>,
-}
-
-impl Audit {
-    fn new(palette: &ResolvedPalette) -> Self {
-        Self {
-            mode: palette.mode.clone(),
-            extras: palette.extras.keys().cloned().collect(),
-            surface_changes: Vec::new(),
-            repairs: Vec::new(),
-            degradations: Vec::new(),
-            minimums: BTreeMap::new(),
-            warnings: (!palette.resolver_stderr.is_empty())
-                .then(|| palette.resolver_stderr.clone())
-                .into_iter()
-                .collect(),
-            saliency: Vec::new(),
-            syntax_analysis: Value::Null,
-            syntax_roles: Vec::new(),
-            syntax_collapses: Vec::new(),
-            diff_metrics: Vec::new(),
-            interaction_ladders: Vec::new(),
-            fidelity_deviations: Vec::new(),
-        }
-    }
-
-    pub fn degradation(&mut self, role: String, invariant: &str, detail: Value) {
-        let mut record = Map::new();
-        record.insert("role".into(), role.into());
-        record.insert("invariant".into(), invariant.into());
-        if let Value::Object(detail) = detail {
-            record.extend(detail);
-        }
-        self.degradations.push(Value::Object(record));
-    }
-
-    fn repair(&mut self, role: &str, source: &str, output: &str) -> Result<()> {
-        if source != output {
-            self.repairs.push(json!({"role": role, "source": source, "output": output, "delta_e": round6(delta_e(source, output)?)}));
-        }
-        Ok(())
-    }
-
-    pub fn detail(&self) -> Value {
-        json!({
-            "mode": self.mode, "extras": self.extras, "surface_changes": self.surface_changes,
-            "repairs": self.repairs, "degradations": self.degradations,
-            "minimums": self.minimums, "warnings": self.warnings,
-            "saliency": self.saliency,
-            "syntax_analysis": self.syntax_analysis, "syntax_roles": self.syntax_roles,
-            "syntax_collapses": self.syntax_collapses, "diff_metrics": self.diff_metrics,
-            "interaction_ladders": self.interaction_ladders, "fidelity_deviations": self.fidelity_deviations,
-        })
-    }
-}
 
 fn color<'a>(palette: &'a ResolvedPalette, key: &str) -> &'a str {
     &palette.colors[key]
@@ -133,7 +61,6 @@ fn render_with_bounded_generic_highlights(
 
 fn fit_highlight_with_alpha_fallback(
     search: &mut Search,
-    audit: &mut Audit,
     role: &str,
     seed: &str,
     request: OverlayFitRequest<'_>,
@@ -143,25 +70,13 @@ fn fit_highlight_with_alpha_fallback(
             Ok(output) => return Ok(output),
             Err(error) => error,
         };
-    let output = search
+    search
         .fit_readable_overlay_bounded(seed, request, OVERLAY_MAX_ALPHA)
         .map_err(|fallback_error| {
             Error(format!(
                 "{role}: preferred alpha cap failed: {preferred_cap_error}; relaxed alpha cap failed: {fallback_error}"
             ))
-        })?;
-
-    audit.degradation(
-        role.into(),
-        "highlight_alpha_cap_relaxed",
-        json!({
-            "preferred_maximum_alpha": PREFERRED_HIGHLIGHT_MAX_ALPHA,
-            "fallback_maximum_alpha": OVERLAY_MAX_ALPHA,
-            "actual_alpha": round6(parse_hex(&output)?.a),
-            "reason": preferred_cap_error.to_string(),
-        }),
-    );
-    Ok(output)
+        })
 }
 
 #[derive(Default)]
@@ -215,10 +130,7 @@ impl StyleBuilder {
     }
 }
 
-fn derive_surfaces(
-    palette: &ResolvedPalette,
-    audit: &mut Audit,
-) -> Result<BTreeMap<String, String>> {
+fn derive_surfaces(palette: &ResolvedPalette) -> Result<BTreeMap<String, String>> {
     let canvas = color(palette, "background");
     let canvas_lightness = lightness(canvas)?;
     let offsets = if palette.mode == "dark" {
@@ -289,35 +201,28 @@ fn derive_surfaces(
 
         eligible.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(right.1)));
 
-        let (source_key, source, source_lightness, output) =
-            if let Some((_, key, value, value_lightness)) = eligible.first() {
-                (*key, *value, *value_lightness, (*value).to_owned())
-            } else {
-                let Some((key, source, source_lightness)) =
-                    authored.iter().min_by(|left, right| {
-                        (left.2 - target)
-                            .abs()
-                            .total_cmp(&(right.2 - target).abs())
-                            .then(left.0.cmp(right.0))
-                    })
-                else {
-                    return Err(Error("no authored surface colors are available".into()));
-                };
-                let mut output = tone(source, target, 1.0)?;
-                if lightness(&output)? <= previous + 1e-6 {
-                    output = tone(source, (previous + 0.004).min(1.0), 1.0)?;
-                }
-                (*key, *source, *source_lightness, output)
+        let output = if let Some((_, key, value, value_lightness)) = eligible.first() {
+            let _ = (key, value_lightness);
+            (*value).to_owned()
+        } else {
+            let Some((key, source, source_lightness)) = authored.iter().min_by(|left, right| {
+                (left.2 - target)
+                    .abs()
+                    .total_cmp(&(right.2 - target).abs())
+                    .then(left.0.cmp(right.0))
+            }) else {
+                return Err(Error("no authored surface colors are available".into()));
             };
+            let mut output = tone(source, target, 1.0)?;
+            if lightness(&output)? <= previous + 1e-6 {
+                output = tone(source, (previous + 0.004).min(1.0), 1.0)?;
+            }
+            let _ = (key, source_lightness);
+            output
+        };
 
         used.insert(output.clone());
         previous = lightness(&output)?;
-
-        audit.surface_changes.push(json!({
-            "role": role, "source_key": source_key, "source": source, "output": output,
-            "delta_l": round6(lightness(&output)? - source_lightness),
-            "delta_e": round6(delta_e(&output, source)?),
-        }));
 
         surfaces.insert(role.into(), output);
     }
@@ -355,7 +260,6 @@ fn minimum_pairwise(
 
 fn fit_player_cursors(
     search: &mut Search,
-    audit: &mut Audit,
     seeds: &[String],
     backgrounds: &[String],
 ) -> Result<Vec<String>> {
@@ -363,18 +267,10 @@ fn fit_player_cursors(
         seeds,
         backgrounds,
         TERMINAL_BRIGHT_PREFERRED,
-        audit,
         "players.cursor",
     ) {
         Ok(values) => Ok(values),
-        Err(_) => {
-            audit.degradation(
-                "players.cursor".into(),
-                "preferred_cursor_contrast",
-                json!({"preferred": TERMINAL_BRIGHT_PREFERRED, "hard_floor": TEXT_CONTRAST}),
-            );
-            search.fit_distinct_colors(seeds, backgrounds, TEXT_CONTRAST, audit, "players.cursor")
-        }
+        Err(_) => search.fit_distinct_colors(seeds, backgrounds, TEXT_CONTRAST, "players.cursor"),
     }
 }
 
@@ -382,17 +278,11 @@ struct TerminalRequest<'a> {
     seeds: [&'a str; 3],
     backgrounds: &'a [String],
     mode: &'a str,
-    role: &'a str,
 }
 
-fn terminal_triplet(
-    search: &mut Search,
-    audit: &mut Audit,
-    request: TerminalRequest<'_>,
-) -> Result<[String; 3]> {
+fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result<[String; 3]> {
     let [dim_seed, normal_seed, bright_seed] = request.seeds;
     let backgrounds = request.backgrounds;
-    let role = request.role;
     let endpoint = if request.mode == "dark" {
         "#ffffff"
     } else {
@@ -401,11 +291,9 @@ fn terminal_triplet(
     let preferred = |search: &mut Search,
                      seed: &str,
                      target: f64,
-                     variant: &str,
                      lower: f64,
                      upper: f64,
-                     prefer_background: bool,
-                     audit: &mut Audit|
+                     prefer_background: bool|
      -> Result<String> {
         if lightness(endpoint)? >= lower - 1e-12
             && lightness(endpoint)? <= upper + 1e-12
@@ -424,7 +312,7 @@ fn terminal_triplet(
                 },
             )
         } else {
-            let candidate = search.fit_color_bounded(
+            search.fit_color_bounded(
                 seed,
                 backgrounds,
                 TEXT_CONTRAST,
@@ -435,22 +323,16 @@ fn terminal_triplet(
                     prefer_background,
                     ..FitBounds::default()
                 },
-            )?;
-            audit.degradation(format!("{role}.{variant}"), "terminal_preferred_contrast", json!({
-                "preferred": target, "hard_floor": TEXT_CONTRAST, "actual": round6(minimum_contrast(&candidate, backgrounds)?),
-            }));
-            Ok(candidate)
+            )
         }
     };
     let normal = preferred(
         search,
         normal_seed,
         TERMINAL_NORMAL_PREFERRED,
-        "normal",
         0.0,
         1.0,
         false,
-        audit,
     )?;
     let normal_l = lightness(&normal)?;
     let (dim_lower, dim_upper, bright_lower, bright_upper) = if request.mode == "dark" {
@@ -471,32 +353,16 @@ fn terminal_triplet(
         },
     ) {
         Ok(value) => value,
-        Err(_) => {
-            audit.degradation(format!("{role}.dim"), "terminal_dim_hue_preserving_space", json!({
-                "hard_floor": TEXT_CONTRAST, "actual": round6(minimum_contrast(&normal, backgrounds)?),
-            }));
-            normal.clone()
-        }
+        Err(_) => normal.clone(),
     };
     let bright = preferred(
         search,
         bright_seed,
         TERMINAL_BRIGHT_PREFERRED,
-        "bright",
         bright_lower,
         bright_upper,
         false,
-        audit,
     )?;
-    for (variant, candidate) in [("dim", &dim), ("bright", &bright)] {
-        if candidate == &normal {
-            audit.degradation(
-                format!("{role}.{variant}"),
-                "terminal_variant_distinctness",
-                json!({"actual": candidate}),
-            );
-        }
-    }
     Ok([dim, normal, bright])
 }
 
@@ -541,7 +407,6 @@ fn derive_semantics(
     palette: &ResolvedPalette,
     text_backgrounds: &[String],
     semantic_backgrounds: &[String],
-    audit: &mut Audit,
 ) -> Result<SemanticColors> {
     let primary = search.fit_color(
         color(palette, "foreground"),
@@ -558,19 +423,6 @@ fn derive_semantics(
     let structural =
         search.fit_color(color(palette, "muted"), text_backgrounds, CONTROL_CONTRAST)?;
     let passive = search.fit_color(color(palette, "muted"), text_backgrounds, PASSIVE_CONTRAST)?;
-    for (role, source, output) in [
-        ("text", color(palette, "foreground"), &primary),
-        ("text.muted", color(palette, "muted"), &secondary),
-        (
-            "text.disabled",
-            color(palette, "dark_foreground"),
-            &disabled,
-        ),
-        ("accent", color(palette, "accent"), &accent),
-        ("structural", color(palette, "muted"), &structural),
-    ] {
-        audit.repair(role, source, output)?;
-    }
     let [green, red] = search
         .fit_pair(
             color(palette, "green"),
@@ -587,19 +439,11 @@ fn derive_semantics(
         std::slice::from_ref(&blue),
     ) {
         Ok(yellow) => yellow,
-        Err(error) => {
-            let yellow = search.fit_color(
-                color(palette, "yellow"),
-                semantic_backgrounds,
-                TEXT_CONTRAST,
-            )?;
-            audit.degradation(
-                "semantic.yellow".into(),
-                "blue_yellow_separation",
-                json!({"actual": yellow, "reason": error.to_string()}),
-            );
-            yellow
-        }
+        Err(_) => search.fit_color(
+            color(palette, "yellow"),
+            semantic_backgrounds,
+            TEXT_CONTRAST,
+        )?,
     };
     Ok(SemanticColors {
         primary,
@@ -626,7 +470,7 @@ fn derive_semantics(
     })
 }
 
-pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
+pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
     if palette.mode != "dark" && palette.mode != "light" {
         return Err(Error(format!(
             "resolved mode must be 'dark' or 'light', got {:?}",
@@ -652,8 +496,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
 
     let mut search = Search::default();
     search.prewarm(palette.colors.values().map(String::as_str))?;
-    let mut audit = Audit::new(palette);
-    let surfaces = derive_surfaces(palette, &mut audit)?;
+    let surfaces = derive_surfaces(palette)?;
     let canvas = surfaces["canvas"].clone();
     let surface = surfaces["surface"].clone();
     let elevated = surfaces["elevated"].clone();
@@ -843,13 +686,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             .chain(tab_inactive_reuses_chrome_context.then(|| tab_inactive.clone())),
     );
 
-    let semantic = derive_semantics(
-        &mut search,
-        palette,
-        &ui_backgrounds,
-        &semantic_backgrounds,
-        &mut audit,
-    )?;
+    let semantic = derive_semantics(&mut search, palette, &ui_backgrounds, &semantic_backgrounds)?;
 
     let content_accent = search.fit_color(&semantic.accent, &ui_backgrounds, TEXT_CONTRAST)?;
     let element_selection = search
@@ -879,16 +716,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             )]),
         )
         .map_err(|error| Error(format!("active editor line: {error}")))?;
-
-    if parse_hex(&editor_active_line)?.opaque_hex() != surface {
-        audit.fidelity_deviations.push(json!({
-            "role": "editor.active_line.background",
-            "requested_relation": "surface and active line share RGB",
-            "source": surface,
-            "output": parse_hex(&editor_active_line)?.opaque_hex(),
-            "reason": "shared RGB is subordinate to readability and state visibility",
-        }));
-    }
 
     let rendered_editor_active_line = gpui_blend(&canvas, &editor_active_line)?.opaque_hex();
     let editor_highlighted_line = search
@@ -968,31 +795,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         &editor_primary,
         SaliencyRequest::new(&editor_bases, TEXT_CONTRAST, PRIMARY_SALIENCY),
     )?;
-    audit.saliency.extend([
-        editor_line_number.audit(
-            "editor.line_number",
-            PASSIVE_CONTRAST,
-            "911-theme median from tmp/zed-saliency-policy-evaluation.json",
-        ),
-        editor_hover_line_number.audit(
-            "editor.hover_line_number",
-            CONTROL_CONTRAST,
-            "deterministic midpoint between inactive and primary",
-        ),
-        editor_active_line_number.audit(
-            "editor.active_line_number",
-            TEXT_CONTRAST,
-            "911-theme active median",
-        ),
-    ]);
-
     let readable_editor_overlay_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
     let search_match_request =
         OverlayFitRequest::new(&editor_bases, SEARCH_MATCH_CONTRAST, STATE_HOVER_DELTA_E)
             .with_readable_foregrounds(&readable_editor_overlay_text);
     let initial_search_match = fit_highlight_with_alpha_fallback(
         &mut search,
-        &mut audit,
         "search.match_background",
         &semantic.yellow,
         search_match_request,
@@ -1005,7 +813,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     .with_readable_foregrounds(&readable_editor_overlay_text);
     let (search_match, search_active) = match fit_highlight_with_alpha_fallback(
         &mut search,
-        &mut audit,
         "search.active_match_background",
         &semantic.accent,
         search_active_request.with_rendered_references(&[(
@@ -1037,22 +844,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                         "search highlights failed sequentially ({sequential_error}) and jointly ({joint_error})"
                     ))
                 })?;
-            audit.degradation(
-                "search.active_match_background".into(),
-                "joint_state_fit",
-                json!({
-                    "initial_match": initial_search_match,
-                    "joint_match": joint_search_match,
-                    "reason": sequential_error.to_string(),
-                }),
-            );
             (joint_search_match, joint_search_active)
         }
     };
 
     let document_read = fit_highlight_with_alpha_fallback(
         &mut search,
-        &mut audit,
         "editor.document_highlight.read_background",
         &semantic.accent,
         OverlayFitRequest::new(
@@ -1063,19 +860,8 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         .with_readable_foregrounds(&readable_editor_overlay_text),
     )?;
 
-    if parse_hex(&document_read)?.opaque_hex() != content_accent {
-        audit.fidelity_deviations.push(json!({
-            "role": "editor.document_highlight.read_background",
-            "requested_relation": "content accent and document read share RGB",
-            "source": content_accent,
-            "output": parse_hex(&document_read)?.opaque_hex(),
-            "reason": "shared RGB is subordinate to readability and state visibility",
-        }));
-    }
-
     let document_write = fit_highlight_with_alpha_fallback(
         &mut search,
-        &mut audit,
         "editor.document_highlight.write_background",
         &semantic.orange,
         OverlayFitRequest::new(
@@ -1087,7 +873,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     )?;
     let document_bracket = fit_highlight_with_alpha_fallback(
         &mut search,
-        &mut audit,
         "editor.document_highlight.bracket_background",
         &semantic.cyan,
         OverlayFitRequest::new(
@@ -1209,7 +994,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
 
     let yank = fit_highlight_with_alpha_fallback(
         &mut search,
-        &mut audit,
         "vim.yank.background",
         &semantic.yellow,
         OverlayFitRequest::new(
@@ -1228,15 +1012,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         document_bracket.as_str(),
         yank.as_str(),
     ];
-    audit.degradation(
-        "editor.generic_highlight_stack".into(),
-        "bounded_overlap_depth",
-        json!({
-            "validated_generic_highlight_depth": 1,
-            "reason": "Zed permits multiple unordered highlights, but deeper stacks cannot preserve every palette's text contract"
-        }),
-    );
-
     let constraint_word_added_bases = constraint_added_hunk_scenes
         .iter()
         .cloned()
@@ -1362,18 +1137,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                 u8::MAX,
                 u8::MAX,
             ) {
-                Ok(selection) => {
-                    audit.degradation(
-                        "players[0].selection".into(),
-                        "selection_seed_substitution",
-                        json!({
-                            "requested": color(palette, "selection"),
-                            "fallback_seed": semantic.accent,
-                            "reason": source_error.to_string(),
-                        }),
-                    );
-                    selection
-                }
+                Ok(selection) => selection,
                 Err(accent_error) => {
                     let mut fallback_errors = Vec::new();
                     let mut fallback_candidate = None;
@@ -1391,21 +1155,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                             Err(error) => fallback_errors.push(format!("{seed}: {error}")),
                         }
                     }
-                    let (fallback_seed, selection) = fallback_candidate.ok_or_else(|| {
+                    let (_, selection) = fallback_candidate.ok_or_else(|| {
                         Error(format!(
                             "focused selection failed for source ({source_error}), accent ({accent_error}), and player seeds ({})",
                             fallback_errors.join("; ")
                         ))
                     })?;
-                    audit.degradation(
-                        "players[0].selection".into(),
-                        "selection_seed_substitution",
-                        json!({
-                            "requested": color(palette, "selection"),
-                            "fallback_seed": fallback_seed,
-                            "reason": source_error.to_string(),
-                        }),
-                    );
                     selection
                 }
             }
@@ -1419,17 +1174,13 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             .push(gpui_blend(background, &apply_opacity(&selection, 0.5)?)?.opaque_hex());
     }
     let player_cursor_backgrounds = unique(player_cursor_backgrounds);
-    let provisional_player_cursors = fit_player_cursors(
-        &mut search,
-        &mut audit,
-        &player_seeds,
-        &player_cursor_backgrounds,
-    )?;
+    let provisional_player_cursors =
+        fit_player_cursors(&mut search, &player_seeds, &player_cursor_backgrounds)?;
 
     let readable = [(editor_primary.clone(), TEXT_CONTRAST)];
     let mut player_selections = vec![selection];
     let mut shared_selection_fallback = false;
-    for (index, cursor) in provisional_player_cursors.iter().enumerate().skip(1) {
+    for cursor in provisional_player_cursors.iter().skip(1) {
         let references = player_selections
             .iter()
             .map(|selection| (selection.clone(), 1.0, PLAYER_SELECTION_DELTA_E))
@@ -1449,11 +1200,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         {
             fitted
         } else {
-            audit.degradation(
-                format!("players[{index}].selection"),
-                "shared_selection_fallback",
-                json!({"reason": "palette cannot distinguish another readable selection"}),
-            );
             shared_selection_fallback = true;
             player_selections[0].clone()
         };
@@ -1478,19 +1224,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     let player_cursors = if shared_selection_fallback {
         provisional_player_cursors.clone()
     } else {
-        match fit_player_cursors(
-            &mut search,
-            &mut audit,
-            &player_seeds,
-            &final_cursor_backgrounds,
-        ) {
+        match fit_player_cursors(&mut search, &player_seeds, &final_cursor_backgrounds) {
             Ok(values) => values,
             Err(_) => {
-                audit.degradation(
-                    "players.selection".into(),
-                    "shared_selection_fallback",
-                    json!({"reason": "palette cannot keep every distinct selection readable beneath its cursor"}),
-                );
                 let shared = player_selections[0].clone();
                 player_selections.fill(shared);
                 provisional_player_cursors.clone()
@@ -1499,11 +1235,10 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     };
 
     let mut players = Vec::new();
-    for (index, ((seed, cursor), selection)) in player_seeds
+    for ((seed, cursor), selection) in player_seeds
         .iter()
         .zip(&player_cursors)
         .zip(player_selections)
-        .enumerate()
     {
         let background = search
             .fit_state(
@@ -1514,25 +1249,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                 &[(cursor.clone(), TEXT_CONTRAST, STATE_CONSECUTIVE_DELTA_E)],
             )
             .unwrap_or_else(|_| canvas.clone());
-        if background == canvas {
-            audit.degradation(
-                format!("players[{index}].background"),
-                "colored_mermaid_background",
-                json!({"actual": canvas}),
-            );
-        }
-
-        let selection_rgb = parse_hex(&selection)?.opaque_hex();
-        if selection_rgb != *cursor {
-            audit.fidelity_deviations.push(json!({
-                "role": format!("players[{index}].selection"),
-                "requested_relation": "cursor and selection share RGB",
-                "source": cursor,
-                "output": selection_rgb,
-                "reason": "shared RGB is subordinate to selection visibility and cursor readability",
-            }));
-        }
-
         players.push(BTreeMap::from([
             ("cursor".into(), cursor.clone()),
             ("background".into(), background),
@@ -1550,7 +1266,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     let terminal_backgrounds = unique([canvas.clone(), local_selection, local_unfocused_selection]);
     let foreground_triplet = terminal_triplet(
         &mut search,
-        &mut audit,
         TerminalRequest {
             seeds: [
                 color(palette, "dark_foreground"),
@@ -1559,7 +1274,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             ],
             backgrounds: &terminal_backgrounds,
             mode: &palette.mode,
-            role: "terminal.foreground",
         },
     )?;
     let mut terminal = BTreeMap::from([
@@ -1583,10 +1297,8 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
     {
         let dim_key = format!("color{index}");
         let bright_key = format!("color{}", index + 8);
-        let role = format!("terminal.ansi.{name}");
         let triplet = terminal_triplet(
             &mut search,
-            &mut audit,
             TerminalRequest {
                 seeds: [
                     color(palette, &dim_key),
@@ -1595,7 +1307,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
                 ],
                 backgrounds: &terminal_backgrounds,
                 mode: &palette.mode,
-                role: &role,
             },
         )?;
         terminal.insert(format!("terminal.ansi.dim_{name}"), triplet[0].clone());
@@ -1752,7 +1463,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         &editor_primary,
         &statuses["predictive"],
         [&diff_green_seed, &diff_yellow_seed, &diff_red_seed],
-        &mut audit,
     )?;
 
     let accent_seeds = cvd_greedy_order(&[
@@ -1773,7 +1483,6 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
         &accent_seeds,
         std::slice::from_ref(&canvas),
         CONTROL_CONTRAST,
-        &mut audit,
         "accents",
     )?;
 
@@ -2054,10 +1763,9 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<(Value, Audit)> {
             editor_text_backgrounds: &editor_text_backgrounds,
             terminal_backgrounds: &terminal_backgrounds,
         },
-        &mut audit,
     )?;
 
-    Ok((document, audit))
+    Ok(document)
 }
 
 fn style(document: &Value) -> Result<&Map<String, Value>> {
@@ -2089,11 +1797,7 @@ struct ValidationContexts<'a> {
     terminal_backgrounds: &'a [String],
 }
 
-fn validate_theme(
-    document: &Value,
-    contexts: ValidationContexts<'_>,
-    audit: &mut Audit,
-) -> Result<()> {
+fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<()> {
     let ValidationContexts {
         ui_backgrounds,
         interaction_bases,
@@ -2269,7 +1973,6 @@ fn validate_theme(
         "version_control.conflict",
         "version_control.ignored",
     ];
-    let mut text_minimum = f64::INFINITY;
     for (names, backgrounds) in [
         (&ui_text_fields[..], ui_backgrounds),
         (&semantic_text_fields[..], interaction_bases),
@@ -2277,35 +1980,24 @@ fn validate_theme(
         for name in names {
             let value = style_color(style, name)?;
             let actual = minimum_contrast(value, backgrounds)?;
-            text_minimum = text_minimum.min(actual);
             if actual < HARD_TEXT_CONTRAST - 1e-9 {
                 errors.push(format!("{name} reaches only {actual:.3}:1"));
             }
         }
     }
-    audit.minimums.insert(
-        "ui_text".into(),
-        (text_minimum * 10_000.0).round() / 10_000.0,
-    );
     let editor_foreground = style_color(style, "editor.foreground")?;
-    let mut editor_label_minimum = f64::INFINITY;
     for (name, floor) in [
         ("editor.line_number", HARD_PASSIVE_CONTRAST),
         ("editor.hover_line_number", HARD_CONTROL_CONTRAST),
         ("editor.active_line_number", HARD_TEXT_CONTRAST),
     ] {
         let actual = minimum_contrast(style_color(style, name)?, editor_bases)?;
-        editor_label_minimum = editor_label_minimum.min(actual);
         if actual < floor - 1e-9 {
             errors.push(format!(
                 "{name} reaches only {actual:.3}:1; floor is {floor:.2}:1"
             ));
         }
     }
-    audit.minimums.insert(
-        "editor_labels".into(),
-        (editor_label_minimum * 10_000.0).round() / 10_000.0,
-    );
     let inactive_saliency = crate::saliency::relative_saliency(
         style_color(style, "editor.line_number")?,
         editor_foreground,
@@ -2360,15 +2052,12 @@ fn validate_theme(
         ));
     }
     let syntax_normal_contexts = [style_color(style, "editor.background")?.to_owned()];
-    let mut syntax_minimum = f64::INFINITY;
-    let mut syntax_overlay_minimum = f64::INFINITY;
     for (name, spec) in syntax {
         let value = spec
             .get("color")
             .and_then(Value::as_str)
             .ok_or_else(|| Error(format!("syntax role {name} has no color")))?;
         let normal_actual = minimum_contrast(value, &syntax_normal_contexts)?;
-        syntax_minimum = syntax_minimum.min(normal_actual);
         let normal_target = contrast_floor(name)
             .ok_or_else(|| Error(format!("syntax role {name} has no capture policy")))?
             - 0.02;
@@ -2378,7 +2067,6 @@ fn validate_theme(
             ));
         }
         let overlay_actual = minimum_contrast(value, syntax_contexts)?;
-        syntax_overlay_minimum = syntax_overlay_minimum.min(overlay_actual);
         let overlay_target = overlay_contrast_floor(name)
             .ok_or_else(|| Error(format!("syntax role {name} has no overlay policy")))?
             - 0.02;
@@ -2442,33 +2130,17 @@ fn validate_theme(
             "syntax diff pair is ambiguous: contrast {syntax_diff_contrast:.3}, delta E {syntax_diff_delta:.3}, CVD {syntax_diff_cvd:.3}"
         ));
     }
-    audit.minimums.insert(
-        "syntax".into(),
-        (syntax_minimum * 10_000.0).round() / 10_000.0,
-    );
-    audit.minimums.insert(
-        "syntax_overlay".into(),
-        (syntax_overlay_minimum * 10_000.0).round() / 10_000.0,
-    );
-
     let terminal_names: Vec<_> = TERMINAL_FIELDS
         .iter()
         .copied()
         .filter(|name| !matches!(*name, "terminal.background" | "terminal.ansi.background"))
         .collect();
-    let mut terminal_minimum = f64::INFINITY;
     for name in terminal_names {
         let actual = minimum_contrast(style_color(style, name)?, terminal_backgrounds)?;
-        terminal_minimum = terminal_minimum.min(actual);
         if actual < HARD_TEXT_CONTRAST - 1e-9 {
             errors.push(format!("{name} reaches only {actual:.3}:1"));
         }
     }
-    audit.minimums.insert(
-        "terminal".into(),
-        (terminal_minimum * 10_000.0).round() / 10_000.0,
-    );
-
     let structural = [
         ("border", "surface.background", HARD_CONTROL_CONTRAST),
         (
@@ -2817,7 +2489,7 @@ fn validate_theme(
         }
         previous_editor_state = Some((rendered, name));
     }
-    for (family, background, names, require_base_step) in [
+    for (_, background, names, require_base_step) in [
         (
             "element",
             "element.background",
@@ -2844,7 +2516,6 @@ fn validate_theme(
         let base = style_color(style, background)?;
         let mut previous_ratio = 1.0;
         let mut previous_color = base.to_owned();
-        let mut rungs = Vec::new();
         for name in names {
             let value = gpui_blend(base, style_color(style, name)?)?.opaque_hex();
             let ratio = contrast_ratio(&value, base)?;
@@ -2863,13 +2534,9 @@ fn validate_theme(
                     "{name} is not distinct from the preceding interaction rung"
                 ));
             }
-            rungs.push(json!({"role": name, "color": value, "base_contrast": round6(ratio), "previous_contrast": round6(consecutive_ratio), "previous_delta_e": round6(consecutive_delta)}));
             previous_ratio = ratio;
             previous_color = value;
         }
-        audit
-            .interaction_ladders
-            .push(json!({"family": family, "background": base, "rungs": rungs}));
     }
     {
         let (first, second, family) = ("tab.inactive_background", "tab.active_background", "tab");
@@ -3018,7 +2685,6 @@ fn validate_theme(
         }
     }
 
-    let mut diff_fill_minimum = f64::INFINITY;
     for rendered in [
         &added_solid,
         &deleted_solid,
@@ -3027,8 +2693,7 @@ fn validate_theme(
         &conflict_ours,
         &conflict_theirs,
     ] {
-        let actual = minimum_pairwise(editor_bases, rendered, contrast_ratio)?;
-        diff_fill_minimum = diff_fill_minimum.min(actual);
+        minimum_pairwise(editor_bases, rendered, contrast_ratio)?;
     }
     for (name, rendered) in [
         ("version_control.conflict_marker.ours", &conflict_ours),
@@ -3078,7 +2743,7 @@ fn validate_theme(
     {
         errors.push(format!("diff added/deleted pair is ambiguous: contrast {pair_contrast:.3}, delta E {pair_delta:.3}, delta L {pair_lightness:.3}, CVD {pair_cvd:.3}"));
     }
-    for (family, first_role, second_role, first_scenes, second_scenes) in [
+    for (family, _, _, first_scenes, second_scenes) in [
         (
             "hunk.solid",
             "editor.diff_hunk.added.background",
@@ -3118,18 +2783,6 @@ fn validate_theme(
         let contrast = minimum_pairwise(first_scenes, second_scenes, contrast_ratio)?;
         let normal = minimum_pairwise(first_scenes, second_scenes, delta_e)?;
         let cvd = minimum_pairwise(first_scenes, second_scenes, crate::search::cvd_distance)?;
-        let first_value = style_color(style, first_role)?;
-        let second_value = style_color(style, second_role)?;
-        audit.diff_metrics.push(json!({
-            "family": family,
-            "first": first_value,
-            "second": second_value,
-            "first_alpha": round6(crate::color::parse_hex(first_value)?.a),
-            "second_alpha": round6(crate::color::parse_hex(second_value)?.a),
-            "normal_delta_e": round6(normal),
-            "cvd_delta_e": round6(cvd),
-            "pair_contrast": round6(contrast),
-        }));
         let strong_separation = contrast >= DIFF_LUMINANCE_SEPARATION_CONTRAST - 1e-9
             || (normal >= DIFF_NORMAL_DELTA_E - 1e-9 && cvd >= DIFF_CVD_DELTA_E - 1e-9);
         if family == "conflict"
@@ -3191,11 +2844,6 @@ fn validate_theme(
             ));
         }
     }
-    audit.minimums.insert(
-        "diff_fill".into(),
-        (diff_fill_minimum * 10_000.0).round() / 10_000.0,
-    );
-
     let status_surface = style_color(style, "surface.background")?;
     let global_text = style_color(style, "text")?;
     let global_icon = style_color(style, "icon")?;
@@ -3312,27 +2960,12 @@ fn validate_theme(
     }
     let mut cursor_backgrounds = editor_text_backgrounds.to_vec();
     let mut prior_selections: Vec<Vec<String>> = Vec::new();
+    let shared_selection_mode = player_values
+        .first()
+        .is_some_and(|first| player_values.iter().all(|value| value.2 == first.2));
     let mut raw_selections = BTreeSet::new();
-    let selection_fallbacks = audit
-        .degradations
-        .iter()
-        .filter(|degradation| {
-            degradation.get("invariant").and_then(Value::as_str)
-                == Some("shared_selection_fallback")
-        })
-        .filter_map(|degradation| {
-            degradation
-                .get("role")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect::<BTreeSet<_>>();
-    let shared_selection_mode = !selection_fallbacks.is_empty();
     for (index, (_, _, selection)) in player_values.iter().enumerate() {
-        let selection_role = format!("players[{index}].selection");
-        let is_fallback =
-            shared_selection_mode || selection_fallbacks.contains(selection_role.as_str());
-        if !raw_selections.insert(*selection) && !is_fallback {
+        if !raw_selections.insert(*selection) && !shared_selection_mode {
             errors.push(format!(
                 "players[{index}].selection duplicates another player"
             ));
@@ -3372,12 +3005,9 @@ fn validate_theme(
             cursor_backgrounds.extend([rendered.clone(), unfocused.clone()]);
             rendered_selection.extend([rendered, unfocused]);
         }
-        let mut word_visibility = [f64::INFINITY; 4];
         for background in editor_text_backgrounds {
             let rendered = gpui_blend(background, selection)?.opaque_hex();
             let text_contrast = contrast_ratio(editor_foreground, &rendered)?;
-            word_visibility[0] = word_visibility[0].min(contrast_ratio(&rendered, background)?);
-            word_visibility[1] = word_visibility[1].min(delta_e(&rendered, background)?);
             if text_contrast < HARD_TEXT_CONTRAST - 1e-9 {
                 errors.push(format!(
                     "editor text is unreadable on players[{index}].selection over a reachable word scene: {text_contrast:.3}:1"
@@ -3385,8 +3015,6 @@ fn validate_theme(
             }
             let unfocused = gpui_blend(background, &apply_opacity(selection, 0.5)?)?.opaque_hex();
             let unfocused_text_contrast = contrast_ratio(editor_foreground, &unfocused)?;
-            word_visibility[2] = word_visibility[2].min(contrast_ratio(&unfocused, background)?);
-            word_visibility[3] = word_visibility[3].min(delta_e(&unfocused, background)?);
             if unfocused_text_contrast < HARD_TEXT_CONTRAST - 1e-9 {
                 errors.push(format!(
                     "editor text is unreadable on unfocused players[{index}].selection over a reachable word scene: {unfocused_text_contrast:.3}:1"
@@ -3394,25 +3022,8 @@ fn validate_theme(
             }
             cursor_backgrounds.extend([rendered, unfocused]);
         }
-        if word_visibility[0] < FOCUSED_SELECTION_CONTRAST - 1e-9
-            || word_visibility[1] < FOCUSED_SELECTION_DELTA_E - 1e-9
-            || word_visibility[2] < 1.08 - 1e-9
-            || word_visibility[3] < 0.020 - 1e-9
-        {
-            audit.degradation(
-                selection_role.clone(),
-                "word_scene_visibility",
-                json!({
-                    "focused_contrast": round6(word_visibility[0]),
-                    "focused_delta_e": round6(word_visibility[1]),
-                    "unfocused_contrast": round6(word_visibility[2]),
-                    "unfocused_delta_e": round6(word_visibility[3]),
-                    "reason": "selection readability is preserved, but no hue-preserving selection satisfies the full visibility contract on every word scene",
-                }),
-            );
-        }
         for (prior_index, prior) in prior_selections.iter().enumerate() {
-            if is_fallback {
+            if shared_selection_mode {
                 continue;
             }
             for (position, (current, prior)) in rendered_selection.iter().zip(prior).enumerate() {
@@ -3483,8 +3094,6 @@ mod tests {
                 ("red".into(), "#ffffff".into()),
                 ("yellow".into(), "#000000".into()),
             ]),
-            extras: BTreeMap::new(),
-            resolver_stderr: String::new(),
             provenance: BTreeMap::new(),
         };
         for (key, target) in [("green", 145.0), ("red", 25.0), ("yellow", 85.0)] {

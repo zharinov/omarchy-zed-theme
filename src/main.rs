@@ -30,25 +30,6 @@ fn print_update(update: ThemeUpdate) {
         },
         update.target.display()
     );
-
-    let Some(audit) = update.audit else { return };
-
-    eprintln!(
-        "audit: mode={} repairs={} extras={} degradations={} syntax_min={:.2} terminal_min={:.2}",
-        audit.mode,
-        audit.repairs.len(),
-        audit.extras.len(),
-        audit.degradations.len(),
-        audit.minimums.get("syntax").unwrap_or(&0.0),
-        audit.minimums.get("terminal").unwrap_or(&0.0),
-    );
-    for warning in audit.warnings {
-        eprintln!("omarchy-zed-theme: resolver warning: {warning}");
-    }
-
-    for degradation in audit.degradations {
-        eprintln!("omarchy-zed-theme: degradation: {degradation}");
-    }
 }
 
 fn sync() -> Result<()> {

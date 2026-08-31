@@ -1,9 +1,8 @@
 //! Shared contrast-relative saliency policy for editor foreground roles.
 
 use crate::color::contrast_ratio;
-use crate::search::{FitBounds, Search, round6};
+use crate::search::{FitBounds, Search};
 use crate::{Error, Result};
-use serde_json::{Value, json};
 
 pub const INACTIVE_LINE_NUMBER_SALIENCY: f64 = 0.394;
 pub const HOVER_LINE_NUMBER_SALIENCY: f64 = 0.70;
@@ -103,23 +102,6 @@ pub fn fit_relative(
         preferred_saliency,
         actual_saliency,
     })
-}
-
-impl SaliencyFit {
-    pub fn audit(&self, role: &str, hard_floor: f64, calibration: &str) -> Value {
-        json!({
-            "role": role,
-            "metric": "log(role geometric-mean contrast) / log(editor foreground geometric-mean contrast)",
-            "calibration": calibration,
-            "hard_minimum_contrast": hard_floor,
-            "reference_contrast": round6(self.reference_contrast),
-            "preferred_contrast": round6(self.preferred_contrast),
-            "actual_contrast": round6(self.actual_contrast),
-            "preferred_saliency": round6(self.preferred_saliency),
-            "actual_saliency": round6(self.actual_saliency),
-            "output": self.output,
-        })
-    }
 }
 
 #[cfg(test)]
