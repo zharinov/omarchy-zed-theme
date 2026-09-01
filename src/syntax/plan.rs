@@ -123,6 +123,18 @@ impl MergePlan {
     }
 
     pub fn activate(&self, active: &BTreeSet<usize>) -> Self {
+        assert!(
+            active.iter().all(|index| *index < self.families.len()),
+            "active syntax family indices must belong to the hierarchy"
+        );
+        for index in active {
+            if let Some(parent) = self.families[*index].parent {
+                assert!(
+                    active.contains(&parent),
+                    "active syntax branches must retain their parent family"
+                );
+            }
+        }
         let value_active =
             self.families.iter().enumerate().any(|(index, family)| {
                 active.contains(&index) && family.anchor == SemanticRole::Value
@@ -150,7 +162,11 @@ impl MergePlan {
             .filter(|(index, _)| active.contains(index))
             .map(|(_, family)| {
                 let mut family = family.clone();
-                family.parent = family.parent.and_then(|parent| remap.get(&parent).copied());
+                family.parent = family.parent.map(|parent| {
+                    *remap
+                        .get(&parent)
+                        .expect("active syntax branches must have an active parent")
+                });
 
                 match family.anchor {
                     SemanticRole::String if !value_active => {
@@ -241,5 +257,13 @@ mod tests {
             plan.family_for(SemanticRole::Type),
             plan.family_for(SemanticRole::Member)
         );
+    }
+
+    #[test]
+    fn activation_rejects_invalid_family_sets() {
+        let hierarchy = MergePlan::hierarchy();
+        for active in [BTreeSet::from([3]), BTreeSet::from([usize::MAX])] {
+            assert!(std::panic::catch_unwind(|| hierarchy.activate(&active)).is_err());
+        }
     }
 }

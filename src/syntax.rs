@@ -20,7 +20,7 @@ use policy::{
     CAPTURE_POLICIES, SYNTAX_ADAPTIVE_OVERLAY_FLOOR, SYNTAX_PRIMARY_FLOOR, SYNTAX_SEMANTIC_FLOOR,
     SYNTAX_SUBDUED_FLOOR, SYNTAX_SUBDUED_OVERLAY_FLOOR,
 };
-use profile::{CHROMA_EVIDENCE, EvidenceColor, SyntaxProfile};
+use profile::{CHROMA_EVIDENCE, EVIDENCE_KEYS, EvidenceColor, SyntaxProfile};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,23 +31,7 @@ const ORDINARY_CVD_SEPARATION: f64 = 0.020;
 const MINIMUM_SEMANTIC_SALIENCY_GAP: f64 = 0.03;
 const MINIMUM_AUTHORED_CHROMA_RETENTION: f64 = 0.60;
 const SUBDUED_SALIENCY: f64 = 0.55;
-const SOURCE_KEY_ORDER: [&str; 15] = [
-    "green",
-    "blue",
-    "magenta",
-    "yellow",
-    "red",
-    "cyan",
-    "orange",
-    "accent",
-    "brown",
-    "bright_green",
-    "bright_blue",
-    "bright_magenta",
-    "bright_yellow",
-    "bright_red",
-    "bright_cyan",
-];
+const SOURCE_KEY_ORDER: [&str; 15] = EVIDENCE_KEYS;
 
 #[derive(Clone, Debug, PartialEq)]
 struct FamilyAllocation {
@@ -144,13 +128,14 @@ fn source_priority(source: &EvidenceColor) -> usize {
     source
         .keys
         .iter()
-        .filter_map(|key| {
+        .map(|key| {
             SOURCE_KEY_ORDER
                 .iter()
                 .position(|candidate| candidate == key)
+                .expect("syntax evidence keys must belong to the source registry")
         })
         .min()
-        .unwrap_or(SOURCE_KEY_ORDER.len())
+        .expect("syntax evidence must retain at least one source key")
 }
 
 fn fit_tone(search: &mut Search, request: ToneFitRequest<'_>) -> Result<SaliencyFit> {
@@ -205,10 +190,26 @@ fn root_sources(profile: &SyntaxProfile, role: SemanticRole) -> Vec<Option<usize
 }
 
 fn source_cluster(profile: &SyntaxProfile, source: usize) -> Option<usize> {
-    profile
+    let evidence = profile
+        .evidence
+        .get(source)
+        .expect("semantic source index must reference syntax evidence");
+    let mut memberships = profile
         .clusters
         .iter()
-        .position(|cluster| cluster.members.contains(&source))
+        .enumerate()
+        .filter_map(|(index, cluster)| cluster.members.contains(&source).then_some(index));
+    let cluster = memberships.next();
+    assert!(
+        memberships.next().is_none(),
+        "syntax evidence cannot belong to more than one hue cluster"
+    );
+    assert_eq!(
+        cluster.is_some(),
+        evidence.chroma >= CHROMA_EVIDENCE - 1e-12,
+        "chromatic syntax evidence must belong to exactly one hue cluster"
+    );
+    cluster
 }
 
 fn allocate_family(search: &mut Search, request: FamilyFitRequest<'_>) -> Result<FamilyAllocation> {
@@ -872,6 +873,7 @@ mod tests {
     use super::*;
     use crate::color::gamut_map_oklch_unchecked;
     use crate::palette::Provenance;
+    use proptest::prelude::*;
 
     fn allocation(family: usize) -> FamilyAllocation {
         FamilyAllocation {
@@ -903,6 +905,93 @@ mod tests {
             provenance,
         })
         .unwrap()
+    }
+
+    fn generated_profile(
+        source_count: usize,
+        hue_degrees: [u16; 5],
+        chroma_steps: [u8; 5],
+        source_aliases: [u8; 5],
+    ) -> SyntaxProfile {
+        let mut colors = BTreeMap::new();
+        let mut provenance = BTreeMap::new();
+        for key in SOURCE_KEY_ORDER {
+            colors.insert(key.to_owned(), "#777777".to_owned());
+            provenance.insert(key.to_owned(), Provenance::Derived);
+        }
+        for (index, key) in SOURCE_KEY_ORDER[..source_count].iter().enumerate() {
+            let source = usize::from(source_aliases[index]) % source_count;
+            let hue = f64::from(hue_degrees[source]).to_radians();
+            let chroma = 0.03 + f64::from(chroma_steps[source]) / 1_700.0;
+            colors.insert(
+                (*key).to_owned(),
+                gamut_map_oklch_unchecked(0.65, chroma, hue).opaque_hex(),
+            );
+            provenance.insert((*key).to_owned(), Provenance::Direct);
+        }
+        profile::measure(&ResolvedPalette {
+            mode: "dark".into(),
+            colors,
+            provenance,
+        })
+        .unwrap()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn pruned_semantic_planner_matches_exhaustive_search(
+            source_count in 0_usize..=5,
+            hue_degrees in any::<[u16; 5]>(),
+            chroma_steps in any::<[u8; 5]>(),
+            source_aliases in any::<[u8; 5]>(),
+        ) {
+            let profile = generated_profile(
+                source_count,
+                hue_degrees.map(|hue| hue % 360),
+                chroma_steps,
+                source_aliases,
+            );
+            let contexts = vec!["#111111".to_owned()];
+            let mut pruned_search = Search::default();
+            let mut exhaustive_search = Search::default();
+            let pruned = select_semantic_plan_with_pruning(
+                &mut pruned_search,
+                &contexts,
+                &contexts,
+                "#eeeeee",
+                &profile,
+                ["#eeeeee", "#777777"],
+                true,
+            );
+            let exhaustive = select_semantic_plan_with_pruning(
+                &mut exhaustive_search,
+                &contexts,
+                &contexts,
+                "#eeeeee",
+                &profile,
+                ["#eeeeee", "#777777"],
+                false,
+            );
+
+            match (pruned, exhaustive) {
+                (Ok(pruned), Ok(exhaustive)) => {
+                    prop_assert_eq!(pruned.plan, exhaustive.plan);
+                    prop_assert_eq!(pruned.allocations, exhaustive.allocations);
+                }
+                (Err(pruned), Err(exhaustive)) => {
+                    prop_assert_eq!(pruned.kind(), exhaustive.kind());
+                    prop_assert_eq!(pruned.to_string(), exhaustive.to_string());
+                }
+                (pruned, exhaustive) => prop_assert!(
+                    false,
+                    "pruned/exhaustive result mismatch: pruned={}, exhaustive={}",
+                    pruned.is_ok(),
+                    exhaustive.is_ok(),
+                ),
+            }
+        }
     }
 
     #[test]

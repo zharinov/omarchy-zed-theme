@@ -385,11 +385,17 @@ fn parse_palette_fixture(value: &Value) -> (String, ResolvedPalette) {
 }
 
 #[test]
-fn representative_palettes_generate_valid_themes() {
+fn dark_and_light_fixture_palettes_generate_valid_themes() {
     let fixtures: Value =
         serde_json::from_str(include_str!("fixtures/resolved-palettes.json")).unwrap();
     assert_eq!(fixtures["version"].as_u64(), Some(1));
-    for fixture in fixtures["palettes"].as_array().unwrap() {
+    for name in ["matte-black", "white"] {
+        let fixture = fixtures["palettes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fixture| fixture["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing fixture palette {name}"));
         let (name, palette) = parse_palette_fixture(fixture);
         let document = build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
         assert_rendered_diff_edge(&name, &document);

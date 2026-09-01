@@ -5,7 +5,7 @@
 //! same perceptual budget.
 
 use crate::Result;
-use crate::color::{lab, oklab_to_oklch};
+use crate::color::{lab, normalize_hex, oklab_to_oklch};
 use crate::palette::{Provenance, ResolvedPalette};
 use std::collections::BTreeMap;
 use std::f64::consts::{PI, TAU};
@@ -17,7 +17,7 @@ const HUE_SIMILARITY_ZERO: f64 = 45.0 * PI / 180.0;
 const NEUTRAL_MEDIAN_CHROMA: f64 = 0.035;
 const NEUTRAL_MAXIMUM_CHROMA: f64 = 0.055;
 
-const EVIDENCE_KEYS: [&str; 15] = [
+pub(crate) const EVIDENCE_KEYS: [&str; 15] = [
     "green",
     "blue",
     "magenta",
@@ -169,11 +169,13 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
     palette.validate_keys(&EVIDENCE_KEYS)?;
     let mut deduplicated: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
     for key in EVIDENCE_KEYS {
-        let value = palette
-            .colors
-            .get(key)
-            .expect("validated syntax evidence color must be present")
-            .clone();
+        let value = normalize_hex(
+            palette
+                .colors
+                .get(key)
+                .expect("validated syntax evidence color must be present"),
+            key,
+        )?;
         let provenance = palette
             .provenance
             .get(key)
@@ -191,6 +193,15 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
         .into_iter()
         .map(|(value, keys)| {
             let [lightness, chroma, hue] = oklab_to_oklch(lab(&value)?);
+            assert!(
+                lightness.is_finite()
+                    && chroma.is_finite()
+                    && hue.is_finite()
+                    && (0.0..=1.0).contains(&lightness)
+                    && chroma >= 0.0
+                    && (0.0..TAU).contains(&hue),
+                "validated RGB evidence must produce finite normalized OKLCH"
+            );
             Ok(EvidenceColor {
                 value,
                 keys,
@@ -227,7 +238,11 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
                     .sum::<f64>()
             })
             .sum::<f64>();
-        1.0 / concentration.max(1e-12)
+        assert!(
+            concentration.is_finite() && concentration > 0.0 && concentration <= 1.0 + 1e-12,
+            "positive syntax evidence weights must produce a finite concentration"
+        );
+        1.0 / concentration
     };
 
     let mut chromas = evidence
@@ -264,7 +279,166 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
 mod tests {
     use super::*;
     use crate::color::gamut_map_oklch_unchecked;
+    use proptest::prelude::*;
     use std::collections::BTreeMap;
+
+    fn rgb_hex([red, green, blue]: [u8; 3]) -> String {
+        format!("#{red:02x}{green:02x}{blue:02x}")
+    }
+
+    fn generated_palette(
+        colors: [[u8; 3]; 15],
+        sources: [u8; 15],
+        provenance: [u8; 15],
+        derived_replacements: Option<[[u8; 3]; 15]>,
+    ) -> ResolvedPalette {
+        let mut palette_colors = BTreeMap::new();
+        let mut palette_provenance = BTreeMap::new();
+        for (index, key) in EVIDENCE_KEYS.into_iter().enumerate() {
+            let source = usize::from(sources[index]) % colors.len();
+            let source_kind = match provenance[index] % 3 {
+                0 => Provenance::Direct,
+                1 => Provenance::Alias,
+                _ => Provenance::Derived,
+            };
+            let value = if source_kind == Provenance::Derived {
+                derived_replacements
+                    .as_ref()
+                    .map_or(colors[source], |replacements| replacements[index])
+            } else {
+                colors[source]
+            };
+            palette_colors.insert(key.to_owned(), rgb_hex(value));
+            palette_provenance.insert(key.to_owned(), source_kind);
+        }
+        ResolvedPalette {
+            mode: "dark".into(),
+            colors: palette_colors,
+            provenance: palette_provenance,
+        }
+    }
+
+    type EvidenceSignature = Vec<(String, Vec<&'static str>)>;
+    type ClusterSignature = Vec<Vec<usize>>;
+
+    fn profile_signature(profile: &SyntaxProfile) -> (EvidenceSignature, ClusterSignature) {
+        (
+            profile
+                .evidence
+                .iter()
+                .map(|color| (color.value.clone(), color.keys.clone()))
+                .collect(),
+            profile
+                .clusters
+                .iter()
+                .map(|cluster| cluster.members.clone())
+                .collect(),
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn measured_profiles_partition_evidence_and_ignore_derived_colors(
+            colors in any::<[[u8; 3]; 15]>(),
+            sources in any::<[u8; 15]>(),
+            provenance in any::<[u8; 15]>(),
+            replacements in any::<[[u8; 3]; 15]>(),
+        ) {
+            let original = measure(&generated_palette(colors, sources, provenance, None)).unwrap();
+            let replaced = measure(&generated_palette(
+                colors,
+                sources,
+                provenance,
+                Some(replacements),
+            )).unwrap();
+
+            prop_assert_eq!(profile_signature(&original), profile_signature(&replaced));
+            prop_assert_eq!(
+                original.chroma_envelope.target_median.to_bits(),
+                replaced.chroma_envelope.target_median.to_bits()
+            );
+            prop_assert_eq!(
+                original.chroma_envelope.ordinary_maximum.to_bits(),
+                replaced.chroma_envelope.ordinary_maximum.to_bits()
+            );
+
+            let mut expected_groups = BTreeMap::new();
+            for (index, key) in EVIDENCE_KEYS.into_iter().enumerate() {
+                if provenance[index] % 3 == 2 {
+                    continue;
+                }
+                let source = usize::from(sources[index]) % colors.len();
+                expected_groups
+                    .entry(rgb_hex(colors[source]))
+                    .or_insert_with(Vec::new)
+                    .push(key);
+            }
+            let actual_groups = original
+                .evidence
+                .iter()
+                .map(|color| (color.value.clone(), color.keys.clone()))
+                .collect::<BTreeMap<_, _>>();
+            prop_assert_eq!(actual_groups, expected_groups);
+
+            let unique_values = original
+                .evidence
+                .iter()
+                .map(|color| &color.value)
+                .collect::<std::collections::BTreeSet<_>>();
+            prop_assert_eq!(unique_values.len(), original.evidence.len());
+
+            let mut clustered = original
+                .clusters
+                .iter()
+                .flat_map(|cluster| cluster.members.iter().copied())
+                .collect::<Vec<_>>();
+            clustered.sort_unstable();
+            let expected = original
+                .evidence
+                .iter()
+                .enumerate()
+                .filter_map(|(index, color)|
+                    (color.chroma >= CHROMA_EVIDENCE - 1e-12).then_some(index)
+                )
+                .collect::<Vec<_>>();
+            prop_assert_eq!(clustered, expected);
+            for cluster in &original.clusters {
+                prop_assert!(cluster.members.contains(&cluster.representative));
+                for (position, left) in cluster.members.iter().enumerate() {
+                    for right in &cluster.members[position + 1..] {
+                        prop_assert!(
+                            circular_distance(
+                                original.evidence[*left].hue,
+                                original.evidence[*right].hue,
+                            ) <= HUE_CLUSTER_LIMIT + 1e-12
+                        );
+                    }
+                }
+            }
+            for left in 0..original.clusters.len() {
+                for right in left + 1..original.clusters.len() {
+                    let cannot_merge = original.clusters[left].members.iter().any(|left_index| {
+                        original.clusters[right].members.iter().any(|right_index| {
+                            circular_distance(
+                                original.evidence[*left_index].hue,
+                                original.evidence[*right_index].hue,
+                            ) > HUE_CLUSTER_LIMIT + 1e-12
+                        })
+                    });
+                    prop_assert!(cannot_merge);
+                }
+            }
+
+            prop_assert!(original.chroma_envelope.target_median.is_finite());
+            prop_assert!(original.chroma_envelope.ordinary_maximum.is_finite());
+            prop_assert!(
+                original.chroma_envelope.target_median
+                    <= original.chroma_envelope.ordinary_maximum + 1e-12
+            );
+        }
+    }
 
     fn palette(samples: &[(&str, f64, f64, Provenance)]) -> ResolvedPalette {
         let mut colors = BTreeMap::new();
@@ -287,6 +461,21 @@ mod tests {
             colors,
             provenance,
         }
+    }
+
+    #[test]
+    fn equivalent_hex_spellings_produce_one_evidence_color() {
+        let mut palette = palette(&[
+            ("red", 0.12, 0.2, Provenance::Direct),
+            ("blue", 0.12, 2.5, Provenance::Direct),
+        ]);
+        palette.colors.insert("red".into(), "#FF0000".into());
+        palette.colors.insert("blue".into(), "#ff0000".into());
+
+        let profile = measure(&palette).unwrap();
+        assert_eq!(profile.evidence.len(), 1);
+        assert_eq!(profile.evidence[0].value, "#ff0000");
+        assert_eq!(profile.evidence[0].keys, ["blue", "red"]);
     }
 
     #[test]

@@ -35,6 +35,14 @@ fn color<'a>(palette: &'a ResolvedPalette, key: &str) -> &'a str {
         .expect("validated palette color must be present")
 }
 
+fn is_dark_mode(mode: &str) -> bool {
+    match mode {
+        "dark" => true,
+        "light" => false,
+        _ => panic!("validated palette mode must be dark or light, got {mode:?}"),
+    }
+}
+
 fn unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     values
@@ -142,7 +150,7 @@ impl StyleBuilder {
 fn derive_surfaces(palette: &ResolvedPalette) -> Result<BTreeMap<String, String>> {
     let canvas = color(palette, "background");
     let canvas_lightness = lightness(canvas)?;
-    let offsets = if palette.mode == "dark" {
+    let offsets = if is_dark_mode(&palette.mode) {
         [
             ("sunken", -0.045),
             ("chrome", -0.025),
@@ -214,16 +222,15 @@ fn derive_surfaces(palette: &ResolvedPalette) -> Result<BTreeMap<String, String>
             let _ = (key, value_lightness);
             (*value).to_owned()
         } else {
-            let Some((key, source, source_lightness)) = authored.iter().min_by(|left, right| {
-                (left.2 - target)
-                    .abs()
-                    .total_cmp(&(right.2 - target).abs())
-                    .then(left.0.cmp(right.0))
-            }) else {
-                return Err(Error::infeasible(
-                    "no authored surface colors are available",
-                ));
-            };
+            let (key, source, source_lightness) = authored
+                .iter()
+                .min_by(|left, right| {
+                    (left.2 - target)
+                        .abs()
+                        .total_cmp(&(right.2 - target).abs())
+                        .then(left.0.cmp(right.0))
+                })
+                .expect("validated palettes always provide authored surface colors");
             let mut output = tone(source, target, 1.0)?;
             if lightness(&output)? <= previous + 1e-6 {
                 output = tone(source, (previous + 0.004).min(1.0), 1.0)?;
@@ -323,7 +330,7 @@ fn generated_distinct_seeds(anchor: &str, count: usize, mode: &str) -> Result<Ve
         let [_, anchor_chroma, anchor_hue] = oklab_to_oklch(lab(anchor)?);
         // Hue-only cursor sets collapse under some CVD transforms; a monotone
         // tone ladder gives the strict fitter another independent separator.
-        let lightness = if mode == "dark" {
+        let lightness = if is_dark_mode(mode) {
             [0.66, 0.71, 0.76, 0.81, 0.86, 0.90, 0.95, 0.99]
         } else {
             [0.48, 0.43, 0.38, 0.33, 0.28, 0.23, 0.18, 0.13]
@@ -343,7 +350,7 @@ fn generated_distinct_seeds(anchor: &str, count: usize, mode: &str) -> Result<Ve
             .collect());
     }
     let [_, anchor_chroma, anchor_hue] = oklab_to_oklch(lab(anchor)?);
-    let lightness = if mode == "dark" {
+    let lightness = if is_dark_mode(mode) {
         [0.68, 0.86, 0.95]
     } else {
         [0.52, 0.34, 0.18]
@@ -371,7 +378,7 @@ struct TerminalRequest<'a> {
 fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result<[String; 3]> {
     let [dim_seed, normal_seed, bright_seed] = request.seeds;
     let backgrounds = request.backgrounds;
-    let endpoint = if request.mode == "dark" {
+    let endpoint = if is_dark_mode(request.mode) {
         "#ffffff"
     } else {
         "#000000"
@@ -423,7 +430,7 @@ fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result
         false,
     )?;
     let normal_l = lightness(&normal)?;
-    let (dim_lower, dim_upper, bright_lower, bright_upper) = if request.mode == "dark" {
+    let (dim_lower, dim_upper, bright_lower, bright_upper) = if is_dark_mode(request.mode) {
         (0.0, normal_l, normal_l, 1.0)
     } else {
         (normal_l, 1.0, 0.0, normal_l)
@@ -507,7 +514,7 @@ struct DiffPresentationProfile {
 
 impl DiffPresentationProfile {
     fn for_mode(mode: &str) -> Self {
-        if mode == "light" {
+        if !is_dark_mode(mode) {
             Self {
                 line_target_contrast: LIGHT_DIFF_LINE_TARGET_CONTRAST,
                 line_minimum_delta_e: LIGHT_DIFF_LINE_MINIMUM_DELTA_E,
@@ -645,7 +652,7 @@ fn diff_overlay_seed(identity: &str, mode: &str, target_hue_degrees: f64) -> Res
     let [lightness, chroma, _] = oklab_to_oklch(lab(identity)?);
     // A low-opacity paint projection needs conventional hue and enough chroma
     // to retain its semantic edge after composition, especially in muted themes.
-    let (minimum_lightness, maximum_lightness) = if mode == "light" {
+    let (minimum_lightness, maximum_lightness) = if !is_dark_mode(mode) {
         (0.52, 0.65)
     } else {
         (0.48, 0.65)
@@ -730,8 +737,17 @@ fn derive_semantics(
 
 pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
     palette.validate()?;
-    match build_theme_from_validated_palette(palette) {
-        Err(error) if error.kind() == crate::ErrorKind::InvalidInput => {
+    classify_validated_build(build_theme_from_validated_palette(palette))
+}
+
+fn classify_validated_build(result: Result<Value>) -> Result<Value> {
+    match result {
+        Err(error)
+            if matches!(
+                error.kind(),
+                crate::ErrorKind::InvalidInput | crate::ErrorKind::External
+            ) =>
+        {
             panic!("validated palette produced invalid internal theme state: {error}")
         }
         result => result,
@@ -1358,14 +1374,33 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             .chain(word_added_scenes.iter().cloned())
             .chain(word_deleted_scenes.iter().cloned()),
     );
-    let editor_primary = search.fit_color_bounded_with_preference_backgrounds(
-        color(palette, "foreground"),
-        &editor_text_backgrounds,
-        &editor_bases,
-        EDITOR_OVERLAY_TEXT_CONTRAST,
-        &[],
-        FitBounds::default(),
-    )?;
+    let fit_editor_primary = |search: &mut Search, target| {
+        search.fit_color_bounded_with_preference_backgrounds(
+            color(palette, "foreground"),
+            &editor_text_backgrounds,
+            &editor_bases,
+            target,
+            &[],
+            FitBounds::default(),
+        )
+    };
+    let editor_primary = match fit_editor_primary(&mut search, EDITOR_OVERLAY_TEXT_CONTRAST) {
+        Ok(output) => output,
+        Err(preferred_error) if preferred_error.is_infeasible() => {
+            // Quantized overlay extremes can make reserve headroom impossible even
+            // when one foreground still satisfies the emitted editor-overlay contract.
+            fit_editor_primary(&mut search, TEXT_CONTRAST).map_err(|fallback_error| {
+                if fallback_error.is_infeasible() {
+                    Error::infeasible(format!(
+                        "final editor text: preferred reserve failed ({preferred_error}); emitted floor failed ({fallback_error})"
+                    ))
+                } else {
+                    fallback_error.context("final editor text emitted-floor fallback")
+                }
+            })?
+        }
+        Err(error) => return Err(error.context("final editor text preferred reserve")),
+    };
 
     let player_seed_values = [
         semantic.accent.clone(),
@@ -3294,6 +3329,19 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_build_classification_only_returns_infeasibility() {
+        let infeasible = classify_validated_build(Err(Error::infeasible("test"))).unwrap_err();
+        assert_eq!(infeasible.kind(), crate::ErrorKind::Infeasible);
+
+        for error in [Error::invalid("test"), Error::external("test")] {
+            assert!(
+                std::panic::catch_unwind(|| classify_validated_build(Err(error))).is_err(),
+                "invalid and external errors must be internal invariant failures"
+            );
+        }
+    }
 
     #[test]
     #[should_panic(expected = "theme role text was generated twice")]

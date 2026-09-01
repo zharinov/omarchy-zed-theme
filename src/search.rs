@@ -6,8 +6,8 @@
 
 use crate::color::{
     ColorMetrics, Rgb24, Rgba, Rgba32, contrast_ratio, endpoint_chroma_taper,
-    gamut_chroma_limit_with_components, gamut_map_oklch_rgb24_with_components, lab, oklab_to_oklch,
-    oklch_in_gamut_with_components,
+    gamut_chroma_limit_with_components, gamut_map_oklch_rgb24_with_components, lab, normalize_hex,
+    oklab_to_oklch, oklch_in_gamut_with_components,
 };
 use crate::constants::*;
 use crate::{Error, Result};
@@ -815,13 +815,23 @@ pub(crate) fn pair_constraints_satisfied(
 }
 
 fn rank_cmp(left: &[f64], right: &[f64]) -> Ordering {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "semantic rank vectors must have equal dimensions"
+    );
     left.iter()
         .zip(right)
         .find_map(|(left, right)| {
             let order = left.total_cmp(right);
             (order != Ordering::Equal).then_some(order)
         })
-        .unwrap_or_else(|| left.len().cmp(&right.len()))
+        .unwrap_or(Ordering::Equal)
+}
+
+fn opaque_color_metrics(value: &str, label: &str) -> Result<ColorMetrics> {
+    normalize_hex(value, label)?;
+    ColorMetrics::from_hex(value)
 }
 
 fn lab_distance(left: [f64; 3], right: [f64; 3]) -> f64 {
@@ -875,6 +885,7 @@ impl Search {
     }
 
     fn build_transform_table(seed: &str) -> Result<TransformTable> {
+        normalize_hex(seed, "transform seed")?;
         let source_lab = lab(seed)?;
         let seed_chroma = oklab_to_oklch(source_lab)[1];
         let mut table = Self::candidate_colors(seed)?
@@ -894,6 +905,18 @@ impl Search {
                 .total_cmp(&right.distance)
                 .then_with(|| left.metrics.rgb24().cmp(&right.metrics.rgb24()))
         });
+        assert!(
+            table
+                .iter()
+                .any(|candidate| candidate.metrics.rgb24().hex() == "#000000"),
+            "transform tables must contain the black endpoint"
+        );
+        assert!(
+            table
+                .iter()
+                .any(|candidate| candidate.metrics.rgb24().hex() == "#ffffff"),
+            "transform tables must contain the white endpoint"
+        );
 
         Ok(Arc::new(TransformTableData {
             candidates: table.into(),
@@ -1269,20 +1292,20 @@ impl Search {
             return Err(Error::invalid("fit_color requires at least one background"));
         }
 
-        let source_metrics = ColorMetrics::from_hex(seed)?;
+        let source_metrics = opaque_color_metrics(seed, "fit_color seed")?;
         let source_chroma = lab_chroma(source_metrics.lab);
         let source_retention = source_chroma / source_chroma.max(1e-12);
         let background_metrics = backgrounds
             .iter()
-            .map(|value| ColorMetrics::from_hex(value))
+            .map(|value| opaque_color_metrics(value, "fit_color background"))
             .collect::<Result<Vec<_>>>()?;
         let preference_background_metrics = preference_backgrounds
             .iter()
-            .map(|value| ColorMetrics::from_hex(value))
+            .map(|value| opaque_color_metrics(value, "fit_color preference background"))
             .collect::<Result<Vec<_>>>()?;
         let avoid_metrics = avoid
             .iter()
-            .map(|value| ColorMetrics::from_hex(value))
+            .map(|value| opaque_color_metrics(value, "fit_color avoided color"))
             .collect::<Result<Vec<_>>>()?;
         let background_lightness = preference_background_metrics
             .iter()
@@ -2352,6 +2375,90 @@ pub fn cvd_distance(first: &str, second: &str) -> Result<f64> {
 mod tests {
     use super::*;
     use crate::color::delta_e;
+    use proptest::prelude::*;
+
+    fn rgb_hex([red, green, blue]: [u8; 3]) -> String {
+        format!("#{red:02x}{green:02x}{blue:02x}")
+    }
+
+    fn standalone_luminance([red, green, blue]: [u8; 3]) -> f64 {
+        let linear = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
+
+    fn endpoint_contrast(background: [u8; 3]) -> f64 {
+        let luminance = standalone_luminance(background);
+        ((luminance + 0.05) / 0.05).max(1.05 / (luminance + 0.05))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn color_fit_obeys_contract_cache_determinism_and_relaxation(
+            seed in any::<[u8; 3]>(),
+            background in any::<[u8; 3]>(),
+            strict_basis_points in 110_u16..=700,
+            relaxation_basis_points in 0_u16..=100,
+        ) {
+            let seed = rgb_hex(seed);
+            let backgrounds = vec![rgb_hex(background)];
+            let strict_target = f64::from(strict_basis_points) / 100.0;
+            let relaxed_target =
+                (strict_target - f64::from(relaxation_basis_points) / 100.0).max(1.0);
+
+            let mut direct = Search::default();
+            let strict = direct.fit_color(&seed, &backgrounds, strict_target);
+            prop_assert_eq!(&strict, &direct.fit_color(&seed, &backgrounds, strict_target));
+
+            let mut prewarmed = Search::default();
+            prewarmed.prewarm([seed.as_str()]).unwrap();
+            let warmed = prewarmed.fit_color(&seed, &backgrounds, strict_target);
+            prop_assert_eq!(&strict, &warmed);
+            prop_assert_eq!(
+                strict.is_ok(),
+                endpoint_contrast(background) >= strict_target - 1e-12,
+                "solver feasibility disagrees with black/white endpoint witness"
+            );
+
+            match strict {
+                Ok(output) => {
+                    prop_assert!(
+                        contrast_ratio(&output, &backgrounds[0]).unwrap() >= strict_target - 1e-12
+                    );
+                    prop_assert!(
+                        direct
+                            .fit_color(&seed, &backgrounds, relaxed_target)
+                            .is_ok(),
+                        "strict target {strict_target} succeeded but relaxed target {relaxed_target} failed"
+                    );
+                }
+                Err(error) => prop_assert_eq!(error.kind(), crate::ErrorKind::Infeasible),
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_color_fit_rejects_rgba_inputs() {
+        let mut search = Search::default();
+        for error in [
+            search
+                .fit_color("#ffffff00", &["#000000".into()], 21.0)
+                .unwrap_err(),
+            search
+                .fit_color("#ffffff", &["#000000ff".into()], 21.0)
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+        }
+    }
 
     #[test]
     fn empty_cvd_order_is_empty() {
