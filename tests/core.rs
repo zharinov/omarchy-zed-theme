@@ -1,6 +1,13 @@
-use omarchy_zed_theme::color::{contrast_ratio, gamut_map_oklch, lab, oklab_to_oklch, parse_hex};
-use omarchy_zed_theme::constants::CANONICAL_COLOR_KEYS;
-use omarchy_zed_theme::palette::{Provenance, ResolvedPalette};
+use omarchy_zed_theme::color::{
+    contrast_ratio, delta_e, gamut_map_oklch, lab, oklab_to_oklch, parse_hex, render_layers,
+};
+use omarchy_zed_theme::constants::{
+    CANONICAL_COLOR_KEYS, DARK_DIFF_BORDER_OPACITY, DARK_DIFF_HOLLOW_OPACITY,
+    DARK_DIFF_LINE_OPACITY, DARK_DIFF_WORD_OPACITY, DIFF_NORMAL_FLOOR_DELTA_E, HARD_TEXT_CONTRAST,
+    LIGHT_DIFF_BORDER_OPACITY, LIGHT_DIFF_HOLLOW_OPACITY, LIGHT_DIFF_LINE_OPACITY,
+    LIGHT_DIFF_WORD_OPACITY, SEMANTIC_PAIR_CONTRACT, SYNTAX_DIFF_CONTRACT,
+};
+use omarchy_zed_theme::palette::{Provenance, ResolvedPalette, resolve_palette};
 use omarchy_zed_theme::publish::{atomic_write_file, generate_and_publish};
 use omarchy_zed_theme::syntax::contrast_floor;
 use omarchy_zed_theme::theme::build_theme;
@@ -28,6 +35,19 @@ fn style(document: &Value) -> &serde_json::Map<String, Value> {
 
 fn role<'a>(style: &'a serde_json::Map<String, Value>, name: &str) -> &'a str {
     style[name].as_str().unwrap()
+}
+
+fn assert_rendered_diff_edge(name: &str, document: &Value) {
+    let style = style(document);
+    let base = role(style, "editor.background");
+    let added = render_layers(base, &[role(style, "editor.diff_hunk.added.background")]).unwrap();
+    let deleted =
+        render_layers(base, &[role(style, "editor.diff_hunk.deleted.background")]).unwrap();
+    let distance = delta_e(&added, &deleted).unwrap();
+    assert!(
+        distance >= DIFF_NORMAL_FLOOR_DELTA_E - 1e-9,
+        "{name}: touching add/delete fills have delta E {distance:.4}"
+    );
 }
 
 fn synthetic_palette() -> ResolvedPalette {
@@ -335,7 +355,157 @@ fn representative_palettes_generate_valid_themes() {
     assert_eq!(fixtures["version"].as_u64(), Some(1));
     for fixture in fixtures["palettes"].as_array().unwrap() {
         let (name, palette) = parse_palette_fixture(fixture);
-        build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let document = build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_rendered_diff_edge(&name, &document);
+    }
+}
+
+#[test]
+fn installed_theme_corpus_generates_when_configured() {
+    let Some(root) = std::env::var_os("OMARCHY_THEMES_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let mut themes = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.join("colors.toml").is_file())
+        .collect::<Vec<_>>();
+    themes.sort();
+    assert!(!themes.is_empty());
+    for theme in themes {
+        let name = theme.file_name().unwrap().to_string_lossy();
+        let palette = resolve_palette(&theme.join("colors.toml"), None)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let document = build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_rendered_diff_edge(&name, &document);
+    }
+}
+
+#[test]
+fn pinned_external_corpus_generates_when_configured() {
+    let Some(root) = std::env::var_os("OMARCHY_ZED_EXTERNAL_CORPUS").map(PathBuf::from) else {
+        return;
+    };
+    let mut tested = 0;
+    for line in include_str!("external-corpus.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        let [name, _, commit, palette_path] = columns.as_slice() else {
+            panic!("invalid external corpus row: {line}");
+        };
+        let checkout = root.join(name);
+        let output = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&checkout)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap_or_else(|error| panic!("{name}: cannot inspect revision: {error}"));
+        assert!(output.status.success(), "{name}: git rev-parse failed");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), *commit);
+        let palette = resolve_palette(&checkout.join(palette_path), None)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let document = build_theme(&palette).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_rendered_diff_edge(name, &document);
+        tested += 1;
+    }
+    assert_eq!(tested, 16);
+}
+
+#[test]
+fn rendered_diff_hierarchy_survives_dark_and_light_palettes() {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/resolved-palettes.json")).unwrap();
+    for name in ["matte-black", "white"] {
+        let fixture = fixtures["palettes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fixture| fixture["name"] == name)
+            .unwrap();
+        let (_, palette) = parse_palette_fixture(fixture);
+        let document = build_theme(&palette).unwrap();
+        let style = style(&document);
+        let base = style["editor.background"].as_str().unwrap();
+        let expected_opacities = if palette.mode == "light" {
+            [
+                LIGHT_DIFF_LINE_OPACITY,
+                LIGHT_DIFF_HOLLOW_OPACITY,
+                LIGHT_DIFF_BORDER_OPACITY,
+                LIGHT_DIFF_WORD_OPACITY,
+            ]
+        } else {
+            [
+                DARK_DIFF_LINE_OPACITY,
+                DARK_DIFF_HOLLOW_OPACITY,
+                DARK_DIFF_BORDER_OPACITY,
+                DARK_DIFF_WORD_OPACITY,
+            ]
+        };
+        for (family, status) in [("added", "created"), ("deleted", "deleted")] {
+            let line_role = format!("editor.diff_hunk.{family}.background");
+            let hollow_role = format!("editor.diff_hunk.{family}.hollow_background");
+            let border_role = format!("editor.diff_hunk.{family}.hollow_border");
+            let word_role = format!(
+                "version_control.word_{}",
+                if family == "added" {
+                    "added"
+                } else {
+                    "deleted"
+                }
+            );
+            for (role, expected) in [
+                (&line_role, expected_opacities[0]),
+                (&hollow_role, expected_opacities[1]),
+                (&border_role, expected_opacities[2]),
+                (&word_role, expected_opacities[3]),
+            ] {
+                let actual = parse_hex(style[role].as_str().unwrap()).unwrap().a;
+                assert_eq!((actual * 255.0).round(), (expected * 255.0).round());
+            }
+
+            for hunk_role in [&line_role, &hollow_role] {
+                let hunk = render_layers(base, &[style[hunk_role].as_str().unwrap()]).unwrap();
+                for highlight in [
+                    "search.match_background",
+                    "search.active_match_background",
+                    "editor.document_highlight.read_background",
+                    "editor.document_highlight.write_background",
+                    "editor.document_highlight.bracket_background",
+                    "vim.yank.background",
+                ] {
+                    let underlay =
+                        render_layers(&hunk, &[style[highlight].as_str().unwrap()]).unwrap();
+                    let word =
+                        render_layers(&underlay, &[style[&word_role].as_str().unwrap()]).unwrap();
+                    assert!(delta_e(&underlay, &word).unwrap() > 0.0);
+                    assert!(
+                        contrast_ratio(style[status].as_str().unwrap(), &word).unwrap()
+                            >= HARD_TEXT_CONTRAST - 1e-9
+                    );
+                }
+            }
+        }
+
+        let vcs_added = style["version_control.added"].as_str().unwrap();
+        let vcs_deleted = style["version_control.deleted"].as_str().unwrap();
+        assert!(delta_e(vcs_added, vcs_deleted).unwrap() >= SEMANTIC_PAIR_CONTRACT.normal_delta_e);
+        assert!(
+            omarchy_zed_theme::search::cvd_distance(vcs_added, vcs_deleted).unwrap()
+                >= SEMANTIC_PAIR_CONTRACT.cvd_delta_e
+        );
+        let syntax_added = style["syntax"]["diff.plus"]["color"].as_str().unwrap();
+        let syntax_deleted = style["syntax"]["diff.minus"]["color"].as_str().unwrap();
+        assert!(
+            delta_e(syntax_added, syntax_deleted).unwrap() >= SYNTAX_DIFF_CONTRACT.normal_delta_e
+        );
+        assert!(
+            omarchy_zed_theme::search::cvd_distance(syntax_added, syntax_deleted).unwrap()
+                >= SYNTAX_DIFF_CONTRACT.cvd_delta_e
+        );
+        assert_eq!(style["success"], style["created"]);
+        assert_eq!(style["error"], style["deleted"]);
     }
 }
 

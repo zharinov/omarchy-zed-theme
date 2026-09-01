@@ -100,6 +100,7 @@ pub struct PairConstraints {
     pub minimum_chroma: f64,
     pub separation_alternative: Option<(f64, f64, f64)>,
     pub prefer_background: bool,
+    pub balance_rendered_salience: bool,
 }
 
 impl PairConstraints {
@@ -118,6 +119,7 @@ impl PairConstraints {
             minimum_chroma: 0.0,
             separation_alternative: None,
             prefer_background: false,
+            balance_rendered_salience: false,
         }
     }
 
@@ -131,6 +133,7 @@ impl PairConstraints {
             minimum_chroma: 0.0,
             separation_alternative: contract.separation_alternative,
             prefer_background: false,
+            balance_rendered_salience: false,
         }
     }
 
@@ -161,29 +164,38 @@ impl PairConstraints {
         self.prefer_background = true;
         self
     }
+
+    pub const fn balance_rendered_salience(mut self) -> Self {
+        self.balance_rendered_salience = true;
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
 pub struct OverlayFitRequest<'a> {
     pub backgrounds: &'a [String],
+    pub readability_backgrounds: &'a [String],
     pub target: f64,
     pub minimum_delta_e: f64,
     pub runtime_state: Option<(f64, f64, f64)>,
     pub readable_foregrounds: &'a [(String, f64)],
     pub rendered_references: &'a [(String, f64, f64)],
     pub runtime_rendered_references: &'a [(String, f64, f64, f64)],
+    pub prefer_source_fidelity: bool,
 }
 
 impl<'a> OverlayFitRequest<'a> {
     pub const fn new(backgrounds: &'a [String], target: f64, minimum_delta_e: f64) -> Self {
         Self {
             backgrounds,
+            readability_backgrounds: &[],
             target,
             minimum_delta_e,
             runtime_state: None,
             readable_foregrounds: &[],
             rendered_references: &[],
             runtime_rendered_references: &[],
+            prefer_source_fidelity: false,
         }
     }
 
@@ -205,6 +217,14 @@ impl<'a> OverlayFitRequest<'a> {
         self
     }
 
+    pub const fn with_readability_backgrounds(
+        mut self,
+        readability_backgrounds: &'a [String],
+    ) -> Self {
+        self.readability_backgrounds = readability_backgrounds;
+        self
+    }
+
     pub const fn with_rendered_references(
         mut self,
         rendered_references: &'a [(String, f64, f64)],
@@ -220,12 +240,18 @@ impl<'a> OverlayFitRequest<'a> {
         self.runtime_rendered_references = runtime_rendered_references;
         self
     }
+
+    pub const fn prefer_source_fidelity(mut self) -> Self {
+        self.prefer_source_fidelity = true;
+        self
+    }
 }
 
 pub struct OverlayPairRequest<'a> {
     pub first: OverlayFitRequest<'a>,
     pub second: OverlayFitRequest<'a>,
     pub constraints: PairConstraints,
+    pub minimum_alpha: u8,
     pub maximum_alpha: u8,
     pub frontier_limit: usize,
 }
@@ -240,12 +266,25 @@ impl<'a> OverlayPairRequest<'a> {
             first,
             second,
             constraints,
+            minimum_alpha: 1,
             maximum_alpha: OVERLAY_MAX_ALPHA,
             frontier_limit: 512,
         }
     }
 
     pub const fn with_limits(mut self, maximum_alpha: u8, frontier_limit: usize) -> Self {
+        self.maximum_alpha = maximum_alpha;
+        self.frontier_limit = frontier_limit;
+        self
+    }
+
+    pub const fn with_alpha_range(
+        mut self,
+        minimum_alpha: u8,
+        maximum_alpha: u8,
+        frontier_limit: usize,
+    ) -> Self {
+        self.minimum_alpha = minimum_alpha;
         self.maximum_alpha = maximum_alpha;
         self.frontier_limit = frontier_limit;
         self
@@ -313,12 +352,14 @@ fn combined_frontier_rank(left: &FrontierCandidate, right: &FrontierCandidate) -
 
 struct PreparedFill {
     backgrounds: Vec<ColorMetrics>,
+    readability_backgrounds: Vec<ColorMetrics>,
     target: f64,
     minimum_delta_e: f64,
     runtime_state: Option<(f64, f64, f64)>,
     readable_foregrounds: Vec<(ColorMetrics, f64)>,
     rendered_references: Vec<Vec<(ColorMetrics, f64, f64)>>,
     runtime_rendered_references: Vec<Vec<(ColorMetrics, f64, f64, f64)>>,
+    prefer_source_fidelity: bool,
 }
 
 struct PreparedOverlayPair {
@@ -376,6 +417,11 @@ impl PreparedFill {
             .iter()
             .map(|background| ColorMetrics::from_hex(background))
             .collect::<Result<Vec<_>>>()?;
+        let readability_backgrounds = request
+            .readability_backgrounds
+            .iter()
+            .map(|background| ColorMetrics::from_hex(background))
+            .collect::<Result<Vec<_>>>()?;
         let readable_foregrounds = request
             .readable_foregrounds
             .iter()
@@ -422,12 +468,14 @@ impl PreparedFill {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             backgrounds,
+            readability_backgrounds,
             target: request.target,
             minimum_delta_e: request.minimum_delta_e,
             runtime_state: request.runtime_state,
             readable_foregrounds,
             rendered_references,
             runtime_rendered_references,
+            prefer_source_fidelity: request.prefer_source_fidelity,
         })
     }
 
@@ -575,18 +623,50 @@ impl PreparedFill {
             }
         }
 
+        for background in &self.readability_backgrounds {
+            let rendered = ColorMetrics::blend_rgb24(*background, opaque_rgb, alpha);
+            if self
+                .readable_foregrounds
+                .iter()
+                .any(|(foreground, target)| rendered.contrast(*foreground) < *target - 1e-12)
+            {
+                return None;
+            }
+            if let Some((runtime_opacity, _, _)) = self.runtime_state {
+                let runtime_alpha = (f64::from(alpha) * runtime_opacity + 0.5).floor() as u8;
+                let runtime = ColorMetrics::blend_rgb24(*background, opaque_rgb, runtime_alpha);
+                if self
+                    .readable_foregrounds
+                    .iter()
+                    .any(|(foreground, target)| runtime.contrast(*foreground) < *target - 1e-12)
+                {
+                    return None;
+                }
+            }
+        }
+
         if minimum_ratio < self.target - 1e-12 {
             return None;
         }
 
         let candidate = Rgba32::from_rgb_alpha(opaque_rgb, alpha);
-        let rank = [
-            final_distance,
-            overshoot,
-            distance,
-            -retention,
-            -f64::from(alpha) / 255.0,
-        ];
+        let rank = if self.prefer_source_fidelity {
+            [
+                distance,
+                overshoot,
+                final_distance,
+                -retention,
+                -f64::from(alpha) / 255.0,
+            ]
+        } else {
+            [
+                final_distance,
+                overshoot,
+                distance,
+                -retention,
+                -f64::from(alpha) / 255.0,
+            ]
+        };
 
         Some(FillCandidate {
             emitted: candidate,
@@ -1313,6 +1393,7 @@ impl Search {
         second_seed: &str,
         first_request: OverlayFitRequest<'_>,
         second_request: OverlayFitRequest<'_>,
+        minimum_alpha: u8,
         maximum_alpha: u8,
     ) -> Result<PreparedOverlayPair> {
         let first = PreparedFill::new(first_request)?;
@@ -1324,9 +1405,10 @@ impl Search {
         let collect = |seed: &str,
                        table: &TransformTableData,
                        prepared: &PreparedFill,
+                       minimum_alpha: u8,
                        maximum_alpha: u8|
          -> Result<Vec<FillCandidate>> {
-            let alpha_values = PreparedFill::alpha_values(1, maximum_alpha);
+            let alpha_values = PreparedFill::alpha_values(minimum_alpha, maximum_alpha);
             let mut candidates = table
                 .candidates
                 .par_iter()
@@ -1355,8 +1437,24 @@ impl Search {
         let first_table = self.transform_table(first_seed)?;
         let second_table = self.transform_table(second_seed)?;
         let (first_candidates, second_candidates) = rayon::join(
-            || collect(first_seed, &first_table, &first, maximum_alpha),
-            || collect(second_seed, &second_table, &second, maximum_alpha),
+            || {
+                collect(
+                    first_seed,
+                    &first_table,
+                    &first,
+                    minimum_alpha,
+                    maximum_alpha,
+                )
+            },
+            || {
+                collect(
+                    second_seed,
+                    &second_table,
+                    &second,
+                    minimum_alpha,
+                    maximum_alpha,
+                )
+            },
         );
         Ok(PreparedOverlayPair {
             first,
@@ -1373,7 +1471,7 @@ impl Search {
         constraints: PairConstraints,
         frontier_limit: usize,
     ) -> Result<[String; 2]> {
-        let mut best: Option<([Rgba32; 2], [f64; 5])> = None;
+        let mut best: Option<([Rgba32; 2], [f64; 6])> = None;
         let mut maxima = [0.0_f64; 3];
 
         for frontier_size in [128_usize, 512]
@@ -1395,7 +1493,8 @@ impl Search {
                 if left.core.source_chroma < constraints.minimum_chroma - 1e-12 {
                     continue;
                 }
-                if let (Some((_, best_rank)), Some(minimum_second)) = (&best, minimum_second)
+                if !constraints.balance_rendered_salience
+                    && let (Some((_, best_rank)), Some(minimum_second)) = (&best, minimum_second)
                     && rank_cmp(
                         &combined_frontier_rank(left, minimum_second),
                         &best_rank[..3],
@@ -1408,16 +1507,25 @@ impl Search {
                         continue;
                     }
                     let prefix = combined_frontier_rank(left, right);
-                    if best.as_ref().is_some_and(|(_, best_rank)| {
-                        rank_cmp(&prefix, &best_rank[..3]) == Ordering::Greater
-                    }) {
+                    if !constraints.balance_rendered_salience
+                        && best.as_ref().is_some_and(|(_, best_rank)| {
+                            rank_cmp(&prefix, &best_rank[..3]) == Ordering::Greater
+                        })
+                    {
                         break;
                     }
                     let mut minimum_contrast = f64::INFINITY;
                     let mut minimum_normal = f64::INFINITY;
                     let mut minimum_lightness = f64::INFINITY;
-                    for (left_rendered, right_rendered) in
-                        left.rendered.iter().zip(right.rendered.iter())
+                    let mut salience_imbalance = 0.0;
+                    for ((left_rendered, right_rendered), (left_base, right_base)) in
+                        left.rendered.iter().zip(right.rendered.iter()).zip(
+                            prepared
+                                .first
+                                .backgrounds
+                                .iter()
+                                .zip(prepared.second.backgrounds.iter()),
+                        )
                     {
                         let contrast = left_rendered.contrast(*right_rendered);
                         let normal = left_rendered.delta_e(*right_rendered);
@@ -1425,6 +1533,9 @@ impl Search {
                         minimum_contrast = minimum_contrast.min(contrast);
                         minimum_normal = minimum_normal.min(normal);
                         minimum_lightness = minimum_lightness.min(lightness);
+                        salience_imbalance += (left_rendered.contrast(*left_base)
+                            - right_rendered.contrast(*right_base))
+                        .abs();
                     }
                     maxima[0] = maxima[0].max(minimum_contrast);
                     maxima[1] = maxima[1].max(minimum_normal);
@@ -1450,13 +1561,25 @@ impl Search {
                     {
                         continue;
                     }
-                    let rank = [
-                        prefix[0],
-                        prefix[1],
-                        prefix[2],
-                        -(minimum_normal + minimum_cvd),
-                        -(minimum_contrast + minimum_lightness),
-                    ];
+                    let rank = if constraints.balance_rendered_salience {
+                        [
+                            prefix[1],
+                            salience_imbalance,
+                            prefix[0],
+                            prefix[2],
+                            -(minimum_normal + minimum_cvd),
+                            -(minimum_contrast + minimum_lightness),
+                        ]
+                    } else {
+                        [
+                            prefix[0],
+                            prefix[1],
+                            prefix[2],
+                            -(minimum_normal + minimum_cvd),
+                            -(minimum_contrast + minimum_lightness),
+                            0.0,
+                        ]
+                    };
                     if best.as_ref().is_none_or(|(best_colors, best_rank)| {
                         rank_cmp(&rank, best_rank)
                             .then_with(|| [left.core.emitted, right.core.emitted].cmp(best_colors))
@@ -1495,6 +1618,7 @@ impl Search {
             second_seed,
             request.first,
             request.second,
+            request.minimum_alpha,
             request.maximum_alpha,
         )?;
         Self::solve_overlay_pair(
@@ -1519,6 +1643,7 @@ impl Search {
             second_seed,
             request.first,
             request.second,
+            request.minimum_alpha,
             request.maximum_alpha,
         )?;
         match Self::solve_overlay_pair(

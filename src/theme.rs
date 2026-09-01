@@ -59,6 +59,10 @@ fn render_with_bounded_generic_highlights(
     Ok(scenes)
 }
 
+fn opacity_byte(opacity: f64) -> u8 {
+    (opacity * 255.0).round() as u8
+}
+
 fn fit_highlight_with_alpha_fallback(
     search: &mut Search,
     role: &str,
@@ -382,6 +386,144 @@ struct SemanticColors {
     magenta: String,
 }
 
+struct ChangeIdentity {
+    added: String,
+    deleted: String,
+}
+
+impl ChangeIdentity {
+    const ADDED_HUE_DEGREES: f64 = 145.0;
+    const DELETED_HUE_DEGREES: f64 = 25.0;
+
+    fn from_palette(palette: &ResolvedPalette) -> Result<Self> {
+        Ok(Self {
+            added: conventional_semantic_seed(palette, "green", Self::ADDED_HUE_DEGREES)?,
+            deleted: conventional_semantic_seed(palette, "red", Self::DELETED_HUE_DEGREES)?,
+        })
+    }
+
+    fn editor_overlay_seeds(&self, mode: &str) -> Result<[String; 2]> {
+        Ok([
+            diff_overlay_seed(&self.added, mode, Self::ADDED_HUE_DEGREES)?,
+            diff_overlay_seed(&self.deleted, mode, Self::DELETED_HUE_DEGREES)?,
+        ])
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DiffPresentationProfile {
+    line_target_contrast: f64,
+    line_minimum_delta_e: f64,
+    line_opacity: f64,
+    hollow_opacity: f64,
+    border_opacity: f64,
+    word_opacity: f64,
+}
+
+impl DiffPresentationProfile {
+    fn for_mode(mode: &str) -> Self {
+        if mode == "light" {
+            Self {
+                line_target_contrast: LIGHT_DIFF_LINE_TARGET_CONTRAST,
+                line_minimum_delta_e: LIGHT_DIFF_LINE_MINIMUM_DELTA_E,
+                line_opacity: LIGHT_DIFF_LINE_OPACITY,
+                hollow_opacity: LIGHT_DIFF_HOLLOW_OPACITY,
+                border_opacity: LIGHT_DIFF_BORDER_OPACITY,
+                word_opacity: LIGHT_DIFF_WORD_OPACITY,
+            }
+        } else {
+            Self {
+                line_target_contrast: DARK_DIFF_LINE_TARGET_CONTRAST,
+                line_minimum_delta_e: DARK_DIFF_LINE_MINIMUM_DELTA_E,
+                line_opacity: DARK_DIFF_LINE_OPACITY,
+                hollow_opacity: DARK_DIFF_HOLLOW_OPACITY,
+                border_opacity: DARK_DIFF_BORDER_OPACITY,
+                word_opacity: DARK_DIFF_WORD_OPACITY,
+            }
+        }
+    }
+}
+
+struct DiffLayers {
+    added_line: String,
+    deleted_line: String,
+    added_hollow: String,
+    deleted_hollow: String,
+    added_border: String,
+    deleted_border: String,
+}
+
+impl DiffLayers {
+    fn from_pigments(added: &str, deleted: &str, profile: DiffPresentationProfile) -> Result<Self> {
+        Ok(Self {
+            added_line: apply_opacity(added, profile.line_opacity)?,
+            deleted_line: apply_opacity(deleted, profile.line_opacity)?,
+            added_hollow: apply_opacity(added, profile.hollow_opacity)?,
+            deleted_hollow: apply_opacity(deleted, profile.hollow_opacity)?,
+            added_border: apply_opacity(added, profile.border_opacity)?,
+            deleted_border: apply_opacity(deleted, profile.border_opacity)?,
+        })
+    }
+
+    fn preserves_rendered_semantics(
+        &self,
+        editor_bases: &[String],
+        editor_foreground: &str,
+        profile: DiffPresentationProfile,
+    ) -> Result<bool> {
+        let added_line = render_on_bases(editor_bases, &[&self.added_line])?;
+        let deleted_line = render_on_bases(editor_bases, &[&self.deleted_line])?;
+        let added_hollow = render_on_bases(editor_bases, &[&self.added_hollow])?;
+        let deleted_hollow = render_on_bases(editor_bases, &[&self.deleted_hollow])?;
+        let added_border = render_on_bases(&added_hollow, &[&self.added_border])?;
+        let deleted_border = render_on_bases(&deleted_hollow, &[&self.deleted_border])?;
+
+        let line_visibility = [
+            minimum_pairwise(editor_bases, &added_line, contrast_ratio)?,
+            minimum_pairwise(editor_bases, &deleted_line, contrast_ratio)?,
+        ]
+        .into_iter()
+        .fold(f64::INFINITY, f64::min);
+        let text_backgrounds = unique(
+            added_line
+                .iter()
+                .chain(&deleted_line)
+                .chain(&added_hollow)
+                .chain(&deleted_hollow)
+                .cloned(),
+        );
+        if line_visibility < profile.line_target_contrast - 1e-9
+            || minimum_contrast(editor_foreground, &text_backgrounds)? < HARD_TEXT_CONTRAST - 1e-9
+        {
+            return Ok(false);
+        }
+
+        for (first, second, normal_floor, cvd_floor) in [
+            (
+                &added_line,
+                &deleted_line,
+                DIFF_NORMAL_FLOOR_DELTA_E,
+                DIFF_CVD_FLOOR_DELTA_E,
+            ),
+            (&added_hollow, &deleted_hollow, 0.003, 0.002),
+            (
+                &added_border,
+                &deleted_border,
+                DIFF_NORMAL_FLOOR_DELTA_E,
+                0.008,
+            ),
+        ] {
+            if minimum_pairwise(first, second, delta_e)? < normal_floor - 1e-9
+                || minimum_pairwise(first, second, crate::search::cvd_distance)? < cvd_floor - 1e-9
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+}
+
 fn conventional_semantic_seed(
     palette: &ResolvedPalette,
     key: &str,
@@ -400,6 +542,24 @@ fn conventional_semantic_seed(
         target_hue
     };
     Ok(gamut_map_oklch(lightness, source_chroma.clamp(0.080, 0.180), hue).opaque_hex())
+}
+
+fn diff_overlay_seed(identity: &str, mode: &str, target_hue_degrees: f64) -> Result<String> {
+    let [lightness, chroma, _] = oklab_to_oklch(lab(identity)?);
+    // A low-opacity paint projection needs conventional hue and enough chroma
+    // to retain its semantic edge after composition, especially in muted themes.
+    let (minimum_lightness, maximum_lightness) = if mode == "light" {
+        (0.52, 0.65)
+    } else {
+        (0.48, 0.65)
+    };
+    let lightness = lightness.clamp(minimum_lightness, maximum_lightness);
+    Ok(gamut_map_oklch(
+        lightness,
+        chroma.max(DIFF_OVERLAY_PIGMENT_CHROMA_FLOOR),
+        target_hue_degrees.to_radians(),
+    )
+    .opaque_hex())
 }
 
 fn derive_semantics(
@@ -795,6 +955,119 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         &editor_primary,
         SaliencyRequest::new(&editor_bases, TEXT_CONTRAST, PRIMARY_SALIENCY),
     )?;
+
+    // Every consumer projects these two palette-native semantic identities into
+    // its own rendering domain. Editor paint is solved before generic highlights
+    // so later layers can use the complete emitted diff scenes as their bases.
+    let change_identity = ChangeIdentity::from_palette(palette)?;
+    let diff_yellow_seed = conventional_semantic_seed(palette, "yellow", 85.0)?;
+    let [version_control_added, version_control_deleted] = search
+        .fit_pair(
+            &change_identity.added,
+            &change_identity.deleted,
+            &interaction_bases,
+            PairConstraints::from_contract(TEXT_CONTRAST, SEMANTIC_PAIR_CONTRACT)
+                .with_minimum_chroma(0.025),
+        )
+        .map_err(|error| Error(format!("version-control add/delete foregrounds: {error}")))?;
+    let version_control_modified = search.fit_color_bounded(
+        &diff_yellow_seed,
+        &interaction_bases,
+        TEXT_CONTRAST,
+        &[],
+        FitBounds {
+            lower_chroma: 0.025,
+            ..FitBounds::default()
+        },
+    )?;
+
+    let presentation = DiffPresentationProfile::for_mode(&palette.mode);
+    let [diff_added_seed, diff_deleted_seed] =
+        change_identity.editor_overlay_seeds(&palette.mode)?;
+    let readable_diff_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
+    let diff_line_request = |backgrounds| {
+        OverlayFitRequest::new(
+            backgrounds,
+            presentation.line_target_contrast,
+            presentation.line_minimum_delta_e,
+        )
+        .with_readable_foregrounds(&readable_diff_text)
+        .prefer_source_fidelity()
+    };
+    let line_alpha = opacity_byte(presentation.line_opacity);
+    let line_fit = search.fit_overlay_pair(
+        &diff_added_seed,
+        &diff_deleted_seed,
+        OverlayPairRequest::new(
+            diff_line_request(&editor_bases),
+            diff_line_request(&editor_bases),
+            PairConstraints::new(
+                1.0,
+                DIFF_PAIR_CONTRAST,
+                DIFF_NORMAL_FLOOR_DELTA_E,
+                DIFF_CVD_FLOOR_DELTA_E,
+            )
+            .with_minimum_chroma(DIFF_OVERLAY_MINIMUM_CHROMA)
+            .balance_rendered_salience(),
+        )
+        .with_alpha_range(line_alpha, line_alpha, 512),
+    );
+    let mut pigment_candidates = Vec::new();
+    if let Ok([added, deleted]) = line_fit {
+        pigment_candidates.push([
+            parse_hex(&added)?.opaque_hex(),
+            parse_hex(&deleted)?.opaque_hex(),
+        ]);
+    }
+    let hollow_alpha = opacity_byte(presentation.hollow_opacity);
+    let hollow_pair_request = |backgrounds| {
+        OverlayFitRequest::new(backgrounds, 1.01, 0.003)
+            .with_readable_foregrounds(&readable_diff_text)
+    };
+    if let Ok([added, deleted]) = search.fit_overlay_pair(
+        &diff_added_seed,
+        &diff_deleted_seed,
+        OverlayPairRequest::new(
+            hollow_pair_request(&editor_bases),
+            hollow_pair_request(&editor_bases),
+            PairConstraints::new(1.0, 1.001, 0.003, 0.002)
+                .with_minimum_chroma(DIFF_OVERLAY_MINIMUM_CHROMA)
+                .balance_rendered_salience(),
+        )
+        .with_alpha_range(hollow_alpha, hollow_alpha, 512),
+    ) {
+        pigment_candidates.push([
+            parse_hex(&added)?.opaque_hex(),
+            parse_hex(&deleted)?.opaque_hex(),
+        ]);
+    }
+    pigment_candidates.push([diff_added_seed.clone(), diff_deleted_seed.clone()]);
+    let mut diff_layers = None;
+    for [added, deleted] in &pigment_candidates {
+        let candidate = DiffLayers::from_pigments(added, deleted, presentation)?;
+        if candidate.preserves_rendered_semantics(&editor_bases, &editor_primary, presentation)? {
+            diff_layers = Some(candidate);
+            break;
+        }
+    }
+    let diff_layers = diff_layers.unwrap_or(DiffLayers::from_pigments(
+        &diff_added_seed,
+        &diff_deleted_seed,
+        presentation,
+    )?);
+    let DiffLayers {
+        added_line: diff_added,
+        deleted_line: diff_deleted,
+        added_hollow: diff_added_hollow,
+        deleted_hollow: diff_deleted_hollow,
+        added_border: diff_added_hollow_border,
+        deleted_border: diff_deleted_hollow_border,
+    } = diff_layers;
+
+    let added_hunk_scenes = render_on_bases(&editor_bases, &[&diff_added])?;
+    let deleted_hunk_scenes = render_on_bases(&editor_bases, &[&diff_deleted])?;
+    let added_hollow_scenes = render_on_bases(&editor_bases, &[&diff_added_hollow])?;
+    let deleted_hollow_scenes = render_on_bases(&editor_bases, &[&diff_deleted_hollow])?;
     let readable_editor_overlay_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
     let search_match_request =
         OverlayFitRequest::new(&editor_bases, SEARCH_MATCH_CONTRAST, STATE_HOVER_DELTA_E)
@@ -883,114 +1156,27 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         .with_readable_foregrounds(&readable_editor_overlay_text),
     )?;
 
-    // Diff colors are derived as a dedicated semantic subsystem because diff viewers
-    // combine text, fills, hollow borders, selections, and conflict overlays.
-    let diff_green_seed = conventional_semantic_seed(palette, "green", 145.0)?;
-    let diff_red_seed = conventional_semantic_seed(palette, "red", 25.0)?;
-    let diff_yellow_seed = conventional_semantic_seed(palette, "yellow", 85.0)?;
-    let [version_control_added, version_control_deleted] = search
-        .fit_pair(
-            &diff_green_seed,
-            &diff_red_seed,
-            &interaction_bases,
-            PairConstraints::from_contract(TEXT_CONTRAST, SEMANTIC_PAIR_CONTRACT)
-                .with_minimum_chroma(0.025),
-        )
-        .map_err(|error| Error(format!("version-control add/delete foregrounds: {error}")))?;
-    let version_control_modified = search.fit_color_bounded(
-        &diff_yellow_seed,
-        &interaction_bases,
-        TEXT_CONTRAST,
-        &[],
-        FitBounds {
-            lower_chroma: 0.025,
-            ..FitBounds::default()
-        },
-    )?;
-
-    let diff_constraints = PairConstraints::new(
-        DIFF_FILL_CONTRAST,
-        DIFF_PAIR_CONTRAST,
-        DIFF_NORMAL_FLOOR_DELTA_E,
-        DIFF_CVD_FLOOR_DELTA_E,
-    )
-    .with_minimum_chroma(0.025)
-    .with_separation_alternative(Some((
-        DIFF_LUMINANCE_SEPARATION_CONTRAST,
-        DIFF_NORMAL_DELTA_E,
-        DIFF_CVD_DELTA_E,
-    )))
-    .prefer_background();
-
-    let readable_diff_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
-    let diff_fill_request = |backgrounds| {
-        OverlayFitRequest::new(backgrounds, DIFF_FILL_CONTRAST, DIFF_NORMAL_FLOOR_DELTA_E)
+    let conflict_constraints = PairConstraints::new(CONFLICT_FILL_CONTRAST, 1.01, 0.030, 0.030)
+        .with_separation_alternative(Some((1.12, 0.075, 0.035)))
+        .prefer_background();
+    let conflict_fill_request = |backgrounds| {
+        OverlayFitRequest::new(backgrounds, CONFLICT_FILL_CONTRAST, 0.030)
             .with_readable_foregrounds(&readable_diff_text)
     };
-    let [constraint_diff_added, constraint_diff_deleted] = search
-        .fit_overlay_pair(
-            &diff_green_seed,
-            &diff_red_seed,
-            OverlayPairRequest::new(
-                diff_fill_request(&editor_bases),
-                diff_fill_request(&editor_bases),
-                diff_constraints,
-            ),
-        )
-        .map_err(|error| Error(format!("solid diff hunks: {error}")))?;
-    let [constraint_diff_added_hollow, constraint_diff_deleted_hollow] = search
-        .fit_overlay_pair(
-            &diff_green_seed,
-            &diff_red_seed,
-            OverlayPairRequest::new(
-                diff_fill_request(&editor_bases).with_target(DIFF_HOLLOW_CONTRAST),
-                diff_fill_request(&editor_bases).with_target(DIFF_HOLLOW_CONTRAST),
-                diff_constraints.with_foreground_contrast(DIFF_HOLLOW_CONTRAST),
-            ),
-        )
-        .map_err(|error| Error(format!("hollow diff hunks: {error}")))?;
-
-    let constraint_added_hunk_scenes = render_on_bases(&editor_bases, &[&constraint_diff_added])?;
-    let constraint_deleted_hunk_scenes =
-        render_on_bases(&editor_bases, &[&constraint_diff_deleted])?;
-    let constraint_added_hollow_scenes =
-        render_on_bases(&editor_bases, &[&constraint_diff_added_hollow])?;
-    let constraint_deleted_hollow_scenes =
-        render_on_bases(&editor_bases, &[&constraint_diff_deleted_hollow])?;
     let [conflict_ours, conflict_theirs] = search
         .fit_overlay_pair(
-            &diff_green_seed,
+            &change_identity.added,
             color(palette, "blue"),
             OverlayPairRequest::new(
-                diff_fill_request(&editor_bases),
-                diff_fill_request(&editor_bases),
-                diff_constraints
-                    .with_foreground_contrast(DIFF_FILL_CONTRAST)
-                    .with_minimum_chroma(0.0),
+                conflict_fill_request(&editor_bases),
+                conflict_fill_request(&editor_bases),
+                conflict_constraints,
             ),
         )
-        .map_err(|error| Error(format!("conflict backgrounds: {error}")))?;
-
-    let (hunk_filled_opacity, hunk_hollow_opacity, hunk_border_opacity) = if palette.mode == "light"
-    {
-        (
-            LIGHT_DIFF_HUNK_FILLED_OPACITY,
-            LIGHT_DIFF_HUNK_HOLLOW_BACKGROUND_OPACITY,
-            LIGHT_DIFF_HUNK_HOLLOW_BORDER_OPACITY,
-        )
-    } else {
-        (
-            DARK_DIFF_HUNK_FILLED_OPACITY,
-            DARK_DIFF_HUNK_HOLLOW_BACKGROUND_OPACITY,
-            DARK_DIFF_HUNK_HOLLOW_BORDER_OPACITY,
-        )
-    };
-    let diff_added = apply_opacity(&version_control_added, hunk_filled_opacity)?;
-    let diff_deleted = apply_opacity(&version_control_deleted, hunk_filled_opacity)?;
-    let diff_added_hollow = apply_opacity(&version_control_added, hunk_hollow_opacity)?;
-    let diff_deleted_hollow = apply_opacity(&version_control_deleted, hunk_hollow_opacity)?;
-    let diff_added_hollow_border = apply_opacity(&version_control_added, hunk_border_opacity)?;
-    let diff_deleted_hollow_border = apply_opacity(&version_control_deleted, hunk_border_opacity)?;
+        .unwrap_or([
+            apply_opacity(&change_identity.added, 0.20)?,
+            apply_opacity(color(palette, "blue"), 0.20)?,
+        ]);
 
     let yank = fit_highlight_with_alpha_fallback(
         &mut search,
@@ -1012,50 +1198,39 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         document_bracket.as_str(),
         yank.as_str(),
     ];
-    let constraint_word_added_bases = constraint_added_hunk_scenes
+    let word_added_bases = added_hunk_scenes
         .iter()
         .cloned()
-        .chain(constraint_added_hollow_scenes.iter().cloned())
+        .chain(added_hollow_scenes.iter().cloned())
         .collect::<Vec<_>>();
-    let constraint_word_deleted_bases = constraint_deleted_hunk_scenes
+    let word_deleted_bases = deleted_hunk_scenes
         .iter()
         .cloned()
-        .chain(constraint_deleted_hollow_scenes.iter().cloned())
+        .chain(deleted_hollow_scenes.iter().cloned())
         .collect::<Vec<_>>();
-    let constraint_word_added_underlays =
-        render_with_bounded_generic_highlights(&constraint_word_added_bases, &generic_highlights)?;
-    let constraint_word_deleted_underlays = render_with_bounded_generic_highlights(
-        &constraint_word_deleted_bases,
-        &generic_highlights,
-    )?;
-    let constraint_readable_word_text = [(editor_primary.clone(), WORD_TEXT_CONTRAST)];
-    let constraint_word_request = |backgrounds| {
-        OverlayFitRequest::new(backgrounds, WORD_DIFF_CONTRAST, STATE_HOVER_DELTA_E)
-            .with_readable_foregrounds(&constraint_readable_word_text)
-    };
-    let constraint_word_pair = search
-        .fit_overlay_pair_with_fallback(
-            &diff_green_seed,
-            &diff_red_seed,
+    let word_added_underlays =
+        render_with_bounded_generic_highlights(&word_added_bases, &generic_highlights)?;
+    let word_deleted_underlays =
+        render_with_bounded_generic_highlights(&word_deleted_bases, &generic_highlights)?;
+    let word_request =
+        |backgrounds| OverlayFitRequest::new(backgrounds, 1.0, 0.0).prefer_source_fidelity();
+    let word_alpha = opacity_byte(presentation.word_opacity);
+    let [word_added, word_deleted] = search
+        .fit_overlay_pair(
+            &change_identity.added,
+            &change_identity.deleted,
             OverlayPairRequest::new(
-                constraint_word_request(&constraint_word_added_underlays),
-                constraint_word_request(&constraint_word_deleted_underlays),
-                diff_constraints
-                    .with_foreground_contrast(WORD_DIFF_CONTRAST)
-                    .with_minimum_chroma(0.0),
+                word_request(&word_added_underlays),
+                word_request(&word_deleted_underlays),
+                PairConstraints::new(1.0, 1.0, 0.0, 0.0)
+                    .with_minimum_chroma(DIFF_OVERLAY_MINIMUM_CHROMA),
             )
-            .with_limits(WORD_OVERLAY_MAX_ALPHA, 128),
-            diff_constraints
-                .with_foreground_contrast(WORD_DIFF_CONTRAST)
-                .with_minimum_chroma(0.0)
-                .with_separation_alternative(None),
-            512,
+            .with_alpha_range(word_alpha, word_alpha, 512),
         )
-        .map_err(|error| Error(format!("word diff backgrounds: {error}")))?;
-
-    let [constraint_word_added, constraint_word_deleted] = constraint_word_pair.colors;
-    let word_added = apply_opacity(&version_control_added, hunk_filled_opacity)?;
-    let word_deleted = apply_opacity(&version_control_deleted, hunk_filled_opacity)?;
+        .unwrap_or([
+            apply_opacity(&change_identity.added, presentation.word_opacity)?,
+            apply_opacity(&change_identity.deleted, presentation.word_opacity)?,
+        ]);
     let rendered_editor_overlays = [
         &search_match,
         &search_active,
@@ -1074,31 +1249,33 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         .flatten()
         .collect::<Vec<_>>();
 
-    let constraint_word_added_scenes =
-        render_on_bases(&constraint_word_added_underlays, &[&constraint_word_added])?;
-    let constraint_word_deleted_scenes = render_on_bases(
-        &constraint_word_deleted_underlays,
-        &[&constraint_word_deleted],
-    )?;
-    // Downstream fitting keeps the former conservative diff scenes so the quieter
-    // emitted treatment cannot retune unrelated syntax, status, or player roles.
-    let base_overlay_backgrounds = unique(
+    let word_added_scenes = render_on_bases(&word_added_underlays, &[&word_added])?;
+    let word_deleted_scenes = render_on_bases(&word_deleted_underlays, &[&word_deleted])?;
+    let selection_visibility_backgrounds = unique(
         editor_bases
             .iter()
             .cloned()
-            .chain(constraint_added_hunk_scenes.iter().cloned())
-            .chain(constraint_deleted_hunk_scenes.iter().cloned())
-            .chain(constraint_added_hollow_scenes.iter().cloned())
-            .chain(constraint_deleted_hollow_scenes.iter().cloned())
+            .chain(added_hunk_scenes.iter().cloned())
+            .chain(deleted_hunk_scenes.iter().cloned())
+            .chain(added_hollow_scenes.iter().cloned())
+            .chain(deleted_hollow_scenes.iter().cloned())
             .chain(rendered_editor_overlay_contexts.iter().cloned()),
     );
     let editor_text_backgrounds = unique(
-        base_overlay_backgrounds
+        selection_visibility_backgrounds
             .iter()
             .cloned()
-            .chain(constraint_word_added_scenes.iter().cloned())
-            .chain(constraint_word_deleted_scenes.iter().cloned()),
+            .chain(word_added_scenes.iter().cloned())
+            .chain(word_deleted_scenes.iter().cloned()),
     );
+    let editor_primary = search.fit_color_bounded_with_preference_backgrounds(
+        color(palette, "foreground"),
+        &editor_text_backgrounds,
+        &editor_bases,
+        EDITOR_OVERLAY_TEXT_CONTRAST,
+        &[],
+        FitBounds::default(),
+    )?;
 
     let player_seed_values = [
         semantic.accent.clone(),
@@ -1116,11 +1293,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
     let selection_readable = [(editor_primary.clone(), TEXT_CONTRAST)];
     let selection_request = || {
         OverlayFitRequest::new(
-            &base_overlay_backgrounds,
+            &selection_visibility_backgrounds,
             FOCUSED_SELECTION_CONTRAST,
             FOCUSED_SELECTION_DELTA_E,
         )
         .with_runtime_state((0.5, 1.08, 0.020))
+        .with_readability_backgrounds(&editor_text_backgrounds)
         .with_readable_foregrounds(&selection_readable)
     };
     let selection = match search.fit_readable_overlay_alpha_range(
@@ -1187,11 +1365,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             .collect::<Vec<_>>();
         let request = || {
             OverlayFitRequest::new(
-                &base_overlay_backgrounds,
+                &selection_visibility_backgrounds,
                 FOCUSED_SELECTION_CONTRAST,
                 FOCUSED_SELECTION_DELTA_E,
             )
             .with_runtime_state((0.5, 1.08, 0.020))
+            .with_readability_backgrounds(&editor_text_backgrounds)
             .with_readable_foregrounds(&readable)
             .with_rendered_references(&references)
         };
@@ -1338,8 +1517,8 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
     );
 
     let status_seeds: BTreeMap<&str, &String> = BTreeMap::from([
-        ("created", &diff_green_seed),
-        ("deleted", &diff_red_seed),
+        ("created", &change_identity.added),
+        ("deleted", &change_identity.deleted),
         ("hidden", &semantic.disabled),
         ("hint", &semantic.cyan),
         ("ignored", &semantic.secondary),
@@ -1374,8 +1553,33 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
     }
 
     let mut status_foregrounds = BTreeMap::new();
+    let created_backgrounds = unique(
+        interaction_bases
+            .iter()
+            .chain(editor_text_backgrounds.iter())
+            .cloned()
+            .chain(std::iter::once(status_backgrounds["created"].clone())),
+    );
+    let deleted_backgrounds = unique(
+        interaction_bases
+            .iter()
+            .chain(editor_text_backgrounds.iter())
+            .cloned()
+            .chain(std::iter::once(status_backgrounds["deleted"].clone())),
+    );
+    if let Ok([created, deleted]) = search.fit_pair_on_backgrounds(
+        &change_identity.added,
+        &created_backgrounds,
+        &change_identity.deleted,
+        &deleted_backgrounds,
+        PairConstraints::from_contract(TEXT_CONTRAST, SEMANTIC_PAIR_CONTRACT)
+            .with_minimum_chroma(0.025),
+    ) {
+        status_foregrounds.insert("created", created);
+        status_foregrounds.insert("deleted", deleted);
+    }
     for (name, seed) in &status_seeds {
-        if *name == "ignored" {
+        if *name == "ignored" || status_foregrounds.contains_key(name) {
             continue;
         }
         let syntax_backgrounds = if *name == "predictive" {
@@ -1462,7 +1666,11 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         },
         &editor_primary,
         &statuses["predictive"],
-        [&diff_green_seed, &diff_yellow_seed, &diff_red_seed],
+        [
+            &change_identity.added,
+            &diff_yellow_seed,
+            &change_identity.deleted,
+        ],
     )?;
 
     let accent_seeds = cvd_greedy_order(&[
@@ -1759,7 +1967,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             interaction_bases: &interaction_bases,
             syntax_contexts: &syntax_contexts,
             editor_bases: &editor_bases,
-            selection_visibility_backgrounds: &base_overlay_backgrounds,
+            selection_visibility_backgrounds: &selection_visibility_backgrounds,
             editor_text_backgrounds: &editor_text_backgrounds,
             terminal_backgrounds: &terminal_backgrounds,
         },
@@ -2572,17 +2780,6 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             "editor.diff_hunk.deleted.hollow_background",
         )?],
     )?;
-    let added_border = render_on_bases(
-        &added_hollow,
-        &[style_color(style, "editor.diff_hunk.added.hollow_border")?],
-    )?;
-    let deleted_border = render_on_bases(
-        &deleted_hollow,
-        &[style_color(
-            style,
-            "editor.diff_hunk.deleted.hollow_border",
-        )?],
-    )?;
     let conflict_ours = render_on_bases(
         editor_bases,
         &[style_color(style, "version_control.conflict_marker.ours")?],
@@ -2594,55 +2791,10 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             "version_control.conflict_marker.theirs",
         )?],
     )?;
-    let generic_highlights = [
-        style_color(style, "search.match_background")?,
-        style_color(style, "search.active_match_background")?,
-        style_color(style, "editor.document_highlight.read_background")?,
-        style_color(style, "editor.document_highlight.write_background")?,
-        style_color(style, "editor.document_highlight.bracket_background")?,
-        style_color(style, "vim.yank.background")?,
-    ];
-    let added_word_bases = added_solid
-        .iter()
-        .cloned()
-        .chain(added_hollow.iter().cloned())
-        .collect::<Vec<_>>();
-    let deleted_word_bases = deleted_solid
-        .iter()
-        .cloned()
-        .chain(deleted_hollow.iter().cloned())
-        .collect::<Vec<_>>();
-    let added_word_underlays =
-        render_with_bounded_generic_highlights(&added_word_bases, &generic_highlights)?;
-    let deleted_word_underlays =
-        render_with_bounded_generic_highlights(&deleted_word_bases, &generic_highlights)?;
-    let word_added = render_on_bases(
-        &added_word_underlays,
-        &[style_color(style, "version_control.word_added")?],
-    )?;
-    let word_deleted = render_on_bases(
-        &deleted_word_underlays,
-        &[style_color(style, "version_control.word_deleted")?],
-    )?;
-
-    let (expected_filled_opacity, expected_hollow_opacity, expected_border_opacity) =
-        if appearance == "light" {
-            (
-                LIGHT_DIFF_HUNK_FILLED_OPACITY,
-                LIGHT_DIFF_HUNK_HOLLOW_BACKGROUND_OPACITY,
-                LIGHT_DIFF_HUNK_HOLLOW_BORDER_OPACITY,
-            )
-        } else {
-            (
-                DARK_DIFF_HUNK_FILLED_OPACITY,
-                DARK_DIFF_HUNK_HOLLOW_BACKGROUND_OPACITY,
-                DARK_DIFF_HUNK_HOLLOW_BORDER_OPACITY,
-            )
-        };
-    for (family, marker, filled, hollow, border, word) in [
+    let presentation = DiffPresentationProfile::for_mode(appearance);
+    for (family, filled, hollow, border, word) in [
         (
             "added",
-            "version_control.added",
             "editor.diff_hunk.added.background",
             "editor.diff_hunk.added.hollow_background",
             "editor.diff_hunk.added.hollow_border",
@@ -2650,36 +2802,37 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         ),
         (
             "deleted",
-            "version_control.deleted",
             "editor.diff_hunk.deleted.background",
             "editor.diff_hunk.deleted.hollow_background",
             "editor.diff_hunk.deleted.hollow_border",
             "version_control.word_deleted",
         ),
     ] {
-        let marker_rgb = parse_hex(style_color(style, marker)?)?.opaque_hex();
-        for (role, expected_opacity) in [
-            (filled, expected_filled_opacity),
-            (hollow, expected_hollow_opacity),
-            (border, expected_border_opacity),
-        ] {
-            let value = parse_hex(style_color(style, role)?)?;
-            let expected_alpha = (expected_opacity * 255.0).round();
-            let actual_alpha = (value.a * 255.0).round();
-            if value.opaque_hex() != marker_rgb || actual_alpha != expected_alpha {
-                errors.push(format!(
-                    "{role} must reuse {marker} RGB at {:.0}% opacity",
-                    expected_opacity * 100.0
-                ));
-            }
-        }
+        let filled_value = parse_hex(style_color(style, filled)?)?;
+        let hollow_value = parse_hex(style_color(style, hollow)?)?;
+        let border_value = parse_hex(style_color(style, border)?)?;
         let word_value = parse_hex(style_color(style, word)?)?;
-        let expected_word_alpha = (expected_filled_opacity * 255.0).round();
-        let actual_word_alpha = (word_value.a * 255.0).round();
-        if word_value.opaque_hex() != marker_rgb || actual_word_alpha != expected_word_alpha {
+        let pigment = filled_value.opaque_hex();
+        if [hollow_value, border_value]
+            .iter()
+            .any(|value| value.opaque_hex() != pigment)
+        {
             errors.push(format!(
-                "{word} must reuse the {family} version-control RGB at {:.0}% opacity",
-                expected_filled_opacity * 100.0
+                "{family} line and border layers do not share one editor-overlay pigment"
+            ));
+        }
+        let expected = [
+            (filled_value.a, presentation.line_opacity),
+            (hollow_value.a, presentation.hollow_opacity),
+            (border_value.a, presentation.border_opacity),
+            (word_value.a, presentation.word_opacity),
+        ];
+        if expected
+            .iter()
+            .any(|(actual, expected)| (actual * 255.0).round() != (expected * 255.0).round())
+        {
+            errors.push(format!(
+                "{family} diff layers do not follow the tuned light/dark opacity profile"
             ));
         }
     }
@@ -2694,154 +2847,17 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     ] {
         minimum_pairwise(editor_bases, rendered, contrast_ratio)?;
     }
-    for (name, rendered) in [
-        ("version_control.conflict_marker.ours", &conflict_ours),
-        ("version_control.conflict_marker.theirs", &conflict_theirs),
-    ] {
-        let actual = minimum_pairwise(editor_bases, rendered, contrast_ratio)?;
-        if actual < DIFF_FILL_CONTRAST - 1e-9 {
-            errors.push(format!("diff fill {name} reaches only {actual:.3}:1"));
-        }
-    }
-
-    for (name, bases, rendered) in [
-        (
-            "version_control.word_added",
-            &added_word_underlays,
-            &word_added,
-        ),
-        (
-            "version_control.word_deleted",
-            &deleted_word_underlays,
-            &word_deleted,
-        ),
-    ] {
-        let actual = minimum_pairwise(bases, rendered, contrast_ratio)?;
-        if actual < PRESENTATION_WORD_DIFF_CONTRAST - 1e-9 {
-            errors.push(format!("word diff {name} reaches only {actual:.3}:1"));
-        }
-    }
-
     let added = style_color(style, "version_control.added")?;
     let deleted = style_color(style, "version_control.deleted")?;
     let pair_delta = delta_e(added, deleted)?;
     let pair_lightness = (lightness(added)? - lightness(deleted)?).abs();
     let pair_cvd = crate::search::cvd_distance(added, deleted)?;
     let pair_contrast = contrast_ratio(added, deleted)?;
-    let semantic_pair_is_strong =
-        SEMANTIC_PAIR_CONTRACT
-            .separation_alternative
-            .is_none_or(|(contrast, normal, cvd)| {
-                pair_contrast >= contrast - 1e-9
-                    || (pair_delta >= normal - 1e-9 && pair_cvd >= cvd - 1e-9)
-            });
     if pair_delta < SEMANTIC_PAIR_CONTRACT.normal_delta_e - 1e-9
         || pair_cvd < SEMANTIC_PAIR_CONTRACT.cvd_delta_e - 1e-9
         || pair_contrast < SEMANTIC_PAIR_CONTRACT.contrast - 1e-9
-        || !semantic_pair_is_strong
     {
         errors.push(format!("diff added/deleted pair is ambiguous: contrast {pair_contrast:.3}, delta E {pair_delta:.3}, delta L {pair_lightness:.3}, CVD {pair_cvd:.3}"));
-    }
-    for (family, _, _, first_scenes, second_scenes) in [
-        (
-            "hunk.solid",
-            "editor.diff_hunk.added.background",
-            "editor.diff_hunk.deleted.background",
-            &added_solid,
-            &deleted_solid,
-        ),
-        (
-            "hunk.hollow",
-            "editor.diff_hunk.added.hollow_background",
-            "editor.diff_hunk.deleted.hollow_background",
-            &added_hollow,
-            &deleted_hollow,
-        ),
-        (
-            "hunk.border",
-            "editor.diff_hunk.added.hollow_border",
-            "editor.diff_hunk.deleted.hollow_border",
-            &added_border,
-            &deleted_border,
-        ),
-        (
-            "word",
-            "version_control.word_added",
-            "version_control.word_deleted",
-            &word_added,
-            &word_deleted,
-        ),
-        (
-            "conflict",
-            "version_control.conflict_marker.ours",
-            "version_control.conflict_marker.theirs",
-            &conflict_ours,
-            &conflict_theirs,
-        ),
-    ] {
-        let contrast = minimum_pairwise(first_scenes, second_scenes, contrast_ratio)?;
-        let normal = minimum_pairwise(first_scenes, second_scenes, delta_e)?;
-        let cvd = minimum_pairwise(first_scenes, second_scenes, crate::search::cvd_distance)?;
-        let strong_separation = contrast >= DIFF_LUMINANCE_SEPARATION_CONTRAST - 1e-9
-            || (normal >= DIFF_NORMAL_DELTA_E - 1e-9 && cvd >= DIFF_CVD_DELTA_E - 1e-9);
-        if family == "conflict"
-            && (normal < DIFF_NORMAL_FLOOR_DELTA_E - 1e-9
-                || cvd < DIFF_CVD_FLOOR_DELTA_E - 1e-9
-                || contrast < DIFF_PAIR_CONTRAST - 1e-9
-                || !strong_separation)
-        {
-            errors.push(format!("diff {family} pair is ambiguous: contrast {contrast:.3}, delta E {normal:.3}, CVD {cvd:.3}"));
-        }
-    }
-    for (family, hollow, border, word) in [
-        (
-            "added",
-            &added_hollow,
-            &added_border,
-            style_color(style, "version_control.word_added")?,
-        ),
-        (
-            "deleted",
-            &deleted_hollow,
-            &deleted_border,
-            style_color(style, "version_control.word_deleted")?,
-        ),
-    ] {
-        let highlighted_hollow =
-            render_with_bounded_generic_highlights(hollow, &generic_highlights)?;
-        let highlighted_border =
-            render_with_bounded_generic_highlights(border, &generic_highlights)?;
-        let word_on_hollow = render_on_bases(&highlighted_hollow, &[word])?;
-        let word_on_border = render_on_bases(&highlighted_border, &[word])?;
-        let retained = minimum_pairwise(&word_on_hollow, &word_on_border, delta_e)?;
-        if highlighted_hollow.len() != word_on_hollow.len()
-            || highlighted_border.len() != word_on_border.len()
-            || highlighted_hollow.len() != highlighted_border.len()
-        {
-            return Err(Error(
-                "diff border retention contexts have different lengths".into(),
-            ));
-        }
-        let retained_ratio = highlighted_hollow
-            .iter()
-            .zip(&highlighted_border)
-            .zip(word_on_hollow.iter().zip(&word_on_border))
-            .try_fold(
-                f64::INFINITY,
-                |minimum, ((fill, border), (word_fill, word_border))| {
-                    let ratio =
-                        delta_e(word_fill, word_border)? / delta_e(fill, border)?.max(1e-12);
-                    Ok::<_, Error>(minimum.min(ratio))
-                },
-            )?;
-        if retained < DIFF_BORDER_RETENTION_DELTA_E - 1e-9
-            || retained_ratio < DIFF_BORDER_RETENTION_RATIO - 1e-9
-        {
-            errors.push(format!(
-                "{family} word overlay erases its hunk border: delta E {retained:.3}, retained {:.1}%",
-                retained_ratio * 100.0,
-            ));
-        }
     }
     let status_surface = style_color(style, "surface.background")?;
     let global_text = style_color(style, "text")?;

@@ -687,10 +687,11 @@ pub fn build_syntax(
     let profile = profile::measure(palette)?;
     let base = saliency_reference.to_owned();
 
-    if minimum_contrast(&base, required_contexts)? < SYNTAX_PRIMARY_FLOOR - 1e-12 {
-        return Err(crate::Error(
-            "editor primary does not meet the syntax-primary floor".into(),
-        ));
+    let primary_minimum = minimum_contrast(&base, required_contexts)?;
+    if primary_minimum < SYNTAX_PRIMARY_FLOOR - 1e-12 {
+        return Err(crate::Error(format!(
+            "editor primary reaches only {primary_minimum:.3}:1 on a rendered syntax context"
+        )));
     }
 
     let subdued_fit = fit_subdued(
