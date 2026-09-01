@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 fn home() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| Error("HOME is not set".into()))
+        .ok_or_else(|| Error::invalid("HOME is not set"))
 }
 
 fn current_paths(home: &Path) -> (PathBuf, PathBuf) {
@@ -44,7 +44,7 @@ fn sync() -> Result<()> {
 fn activation_owner(owner: OsString) -> Result<String> {
     owner
         .into_string()
-        .map_err(|owner| Error(format!("activation owner is not valid UTF-8: {owner:?}")))
+        .map_err(|owner| Error::invalid(format!("activation owner is not valid UTF-8: {owner:?}")))
 }
 
 fn run() -> Result<()> {
@@ -61,8 +61,8 @@ fn run() -> Result<()> {
         (Some(argument), Some(owner), None) if argument == "--restore" => {
             zed_settings::restore(&home()?, &activation_owner(owner)?)
         }
-        _ => Err(Error(
-            "usage: omarchy-zed-theme [--version|--activate OWNER|--restore OWNER]".into(),
+        _ => Err(Error::invalid(
+            "usage: omarchy-zed-theme [--version|--activate OWNER|--restore OWNER]",
         )),
     }
 }

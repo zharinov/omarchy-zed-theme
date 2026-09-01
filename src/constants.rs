@@ -40,6 +40,10 @@ pub const EDITOR_CANVAS_TEXT_CONTRAST: f64 = EDITOR_BASE_TEXT_CONTRAST * STATE_S
 pub const FOCUSED_SELECTION_CONTRAST: f64 = 1.20;
 pub const FOCUSED_SELECTION_DELTA_E: f64 = 0.040;
 pub const PLAYER_SELECTION_DELTA_E: f64 = 0.001;
+// Cursor colors cross more editor composites than accents, so they have a
+// separate achievable contract that the solver and emitted-theme validator share.
+pub const PLAYER_CURSOR_NORMAL_DELTA_E: f64 = 0.025;
+pub const PLAYER_CURSOR_CVD_DELTA_E: f64 = 0.012;
 pub const OVERLAY_MAX_ALPHA: u8 = 250;
 pub const PREFERRED_HIGHLIGHT_MAX_ALPHA: u8 = 166;
 // Opacity and salience are presentation inputs established by rendered comparison.
@@ -62,6 +66,7 @@ pub const CONFLICT_FILL_CONTRAST: f64 = 1.30;
 pub const DIFF_PAIR_CONTRAST: f64 = 1.05;
 pub const DIFF_NORMAL_FLOOR_DELTA_E: f64 = 0.052;
 pub const DIFF_CVD_FLOOR_DELTA_E: f64 = 0.008;
+pub const DIFF_CVD_TARGET_DELTA_E: f64 = 0.010;
 pub const THUMB_HOVER_CONTRAST: f64 = 3.52;
 pub const THUMB_ACTIVE_CONTRAST: f64 = 4.02;
 pub const STATE_HOVER_DELTA_E: f64 = 0.040;

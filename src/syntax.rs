@@ -10,7 +10,7 @@ pub mod policy;
 pub mod profile;
 
 use crate::Result;
-use crate::color::{contrast_ratio, delta_e, gamut_map_oklch, lab, oklab_to_oklch};
+use crate::color::{contrast_ratio, delta_e, gamut_map_oklch_unchecked, lab, oklab_to_oklch};
 use crate::constants::SYNTAX_DIFF_CONTRACT;
 use crate::palette::ResolvedPalette;
 use crate::saliency::SaliencyFit;
@@ -97,8 +97,8 @@ fn minimum_contrast(color: &str, contexts: &[String]) -> Result<f64> {
 
 fn geometric_contrast(color: &str, contexts: &[String]) -> Result<f64> {
     if contexts.is_empty() {
-        return Err(crate::Error(
-            "syntax tone fitting requires at least one preference context".into(),
+        return Err(crate::Error::invalid(
+            "syntax tone fitting requires at least one preference context",
         ));
     }
     let mean_log = contexts
@@ -226,7 +226,8 @@ fn allocate_family(search: &mut Search, request: FamilyFitRequest<'_>) -> Result
         };
         let preferred_chroma = evidence.chroma.min(authored_preference).min(chroma_cap);
         (
-            gamut_map_oklch(evidence.lightness, preferred_chroma, evidence.hue).opaque_hex(),
+            gamut_map_oklch_unchecked(evidence.lightness, preferred_chroma, evidence.hue)
+                .opaque_hex(),
             chroma_cap,
             preferred_chroma * MINIMUM_AUTHORED_CHROMA_RETENTION,
         )
@@ -256,12 +257,11 @@ fn allocate_family(search: &mut Search, request: FamilyFitRequest<'_>) -> Result
         },
     )?;
     let output_chroma = oklab_to_oklch(lab(&fit.output)?)[1];
-    if output_chroma > chroma_cap + 1e-12 {
-        return Err(crate::Error(format!(
-            "syntax family {} escaped its chroma envelope: {output_chroma:.6} > {chroma_cap:.6}",
-            request.family
-        )));
-    }
+    assert!(
+        output_chroma <= chroma_cap + 1e-12,
+        "bounded syntax family {} escaped its chroma envelope: {output_chroma:.6} > {chroma_cap:.6}",
+        request.family
+    );
     Ok(FamilyAllocation {
         family: request.family,
         roles: Vec::new(),
@@ -349,7 +349,7 @@ fn semantic_score(
             let allocation = allocations
                 .iter()
                 .find(|allocation| allocation.family == family)
-                .unwrap();
+                .expect("active syntax trunk must have an allocation");
             if let Some(source) = allocation.source {
                 score.authored_trunk_count += 1;
                 if let Some(cluster) = source_cluster(profile, source) {
@@ -511,12 +511,12 @@ fn search_semantic_forest(
                 let parent = allocations
                     .iter()
                     .find(|allocation| allocation.family == parent)
-                    .unwrap();
+                    .expect("active syntax branch must have its parent allocation");
                 (parent.measured_saliency + semantic.parent_saliency_delta)
                     .clamp(request.subdued_saliency + 0.06, 0.96)
             })
             .unwrap_or(semantic.fallback_saliency);
-        let Ok(candidate) = allocate_family(
+        let candidate = match allocate_family(
             search,
             FamilyFitRequest {
                 preference_contexts: request.preference_contexts,
@@ -527,8 +527,12 @@ fn search_semantic_forest(
                 source,
                 preferred_saliency,
             },
-        ) else {
-            continue;
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) if error.is_infeasible() => continue,
+            Err(error) => {
+                panic!("validated syntax family request failed unexpectedly: {error}")
+            }
         };
 
         allocations.push(candidate);
@@ -538,7 +542,9 @@ fn search_semantic_forest(
             continue;
         }
 
-        let candidate = allocations.last().unwrap();
+        let candidate = allocations
+            .last()
+            .expect("newly pushed syntax allocation must be present");
         let existing = request.fixed_outputs.iter().copied().chain(
             allocations[..allocations.len() - 1]
                 .iter()
@@ -666,8 +672,8 @@ fn fit_subdued(
         },
     )?;
     if fit.output == reference {
-        return Err(crate::Error(
-            "base and subdued syntax roles collided exactly".into(),
+        return Err(crate::Error::infeasible(
+            "base and subdued syntax roles collided exactly",
         ));
     }
 
@@ -682,14 +688,62 @@ pub fn build_syntax(
     predictive: &str,
     diff_sources: [&str; 3],
 ) -> Result<Map<String, Value>> {
+    palette.validate()?;
     let preference_contexts = contexts.ordinary;
     let required_contexts = contexts.rendered;
+    if preference_contexts.is_empty() || required_contexts.is_empty() {
+        return Err(crate::Error::invalid(
+            "syntax generation requires ordinary and rendered contexts",
+        ));
+    }
+    for (name, value) in [
+        ("saliency reference", saliency_reference),
+        ("predictive", predictive),
+    ] {
+        lab(value).map_err(|error| error.context(name))?;
+    }
+    for (index, source) in diff_sources.iter().enumerate() {
+        lab(source).map_err(|error| error.context(format!("diff source {index}")))?;
+    }
+    for (kind, values) in [
+        ("ordinary syntax context", preference_contexts),
+        ("rendered syntax context", required_contexts),
+    ] {
+        for (index, value) in values.iter().enumerate() {
+            lab(value).map_err(|error| error.context(format!("{kind} {index}")))?;
+        }
+    }
+    match build_syntax_from_validated_inputs(
+        search,
+        palette,
+        preference_contexts,
+        required_contexts,
+        saliency_reference,
+        predictive,
+        diff_sources,
+    ) {
+        Err(error) if error.kind() == crate::ErrorKind::InvalidInput => {
+            panic!("validated syntax inputs produced invalid internal state: {error}")
+        }
+        result => result,
+    }
+}
+
+fn build_syntax_from_validated_inputs(
+    search: &mut Search,
+    palette: &ResolvedPalette,
+    preference_contexts: &[String],
+    required_contexts: &[String],
+    saliency_reference: &str,
+    predictive: &str,
+    diff_sources: [&str; 3],
+) -> Result<Map<String, Value>> {
     let profile = profile::measure(palette)?;
     let base = saliency_reference.to_owned();
 
     let primary_minimum = minimum_contrast(&base, required_contexts)?;
     if primary_minimum < SYNTAX_PRIMARY_FLOOR - 1e-12 {
-        return Err(crate::Error(format!(
+        return Err(crate::Error::infeasible(format!(
             "editor primary reaches only {primary_minimum:.3}:1 on a rendered syntax context"
         )));
     }
@@ -730,7 +784,13 @@ pub fn build_syntax(
         }
 
         let fallback = semantic_plan.fallback_for(role);
-        role_colors.insert(role, role_colors[&fallback].clone());
+        role_colors.insert(
+            role,
+            role_colors
+                .get(&fallback)
+                .expect("syntax fallback role must already have a color")
+                .clone(),
+        );
     }
 
     let pair_constraints =
@@ -743,7 +803,7 @@ pub fn build_syntax(
             required_contexts,
             pair_constraints,
         )
-        .map_err(|error| crate::Error(format!("syntax diff semantic pair: {error}")))?;
+        .map_err(|error| error.context("syntax diff semantic pair"))?;
     let syntax_change =
         search.fit_color(diff_sources[1], required_contexts, SYNTAX_SEMANTIC_FLOOR)?;
     role_colors.extend([
@@ -754,12 +814,12 @@ pub fn build_syntax(
 
     let mut output = Map::new();
     for capture in CAPTURE_POLICIES {
-        let color = role_colors.get(&capture.role).ok_or_else(|| {
-            crate::Error(format!(
-                "no syntax color allocated for {}",
+        let color = role_colors.get(&capture.role).unwrap_or_else(|| {
+            panic!(
+                "generated syntax role {} must have an allocated color",
                 capture.role.as_str()
-            ))
-        })?;
+            )
+        });
         let (style, weight) = capture_style(capture.capture);
         let mut spec = Map::from_iter([("color".into(), color.clone().into())]);
         if let Some(style) = style {
@@ -810,7 +870,7 @@ fn capture_style(capture: &str) -> (Option<&'static str>, Option<u16>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::gamut_map_oklch;
+    use crate::color::gamut_map_oklch_unchecked;
     use crate::palette::Provenance;
 
     fn allocation(family: usize) -> FamilyAllocation {
@@ -833,7 +893,7 @@ mod tests {
         for (index, key) in SOURCE_KEY_ORDER[..5].iter().enumerate() {
             colors.insert(
                 (*key).to_owned(),
-                gamut_map_oklch(0.65, 0.10, index as f64).opaque_hex(),
+                gamut_map_oklch_unchecked(0.65, 0.10, index as f64).opaque_hex(),
             );
             provenance.insert((*key).to_owned(), Provenance::Direct);
         }

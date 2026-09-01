@@ -1,3 +1,4 @@
+use omarchy_zed_theme::ErrorKind;
 use omarchy_zed_theme::color::{
     contrast_ratio, delta_e, gamut_map_oklch, lab, oklab_to_oklch, parse_hex, render_layers,
 };
@@ -9,7 +10,9 @@ use omarchy_zed_theme::constants::{
 };
 use omarchy_zed_theme::palette::{Provenance, ResolvedPalette, resolve_palette};
 use omarchy_zed_theme::publish::{atomic_write_file, generate_and_publish};
-use omarchy_zed_theme::syntax::contrast_floor;
+use omarchy_zed_theme::search::Search;
+use omarchy_zed_theme::syntax::profile::measure;
+use omarchy_zed_theme::syntax::{SyntaxContexts, build_syntax, contrast_floor};
 use omarchy_zed_theme::theme::build_theme;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -106,9 +109,10 @@ fn malformed_resolved_palettes_are_rejected() {
     let mut missing = synthetic_palette();
     missing.colors.remove("foreground");
 
+    let missing_error = build_theme(&missing).unwrap_err();
+    assert_eq!(missing_error.kind(), ErrorKind::InvalidInput);
     assert!(
-        build_theme(&missing)
-            .unwrap_err()
+        missing_error
             .to_string()
             .contains("omitted canonical keys: foreground")
     );
@@ -129,6 +133,38 @@ fn malformed_resolved_palettes_are_rejected() {
         .insert("foreground".into(), "#€éa".into());
 
     assert!(build_theme(&invalid_color).is_err());
+
+    let mut missing_provenance = synthetic_palette();
+    missing_provenance.provenance.remove("green");
+    let profile_error = measure(&missing_provenance).unwrap_err();
+    assert_eq!(profile_error.kind(), ErrorKind::InvalidInput);
+    assert!(profile_error.to_string().contains("provenance: green"));
+
+    let mut missing_syntax_color = synthetic_palette();
+    missing_syntax_color.colors.remove("muted");
+    let mut search = Search::default();
+    let syntax_error = build_syntax(
+        &mut search,
+        &missing_syntax_color,
+        SyntaxContexts {
+            ordinary: &[],
+            rendered: &[],
+        },
+        "#ffffff",
+        "#ffffff",
+        ["#00ff00", "#ffff00", "#ff0000"],
+    )
+    .unwrap_err();
+    assert_eq!(syntax_error.kind(), ErrorKind::InvalidInput);
+    assert!(syntax_error.to_string().contains("canonical keys: muted"));
+}
+
+#[test]
+fn missing_palette_file_is_an_external_failure() {
+    let missing = temporary("missing-palette");
+    let error = resolve_palette(&missing, None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::External);
+    assert!(error.to_string().contains(&missing.display().to_string()));
 }
 
 #[test]
@@ -461,7 +497,7 @@ fn rendered_diff_hierarchy_survives_dark_and_light_palettes() {
                 (&border_role, expected_opacities[2]),
                 (&word_role, expected_opacities[3]),
             ] {
-                let actual = parse_hex(style[role].as_str().unwrap()).unwrap().a;
+                let actual = parse_hex(style[role].as_str().unwrap()).unwrap().alpha();
                 assert_eq!((actual * 255.0).round(), (expected * 255.0).round());
             }
 
@@ -652,7 +688,7 @@ fn a_scarce_but_perceptible_authored_hue_is_not_discarded() {
     }
     palette.colors.insert(
         "accent".into(),
-        gamut_map_oklch(0.65, 0.03, 0.2).opaque_hex(),
+        gamut_map_oklch(0.65, 0.03, 0.2).unwrap().opaque_hex(),
     );
     palette
         .provenance
@@ -815,14 +851,14 @@ fn renderer_layer_roles_remain_translucent() {
         "minimap.thumb.active_background",
     ] {
         assert!(
-            parse_hex(style[role].as_str().unwrap()).unwrap().a < 1.0,
+            parse_hex(style[role].as_str().unwrap()).unwrap().alpha() < 1.0,
             "{role} became opaque"
         );
     }
     assert_eq!(
         parse_hex(style["drop_target.border"].as_str().unwrap())
             .unwrap()
-            .a,
+            .alpha(),
         1.0
     );
 }

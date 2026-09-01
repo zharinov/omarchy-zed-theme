@@ -145,7 +145,7 @@ fn complete_link_clusters(evidence: &[EvidenceColor]) -> Vec<HueCluster> {
                         .total_cmp(&evidence[**left].chroma)
                         .then_with(|| evidence[**left].value.cmp(&evidence[**right].value))
                 })
-                .unwrap();
+                .expect("a syntax hue cluster must contain evidence");
             HueCluster {
                 members,
                 representative,
@@ -166,14 +166,19 @@ fn complete_link_clusters(evidence: &[EvidenceColor]) -> Vec<HueCluster> {
 }
 
 pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
+    palette.validate_keys(&EVIDENCE_KEYS)?;
     let mut deduplicated: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
     for key in EVIDENCE_KEYS {
-        let value = palette.colors[key].clone();
+        let value = palette
+            .colors
+            .get(key)
+            .expect("validated syntax evidence color must be present")
+            .clone();
         let provenance = palette
             .provenance
             .get(key)
             .copied()
-            .unwrap_or(Provenance::Derived);
+            .expect("validated syntax evidence provenance must be present");
 
         if provenance == Provenance::Derived {
             continue;
@@ -258,7 +263,7 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::gamut_map_oklch;
+    use crate::color::gamut_map_oklch_unchecked;
     use std::collections::BTreeMap;
 
     fn palette(samples: &[(&str, f64, f64, Provenance)]) -> ResolvedPalette {
@@ -273,7 +278,7 @@ mod tests {
         for (key, chroma, hue, source) in samples {
             colors.insert(
                 (*key).to_owned(),
-                gamut_map_oklch(0.65, *chroma, *hue).opaque_hex(),
+                gamut_map_oklch_unchecked(0.65, *chroma, *hue).opaque_hex(),
             );
             provenance.insert((*key).to_owned(), *source);
         }

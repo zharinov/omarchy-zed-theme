@@ -63,8 +63,8 @@ struct StateQuery {
 #[derive(Default)]
 pub struct Search {
     transform_tables: HashMap<String, TransformTable>,
-    color_results: HashMap<ColorQuery, std::result::Result<String, String>>,
-    state_results: HashMap<StateQuery, std::result::Result<String, String>>,
+    color_results: HashMap<ColorQuery, Result<String>>,
+    state_results: HashMap<StateQuery, Result<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +87,31 @@ impl Default for FitBounds {
             preferred_contrast: None,
             prefer_background: false,
         }
+    }
+}
+
+impl FitBounds {
+    fn validate(self) -> Result<()> {
+        finite_in_range("lower lightness", self.lower_lightness, 0.0, 1.0)?;
+        finite_in_range("upper lightness", self.upper_lightness, 0.0, 1.0)?;
+        if self.lower_lightness > self.upper_lightness {
+            return Err(Error::invalid(
+                "lower lightness cannot exceed upper lightness",
+            ));
+        }
+        finite_at_least("lower chroma", self.lower_chroma, 0.0)?;
+        if self.upper_chroma.is_nan() || self.upper_chroma < 0.0 {
+            return Err(Error::invalid(
+                "upper chroma must be non-negative and not NaN",
+            ));
+        }
+        if self.lower_chroma > self.upper_chroma {
+            return Err(Error::invalid("lower chroma cannot exceed upper chroma"));
+        }
+        if let Some(preferred) = self.preferred_contrast {
+            valid_contrast("preferred contrast", preferred)?;
+        }
+        Ok(())
     }
 }
 
@@ -169,6 +194,21 @@ impl PairConstraints {
         self.balance_rendered_salience = true;
         self
     }
+
+    fn validate(self) -> Result<()> {
+        valid_contrast("foreground contrast", self.foreground_contrast)?;
+        valid_contrast("pair contrast", self.pair_contrast)?;
+        finite_at_least("normal delta E", self.normal_delta, 0.0)?;
+        finite_at_least("CVD delta E", self.cvd_delta, 0.0)?;
+        finite_at_least("lightness delta", self.lightness_delta, 0.0)?;
+        finite_at_least("minimum chroma", self.minimum_chroma, 0.0)?;
+        if let Some((contrast, normal, cvd)) = self.separation_alternative {
+            valid_contrast("alternative pair contrast", contrast)?;
+            finite_at_least("alternative normal delta E", normal, 0.0)?;
+            finite_at_least("alternative CVD delta E", cvd, 0.0)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -245,6 +285,29 @@ impl<'a> OverlayFitRequest<'a> {
         self.prefer_source_fidelity = true;
         self
     }
+
+    fn validate(self) -> Result<()> {
+        valid_contrast("overlay target contrast", self.target)?;
+        finite_at_least("overlay minimum delta E", self.minimum_delta_e, 0.0)?;
+        if let Some((factor, contrast, delta)) = self.runtime_state {
+            finite_in_range("runtime opacity factor", factor, 0.0, 1.0)?;
+            valid_contrast("runtime target contrast", contrast)?;
+            finite_at_least("runtime minimum delta E", delta, 0.0)?;
+        }
+        for (_, target) in self.readable_foregrounds {
+            valid_contrast("readable foreground contrast", *target)?;
+        }
+        for (_, target, delta) in self.rendered_references {
+            valid_contrast("rendered reference contrast", *target)?;
+            finite_at_least("rendered reference delta E", *delta, 0.0)?;
+        }
+        for (_, target, delta, base_step) in self.runtime_rendered_references {
+            valid_contrast("runtime reference contrast", *target)?;
+            finite_at_least("runtime reference delta E", *delta, 0.0)?;
+            finite_at_least("runtime reference base step", *base_step, 0.0)?;
+        }
+        Ok(())
+    }
 }
 
 pub struct OverlayPairRequest<'a> {
@@ -289,6 +352,45 @@ impl<'a> OverlayPairRequest<'a> {
         self.frontier_limit = frontier_limit;
         self
     }
+
+    fn validate(&self) -> Result<()> {
+        self.first.validate()?;
+        self.second.validate()?;
+        self.constraints.validate()?;
+        if self.minimum_alpha > self.maximum_alpha {
+            return Err(Error::invalid(
+                "overlay minimum alpha cannot exceed maximum alpha",
+            ));
+        }
+        if self.frontier_limit < 128 {
+            return Err(Error::invalid(
+                "overlay frontier limit must be at least 128",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn finite_at_least(name: &str, value: f64, minimum: f64) -> Result<()> {
+    if !value.is_finite() || value < minimum {
+        return Err(Error::invalid(format!(
+            "{name} must be finite and at least {minimum}, got {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn finite_in_range(name: &str, value: f64, minimum: f64, maximum: f64) -> Result<()> {
+    if !value.is_finite() || !(minimum..=maximum).contains(&value) {
+        return Err(Error::invalid(format!(
+            "{name} must be finite and in {minimum}..={maximum}, got {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn valid_contrast(name: &str, value: f64) -> Result<()> {
+    finite_in_range(name, value, 1.0, 21.0)
 }
 
 pub struct OverlayPairFallback {
@@ -408,8 +510,11 @@ impl PreparedFill {
     }
 
     fn new(request: OverlayFitRequest<'_>) -> Result<Self> {
+        request.validate()?;
         if request.backgrounds.is_empty() {
-            return Err(Error("overlay fit requires at least one background".into()));
+            return Err(Error::invalid(
+                "overlay fit requires at least one background",
+            ));
         }
 
         let backgrounds = request
@@ -695,6 +800,20 @@ fn pair_is_separated(
     )
 }
 
+pub(crate) fn pair_constraints_satisfied(
+    pair_contrast: f64,
+    normal_delta: f64,
+    cvd_delta: f64,
+    lightness_delta: f64,
+    constraints: PairConstraints,
+) -> bool {
+    pair_contrast >= constraints.pair_contrast - 1e-12
+        && normal_delta >= constraints.normal_delta - 1e-12
+        && cvd_delta >= constraints.cvd_delta - 1e-12
+        && lightness_delta >= constraints.lightness_delta - 1e-12
+        && pair_is_separated(pair_contrast, normal_delta, cvd_delta, constraints)
+}
+
 fn rank_cmp(left: &[f64], right: &[f64]) -> Ordering {
     left.iter()
         .zip(right)
@@ -871,8 +990,15 @@ impl Search {
         constraints: PairConstraints,
         readable_foregrounds: &[(String, f64)],
     ) -> Result<[String; 2]> {
+        constraints.validate()?;
         if first_backgrounds.is_empty() || second_backgrounds.is_empty() {
-            return Err(Error("fit_pair requires at least one background".into()));
+            return Err(Error::invalid("fit_pair requires at least one background"));
+        }
+        for (index, (foreground, target)) in readable_foregrounds.iter().enumerate() {
+            ColorMetrics::from_hex(foreground).map_err(|error| {
+                error.context(format!("readable_foregrounds[{index}].foreground"))
+            })?;
+            valid_contrast(&format!("readable_foregrounds[{index}].contrast"), *target)?;
         }
 
         let collect = |search: &mut Self,
@@ -1001,9 +1127,15 @@ impl Search {
                     normal_delta,
                 );
                 maxima[2] = maxima[2].max(cvd_delta);
-                if cvd_delta < constraints.cvd_delta - 1e-12
-                    || !pair_is_separated(pair_contrast, normal_delta, cvd_delta, constraints)
-                {
+                let lightness_delta =
+                    (first_facts.metrics.lab[0] - second_facts.metrics.lab[0]).abs();
+                if !pair_constraints_satisfied(
+                    pair_contrast,
+                    normal_delta,
+                    cvd_delta,
+                    lightness_delta,
+                    constraints,
+                ) {
                     continue;
                 }
                 let rank = [
@@ -1054,7 +1186,7 @@ impl Search {
                 }
             }
 
-            return Err(Error(format!(
+            return Err(Error::infeasible(format!(
                 "no jointly fitted pair remains for {first_seed}/{second_seed} ({} first candidates, {} second candidates; maxima contrast {:.3}, delta E {:.3}, cheap-feasible CVD {:.3})",
                 first.len(),
                 second.len(),
@@ -1094,6 +1226,8 @@ impl Search {
         avoid: &[String],
         bounds: FitBounds,
     ) -> Result<String> {
+        valid_contrast("color target contrast", target)?;
+        bounds.validate()?;
         let query = ColorQuery {
             seed: seed.to_owned(),
             backgrounds: backgrounds.to_vec(),
@@ -1108,7 +1242,7 @@ impl Search {
             prefer_background: bounds.prefer_background,
         };
         if let Some(result) = self.color_results.get(&query) {
-            return result.clone().map_err(Error);
+            return result.clone();
         }
         let result = self.fit_color_bounded_uncached(
             seed,
@@ -1118,13 +1252,7 @@ impl Search {
             avoid,
             bounds,
         );
-        self.color_results.insert(
-            query,
-            result
-                .as_ref()
-                .map(|color| color.clone())
-                .map_err(|error| error.0.clone()),
-        );
+        self.color_results.insert(query, result.clone());
         result
     }
 
@@ -1138,7 +1266,7 @@ impl Search {
         bounds: FitBounds,
     ) -> Result<String> {
         if backgrounds.is_empty() || preference_backgrounds.is_empty() {
-            return Err(Error("fit_color requires at least one background".into()));
+            return Err(Error::invalid("fit_color requires at least one background"));
         }
 
         let source_metrics = ColorMetrics::from_hex(seed)?;
@@ -1219,7 +1347,7 @@ impl Search {
                 }
             }
             return best.map(|(color, _)| color.hex()).ok_or_else(|| {
-                Error(format!(
+                Error::infeasible(format!(
                     "no candidate in the defined hue-preserving candidate space for {seed} at {target:.2}:1 over {}",
                     backgrounds.join(",")
                 ))
@@ -1268,7 +1396,7 @@ impl Search {
                 );
             }
             return best.map(|(color, _)| color.hex()).ok_or_else(|| {
-                Error(format!(
+                Error::infeasible(format!(
                     "no candidate in the defined hue-preserving candidate space for {seed} at {target:.2}:1 over {}",
                     backgrounds.join(",")
                 ))
@@ -1318,7 +1446,7 @@ impl Search {
             );
         }
         best.map(|(color, _)| color.hex()).ok_or_else(|| {
-            Error(format!(
+            Error::infeasible(format!(
                 "no candidate in the defined hue-preserving candidate space for {seed} at {target:.2}:1 over {}",
                 backgrounds.join(",")
             ))
@@ -1349,6 +1477,11 @@ impl Search {
         minimum_alpha: u8,
         maximum_alpha: u8,
     ) -> Result<String> {
+        if minimum_alpha > maximum_alpha {
+            return Err(Error::invalid(
+                "overlay minimum alpha cannot exceed maximum alpha",
+            ));
+        }
         let prepared = PreparedFill::new(request)?;
         let alpha_values = PreparedFill::alpha_values(minimum_alpha, maximum_alpha);
         let source = ColorMetrics::from_hex(seed)?;
@@ -1384,7 +1517,7 @@ impl Search {
                 },
             );
         best.map(|candidate| candidate.emitted.hex())
-            .ok_or_else(|| Error(format!("no candidate for fill {seed}")))
+            .ok_or_else(|| Error::infeasible(format!("no candidate for fill {seed}")))
     }
 
     fn prepare_overlay_pair(
@@ -1399,7 +1532,7 @@ impl Search {
         let first = PreparedFill::new(first_request)?;
         let second = PreparedFill::new(second_request)?;
         if first.backgrounds.len() != second.backgrounds.len() {
-            return Err(Error("overlay pair scene counts differ".into()));
+            return Err(Error::invalid("overlay pair scene counts differ"));
         }
 
         let collect = |seed: &str,
@@ -1551,14 +1684,13 @@ impl Search {
                         minimum_cvd = minimum_cvd.min(cvd);
                     }
                     maxima[2] = maxima[2].max(minimum_cvd);
-                    if minimum_cvd < constraints.cvd_delta - 1e-12
-                        || !pair_is_separated(
-                            minimum_contrast,
-                            minimum_normal,
-                            minimum_cvd,
-                            constraints,
-                        )
-                    {
+                    if !pair_constraints_satisfied(
+                        minimum_contrast,
+                        minimum_normal,
+                        minimum_cvd,
+                        minimum_lightness,
+                        constraints,
+                    ) {
                         continue;
                     }
                     let rank = if constraints.balance_rendered_salience {
@@ -1596,7 +1728,7 @@ impl Search {
 
         best.map(|(colors, _)| [colors[0].hex(), colors[1].hex()])
             .ok_or_else(|| {
-                Error(format!(
+                Error::infeasible(format!(
                     "no rendered overlay pair for {first_seed} and {second_seed} ({} and {} local candidates; maxima contrast {:.3}, delta E {:.3}, CVD {:.3})",
                     prepared.first_candidates.len(),
                     prepared.second_candidates.len(),
@@ -1613,6 +1745,7 @@ impl Search {
         second_seed: &str,
         request: OverlayPairRequest<'_>,
     ) -> Result<[String; 2]> {
+        request.validate()?;
         let prepared = self.prepare_overlay_pair(
             first_seed,
             second_seed,
@@ -1638,6 +1771,13 @@ impl Search {
         fallback_constraints: PairConstraints,
         fallback_frontier_limit: usize,
     ) -> Result<OverlayPairFallback> {
+        request.validate()?;
+        fallback_constraints.validate()?;
+        if fallback_frontier_limit < 128 {
+            return Err(Error::invalid(
+                "fallback overlay frontier limit must be at least 128",
+            ));
+        }
         let prepared = self.prepare_overlay_pair(
             first_seed,
             second_seed,
@@ -1657,19 +1797,31 @@ impl Search {
                 colors,
                 strong_error: None,
             }),
-            Err(strong_error) => {
+            Err(strong_error) if strong_error.is_infeasible() => {
                 let colors = Self::solve_overlay_pair(
                     &prepared,
                     first_seed,
                     second_seed,
                     fallback_constraints,
                     fallback_frontier_limit,
-                )?;
+                )
+                .map_err(|fallback_error| {
+                    if fallback_error.is_infeasible() {
+                        Error::infeasible(format!(
+                            "strong overlay contract failed ({strong_error}); fallback overlay contract failed ({fallback_error})"
+                        ))
+                    } else {
+                        fallback_error.context(format!(
+                            "fallback overlay search after strong contract failed ({strong_error})"
+                        ))
+                    }
+                })?;
                 Ok(OverlayPairFallback {
                     colors,
                     strong_error: Some(strong_error.to_string()),
                 })
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1681,6 +1833,12 @@ impl Search {
         minimum_delta_e: f64,
         references: &[(String, f64, f64)],
     ) -> Result<String> {
+        valid_contrast("state target contrast", target)?;
+        finite_at_least("state minimum delta E", minimum_delta_e, 0.0)?;
+        for (_, reference_target, reference_delta) in references {
+            valid_contrast("state reference contrast", *reference_target)?;
+            finite_at_least("state reference delta E", *reference_delta, 0.0)?;
+        }
         let query = StateQuery {
             seed: seed.to_owned(),
             backgrounds: backgrounds.to_vec(),
@@ -1692,17 +1850,11 @@ impl Search {
                 .collect(),
         };
         if let Some(result) = self.state_results.get(&query) {
-            return result.clone().map_err(Error);
+            return result.clone();
         }
         let result =
             self.fit_state_uncached(seed, backgrounds, target, minimum_delta_e, references);
-        self.state_results.insert(
-            query,
-            result
-                .as_ref()
-                .map(|color| color.clone())
-                .map_err(|error| error.0.clone()),
-        );
+        self.state_results.insert(query, result.clone());
         result
     }
 
@@ -1715,7 +1867,7 @@ impl Search {
         references: &[(String, f64, f64)],
     ) -> Result<String> {
         if backgrounds.is_empty() {
-            return Err(Error("fit_state requires at least one background".into()));
+            return Err(Error::invalid("fit_state requires at least one background"));
         }
 
         let background_metrics = backgrounds
@@ -1777,7 +1929,7 @@ impl Search {
         }
 
         best.map(|(color, _)| color.hex())
-            .ok_or_else(|| Error(format!("no quantized state candidate for {seed}")))
+            .ok_or_else(|| Error::infeasible(format!("no quantized state candidate for {seed}")))
     }
 
     pub fn fit_state_ladder(
@@ -1787,6 +1939,26 @@ impl Search {
         rungs: &[(f64, f64)],
         protected: &[(String, f64, f64)],
     ) -> Result<Vec<String>> {
+        if backgrounds.is_empty() {
+            return Err(Error::invalid(
+                "fit_state_ladder requires at least one background",
+            ));
+        }
+        ColorMetrics::from_hex(seed).map_err(|error| error.context("state ladder seed"))?;
+        for (index, background) in backgrounds.iter().enumerate() {
+            ColorMetrics::from_hex(background)
+                .map_err(|error| error.context(format!("state ladder background[{index}]")))?;
+        }
+        for (target, delta) in rungs {
+            valid_contrast("state ladder target contrast", *target)?;
+            finite_at_least("state ladder minimum delta E", *delta, 0.0)?;
+        }
+        for (index, (color, target, delta)) in protected.iter().enumerate() {
+            ColorMetrics::from_hex(color)
+                .map_err(|error| error.context(format!("protected state[{index}].color")))?;
+            valid_contrast("protected state contrast", *target)?;
+            finite_at_least("protected state delta E", *delta, 0.0)?;
+        }
         let mut results: Vec<String> = Vec::new();
 
         for (index, (target, delta)) in rungs.iter().enumerate() {
@@ -1801,6 +1973,11 @@ impl Search {
             } else {
                 *target
             };
+            if effective_target > 21.0 {
+                return Err(Error::infeasible(format!(
+                    "state ladder rung {index} requires impossible contrast {effective_target:.3}:1"
+                )));
+            }
 
             let mut references = protected.to_vec();
             references.extend(
@@ -1835,6 +2012,41 @@ impl Search {
         target: f64,
         role: &str,
     ) -> Result<Vec<String>> {
+        self.fit_distinct_colors_with_separation(
+            seeds,
+            backgrounds,
+            target,
+            ACCENT_NORMAL_DELTA_E,
+            ACCENT_CVD_DELTA_E,
+            role,
+        )
+    }
+
+    pub fn fit_distinct_colors_with_separation(
+        &mut self,
+        seeds: &[String],
+        backgrounds: &[String],
+        target: f64,
+        normal_delta_e: f64,
+        cvd_delta_e: f64,
+        role: &str,
+    ) -> Result<Vec<String>> {
+        valid_contrast("distinct color target contrast", target)?;
+        finite_at_least("distinct color normal delta E", normal_delta_e, 0.0)?;
+        finite_at_least("distinct color CVD delta E", cvd_delta_e, 0.0)?;
+        if backgrounds.is_empty() {
+            return Err(Error::invalid(
+                "fit_distinct_colors requires at least one background",
+            ));
+        }
+        for (index, seed) in seeds.iter().enumerate() {
+            ColorMetrics::from_hex(seed)
+                .map_err(|error| error.context(format!("distinct color seed[{index}]")))?;
+        }
+        for (index, background) in backgrounds.iter().enumerate() {
+            ColorMetrics::from_hex(background)
+                .map_err(|error| error.context(format!("distinct color background[{index}]")))?;
+        }
         let mut chosen: Vec<String> = Vec::new();
 
         for (index, seed) in seeds.iter().enumerate() {
@@ -1902,8 +2114,8 @@ impl Search {
                         .fold(f64::INFINITY, f64::min);
 
                     let fallback_rank = [
-                        -normal.min(ACCENT_NORMAL_DELTA_E),
-                        -cvd.min(ACCENT_CVD_DELTA_E),
+                        -normal.min(normal_delta_e),
+                        -cvd.min(cvd_delta_e),
                         transform,
                         overshoot,
                         -retention,
@@ -1915,7 +2127,7 @@ impl Search {
                         *fallback = Some((candidate, fallback_rank));
                     }
 
-                    if normal < ACCENT_NORMAL_DELTA_E - 1e-12 || cvd < ACCENT_CVD_DELTA_E - 1e-12 {
+                    if normal < normal_delta_e - 1e-12 || cvd < cvd_delta_e - 1e-12 {
                         return;
                     }
 
@@ -1958,14 +2170,14 @@ impl Search {
                 );
             }
 
-            let output = passing
-                .map(|(color, _)| color.hex())
-                .or_else(|| fallback.map(|(color, _)| color.hex()))
-                .ok_or_else(|| {
-                    Error(format!(
-                        "no distinct passing color remains for {role}[{index}]"
-                    ))
-                })?;
+            let output = passing.map(|(color, _)| color.hex()).ok_or_else(|| {
+                let achieved = fallback
+                    .map(|(_, rank)| format!(", best normal {:.3}, CVD {:.3}", -rank[0], -rank[1]))
+                    .unwrap_or_default();
+                Error::infeasible(format!(
+                    "no distinct passing color remains for {role}[{index}]{achieved}"
+                ))
+            })?;
 
             chosen.push(output);
         }
@@ -1979,11 +2191,23 @@ pub fn cvd_greedy_order(values: &[String]) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
 
+    const MAX_COLORS: usize = 1024;
+    if values.len() > MAX_COLORS {
+        return Err(Error::invalid(format!(
+            "CVD ordering accepts at most {MAX_COLORS} colors, got {}",
+            values.len()
+        )));
+    }
+
     let prepared = values
         .iter()
         .map(|value| PreparedCvd::new(value))
         .collect::<Result<Vec<_>>>()?;
-    let mut distances = vec![0.0; values.len() * values.len()];
+    let matrix_len = values
+        .len()
+        .checked_mul(values.len())
+        .expect("bounded CVD color count must have a representable square");
+    let mut distances = vec![0.0; matrix_len];
     for first in 0..values.len() {
         for second in (first + 1)..values.len() {
             let distance = prepared[first].distance(prepared[second]);
@@ -2124,10 +2348,6 @@ pub fn cvd_distance(first: &str, second: &str) -> Result<f64> {
     Ok(PreparedCvd::new(first)?.distance(PreparedCvd::new(second)?))
 }
 
-pub fn round6(value: f64) -> f64 {
-    (value * 1_000_000.0).round() / 1_000_000.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2176,6 +2396,157 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn invalid_numeric_requests_are_rejected_before_caching() {
+        let backgrounds = vec!["#101010".to_owned()];
+        let mut search = Search::default();
+
+        let target_error = search
+            .fit_color("#ffffff", &backgrounds, f64::NAN)
+            .unwrap_err();
+        assert_eq!(target_error.kind(), crate::ErrorKind::InvalidInput);
+        assert!(search.color_results.is_empty());
+
+        let bounds_error = search
+            .fit_color_bounded(
+                "#ffffff",
+                &backgrounds,
+                4.5,
+                &[],
+                FitBounds {
+                    lower_lightness: 0.8,
+                    upper_lightness: 0.2,
+                    ..FitBounds::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(bounds_error.kind(), crate::ErrorKind::InvalidInput);
+        assert!(search.color_results.is_empty());
+
+        let pair_error = search
+            .fit_pair(
+                "#ffffff",
+                "#000000",
+                &backgrounds,
+                PairConstraints::new(4.5, 1.0, f64::NAN, 0.0),
+            )
+            .unwrap_err();
+        assert_eq!(pair_error.kind(), crate::ErrorKind::InvalidInput);
+
+        let readable_error = search
+            .fit_pair_on_backgrounds_readable(
+                "#ffffff",
+                &backgrounds,
+                "#000000",
+                &backgrounds,
+                PairConstraints::new(4.5, 1.0, 0.0, 0.0),
+                &[("#ffffff".into(), f64::NAN)],
+            )
+            .unwrap_err();
+        assert_eq!(readable_error.kind(), crate::ErrorKind::InvalidInput);
+        assert!(
+            readable_error
+                .to_string()
+                .contains("readable_foregrounds[0]")
+        );
+
+        let overlay_error = search
+            .fit_readable_overlay(
+                "#ffffff",
+                OverlayFitRequest::new(&backgrounds, 1.2, f64::NEG_INFINITY),
+            )
+            .unwrap_err();
+        assert_eq!(overlay_error.kind(), crate::ErrorKind::InvalidInput);
+
+        let frontier_error = search
+            .fit_overlay_pair(
+                "#ffffff",
+                "#000000",
+                OverlayPairRequest::new(
+                    OverlayFitRequest::new(&backgrounds, 1.1, 0.01),
+                    OverlayFitRequest::new(&backgrounds, 1.1, 0.01),
+                    PairConstraints::new(1.0, 1.0, 0.0, 0.0),
+                )
+                .with_limits(OVERLAY_MAX_ALPHA, 1),
+            )
+            .unwrap_err();
+        assert_eq!(frontier_error.kind(), crate::ErrorKind::InvalidInput);
+
+        let separation_error = search
+            .fit_distinct_colors_with_separation(
+                &["#ffffff".into()],
+                &backgrounds,
+                4.5,
+                f64::NAN,
+                0.0,
+                "test",
+            )
+            .unwrap_err();
+        assert_eq!(separation_error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn derived_impossible_state_ladder_is_infeasible() {
+        let mut search = Search::default();
+        let error = search
+            .fit_state_ladder(
+                "#ffffff",
+                &["#000000".into()],
+                &[(21.0, 0.0), (21.0, 0.0)],
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Infeasible);
+        assert!(error.to_string().contains("rung 1"));
+    }
+
+    #[test]
+    fn zero_work_searches_still_validate_public_color_inputs() {
+        let mut search = Search::default();
+        for error in [
+            search
+                .fit_state_ladder("invalid", &["#000000".into()], &[], &[])
+                .unwrap_err(),
+            search
+                .fit_state_ladder("#ffffff", &["invalid".into()], &[], &[])
+                .unwrap_err(),
+            search
+                .fit_state_ladder(
+                    "#ffffff",
+                    &["#000000".into()],
+                    &[],
+                    &[("invalid".into(), 1.0, 0.0)],
+                )
+                .unwrap_err(),
+            search
+                .fit_distinct_colors(&[], &["invalid".into()], 4.5, "test")
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn distinct_color_fit_never_returns_a_weak_success() {
+        let mut search = Search::default();
+        let error = search
+            .fit_distinct_colors(
+                &["#ffffff".into(), "#ffffff".into()],
+                &["#000000".into()],
+                20.0,
+                "test",
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Infeasible);
+    }
+
+    #[test]
+    fn cvd_order_rejects_unbounded_quadratic_input() {
+        let values = vec!["#000000".to_owned(); 1025];
+        let error = cvd_greedy_order(&values).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]

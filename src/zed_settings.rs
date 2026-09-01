@@ -28,10 +28,10 @@ const SETTINGS_PARSE_OPTIONS: ParseOptions = ParseOptions {
 
 fn parse_settings(source: &str) -> Result<(CstRootNode, CstObject)> {
     let root = CstRootNode::parse(source, &SETTINGS_PARSE_OPTIONS)
-        .map_err(|error| Error(format!("invalid Zed settings: {error}")))?;
+        .map_err(|error| Error::invalid(format!("invalid Zed settings: {error}")))?;
     let object = root
         .object_value()
-        .ok_or_else(|| Error("Zed settings must contain a JSON object".into()))?;
+        .ok_or_else(|| Error::invalid("Zed settings must contain a JSON object"))?;
     Ok((root, object))
 }
 
@@ -40,15 +40,15 @@ fn theme_property(object: &CstObject) -> Result<Option<CstObjectProp>> {
     for property in object.properties() {
         let name = property
             .name()
-            .ok_or_else(|| Error("Zed settings contain an unnamed property".into()))?
+            .ok_or_else(|| Error::invalid("Zed settings contain an unnamed property"))?
             .decoded_value()
-            .map_err(|error| Error(format!("invalid Zed setting name: {error}")))?;
+            .map_err(|error| Error::invalid(format!("invalid Zed setting name: {error}")))?;
 
         if name != "theme" {
             continue;
         }
         if found.is_some() {
-            return Err(Error("Zed settings contain duplicate theme keys".into()));
+            return Err(Error::invalid("Zed settings contain duplicate theme keys"));
         }
 
         found = Some(property);
@@ -81,13 +81,13 @@ fn current_theme(source: &str) -> Result<Option<Value>> {
         .value()
         .and_then(|value| value.to_serde_value())
         .map(Some)
-        .ok_or_else(|| Error("Zed theme setting has no valid value".into()))
+        .ok_or_else(|| Error::invalid("Zed theme setting has no valid value"))
 }
 
 fn root_object_start(root: &CstRootNode) -> Result<usize> {
     let value_index = root
         .value()
-        .ok_or_else(|| Error("Zed settings have no root value".into()))?
+        .ok_or_else(|| Error::invalid("Zed settings have no root value"))?
         .child_index();
     Ok(root
         .children()
@@ -202,17 +202,17 @@ fn state_content(state: &ActivationState) -> Result<Vec<u8>> {
 
 fn parse_state(content: &[u8]) -> Result<ActivationState> {
     let value: Value = serde_json::from_slice(content)
-        .map_err(|error| Error(format!("invalid saved Zed theme state: {error}")))?;
+        .map_err(|error| Error::invalid(format!("invalid saved Zed theme state: {error}")))?;
     let object = value
         .as_object()
-        .ok_or_else(|| Error("saved Zed theme state must be an object".into()))?;
+        .ok_or_else(|| Error::invalid("saved Zed theme state must be an object"))?;
     if object.get("version").and_then(Value::as_u64) != Some(STATE_VERSION) {
-        return Err(Error("unsupported saved Zed theme state version".into()));
+        return Err(Error::invalid("unsupported saved Zed theme state version"));
     }
     let active = object
         .get("active")
         .and_then(Value::as_bool)
-        .ok_or_else(|| Error("saved Zed theme state has no active flag".into()))?;
+        .ok_or_else(|| Error::invalid("saved Zed theme state has no active flag"))?;
     Ok(ActivationState {
         active,
         previous_theme: object.get("previous_theme").cloned(),
@@ -222,7 +222,7 @@ fn parse_state(content: &[u8]) -> Result<ActivationState> {
 fn settings_source(content: Option<&[u8]>) -> Result<&str> {
     match content {
         Some(content) => std::str::from_utf8(content)
-            .map_err(|_| Error("Zed settings are not valid UTF-8".into())),
+            .map_err(|_| Error::invalid("Zed settings are not valid UTF-8")),
         None => Ok("{}\n"),
     }
 }
@@ -261,7 +261,7 @@ fn activate_settings(
         }
     }
 
-    Err(Error(format!(
+    Err(Error::external(format!(
         "Zed settings did not remain stable: {}",
         settings_path.display()
     )))
@@ -295,7 +295,7 @@ fn restore_settings(
         }
     }
 
-    Err(Error(format!(
+    Err(Error::external(format!(
         "Zed settings did not remain stable: {}",
         settings_path.display()
     )))
@@ -320,17 +320,36 @@ fn activation_directory_lock(state_path: &Path) -> Result<File> {
     let root = state_path
         .parent()
         .and_then(Path::parent)
-        .ok_or_else(|| Error("saved Zed theme state has no stable lock directory".into()))?;
-    fs::create_dir_all(root)?;
-    let lock = File::open(root)?;
-    if !lock.metadata()?.is_dir() {
-        return Err(Error(format!(
+        .ok_or_else(|| Error::invalid("saved Zed theme state has no stable lock directory"))?;
+    fs::create_dir_all(root).map_err(|error| {
+        Error::external(format!(
+            "cannot create saved Zed theme lock directory {}: {error}",
+            root.display()
+        ))
+    })?;
+    let lock = File::open(root).map_err(|error| {
+        Error::external(format!(
+            "cannot open saved Zed theme lock directory {}: {error}",
+            root.display()
+        ))
+    })?;
+    if !lock
+        .metadata()
+        .map_err(|error| {
+            Error::external(format!(
+                "cannot inspect saved Zed theme lock directory {}: {error}",
+                root.display()
+            ))
+        })?
+        .is_dir()
+    {
+        return Err(Error::external(format!(
             "saved Zed theme lock path is not a directory: {}",
             root.display()
         )));
     }
     lock.lock_exclusive()
-        .map_err(|error| Error(format!("cannot lock saved Zed theme state: {error}")))?;
+        .map_err(|error| Error::external(format!("cannot lock saved Zed theme state: {error}")))?;
     Ok(lock)
 }
 
@@ -339,7 +358,7 @@ fn claim_matches(claim_path: &Path, owner: &str) -> Result<bool> {
         return Ok(false);
     };
     let claim = std::str::from_utf8(&content)
-        .map_err(|_| Error("activation claim is not valid UTF-8".into()))?;
+        .map_err(|_| Error::invalid("activation claim is not valid UTF-8"))?;
     Ok(claim.trim() == owner)
 }
 
@@ -350,7 +369,7 @@ fn activate_paths(
     owner: &str,
 ) -> Result<()> {
     if owner.is_empty() {
-        return Err(Error("activation owner cannot be empty".into()));
+        return Err(Error::invalid("activation owner cannot be empty"));
     }
 
     let _lock = activation_directory_lock(state_path)?;
@@ -396,7 +415,7 @@ fn restore_paths(
     owner: &str,
 ) -> Result<()> {
     if owner.is_empty() {
-        return Err(Error("activation owner cannot be empty".into()));
+        return Err(Error::invalid("activation owner cannot be empty"));
     }
 
     let _lock = activation_directory_lock(state_path)?;
@@ -429,7 +448,12 @@ fn restore_paths(
         return Ok(());
     }
 
-    fs::remove_file(state_path)?;
+    fs::remove_file(state_path).map_err(|error| {
+        Error::external(format!(
+            "cannot remove saved Zed theme state {}: {error}",
+            state_path.display()
+        ))
+    })?;
     if let Some(parent) = state_path.parent() {
         let _ = fs::remove_dir(parent);
     }

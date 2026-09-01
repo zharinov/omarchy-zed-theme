@@ -46,8 +46,8 @@ impl<'a> SaliencyRequest<'a> {
 
 fn geometric_contrast(color: &str, backgrounds: &[String]) -> Result<f64> {
     if backgrounds.is_empty() {
-        return Err(Error(
-            "relative saliency requires at least one background".into(),
+        return Err(Error::invalid(
+            "relative saliency requires at least one background",
         ));
     }
 
@@ -79,8 +79,18 @@ pub fn fit_relative(
         mut bounds,
     } = request;
 
+    if !hard_floor.is_finite() || !(1.0..=21.0).contains(&hard_floor) {
+        return Err(Error::invalid(format!(
+            "saliency hard floor must be finite and in 1..=21, got {hard_floor:?}"
+        )));
+    }
+    if !preferred_saliency.is_finite() || !(0.0..=1.0).contains(&preferred_saliency) {
+        return Err(Error::invalid(format!(
+            "preferred saliency must be finite and in 0..=1, got {preferred_saliency:?}"
+        )));
+    }
+
     let reference_contrast = geometric_contrast(reference, backgrounds)?;
-    let preferred_saliency = preferred_saliency.clamp(0.0, 1.0);
     let preferred_contrast = (reference_contrast.ln() * preferred_saliency)
         .exp()
         .max(hard_floor);

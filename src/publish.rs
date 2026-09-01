@@ -33,9 +33,9 @@ struct SourceIdentity {
 
 fn source_identity(path: &Path) -> Result<SourceIdentity> {
     let metadata = fs::metadata(path)
-        .map_err(|error| Error(format!("cannot inspect {}: {error}", path.display())))?;
+        .map_err(|error| Error::external(format!("cannot inspect {}: {error}", path.display())))?;
     if !metadata.is_file() {
-        return Err(Error(format!(
+        return Err(Error::invalid(format!(
             "colors.toml is not a regular file: {}",
             path.display()
         )));
@@ -54,11 +54,11 @@ fn source_identity(path: &Path) -> Result<SourceIdentity> {
 
 fn replaceable_target(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error(format!(
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::invalid(format!(
             "refusing to replace symlink target: {}",
             path.display()
         ))),
-        Ok(metadata) if !metadata.is_file() => Err(Error(format!(
+        Ok(metadata) if !metadata.is_file() => Err(Error::invalid(format!(
             "refusing non-regular target: {}",
             path.display()
         ))),
@@ -77,22 +77,36 @@ pub(crate) fn read_regular_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(Error(format!(
+            return Err(Error::external(format!(
                 "cannot read existing target {}: {error}",
                 path.display()
             )));
         }
     };
 
-    if !file.metadata()?.is_file() {
-        return Err(Error(format!(
+    if !file
+        .metadata()
+        .map_err(|error| {
+            Error::external(format!(
+                "cannot inspect open target {}: {error}",
+                path.display()
+            ))
+        })?
+        .is_file()
+    {
+        return Err(Error::invalid(format!(
             "refusing non-regular target: {}",
             path.display()
         )));
     }
 
     let mut content = Vec::new();
-    file.read_to_end(&mut content)?;
+    file.read_to_end(&mut content).map_err(|error| {
+        Error::external(format!(
+            "cannot read existing target {}: {error}",
+            path.display()
+        ))
+    })?;
 
     Ok(Some(content))
 }
@@ -110,8 +124,13 @@ fn atomic_write_file_inner(
 ) -> Result<Option<bool>> {
     let parent = target
         .parent()
-        .ok_or_else(|| Error("target has no parent".into()))?;
-    fs::create_dir_all(parent)?;
+        .ok_or_else(|| Error::invalid("target has no parent"))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        Error::external(format!(
+            "cannot create target directory {}: {error}",
+            parent.display()
+        ))
+    })?;
     replaceable_target(target)?;
 
     let current = read_regular_nofollow(target)?;
@@ -135,9 +154,25 @@ fn atomic_write_file_inner(
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(content)?;
-        file.sync_all()?;
+            .open(&temporary)
+            .map_err(|error| {
+                Error::external(format!(
+                    "cannot create temporary output {}: {error}",
+                    temporary.display()
+                ))
+            })?;
+        file.write_all(content).map_err(|error| {
+            Error::external(format!(
+                "cannot write temporary output {}: {error}",
+                temporary.display()
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            Error::external(format!(
+                "cannot sync temporary output {}: {error}",
+                temporary.display()
+            ))
+        })?;
         replaceable_target(target)?;
         if let ExpectedContent::Exact(expected) = expected
             && read_regular_nofollow(target)?.as_deref() != expected
@@ -145,8 +180,21 @@ fn atomic_write_file_inner(
             return Ok(false);
         }
 
-        fs::rename(&temporary, target)?;
-        File::open(parent)?.sync_all()?;
+        fs::rename(&temporary, target).map_err(|error| {
+            Error::external(format!(
+                "cannot publish {} as {}: {error}",
+                temporary.display(),
+                target.display()
+            ))
+        })?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                Error::external(format!(
+                    "cannot sync target directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
         Ok(true)
     })();
 
@@ -158,8 +206,10 @@ fn atomic_write_file_inner(
 }
 
 pub fn atomic_write_file(target: &Path, content: &[u8]) -> Result<bool> {
-    atomic_write_file_inner(target, content, ExpectedContent::Any)?
-        .ok_or_else(|| Error("unconditional atomic write was not attempted".into()))
+    Ok(
+        atomic_write_file_inner(target, content, ExpectedContent::Any)?
+            .expect("unconditional atomic write must always be attempted"),
+    )
 }
 
 pub fn atomic_write_file_if_unchanged(
@@ -185,14 +235,14 @@ fn running_binary_hash() -> Result<[u8; 32]> {
     let path = Path::new("/proc/self/exe");
     let mut file = File::open(path)
         .or_else(|_| std::env::current_exe().and_then(File::open))
-        .map_err(|error| Error(format!("cannot open the running executable: {error}")))?;
+        .map_err(|error| Error::external(format!("cannot open the running executable: {error}")))?;
 
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let length = file
-            .read(&mut buffer)
-            .map_err(|error| Error(format!("cannot hash the running executable: {error}")))?;
+        let length = file.read(&mut buffer).map_err(|error| {
+            Error::external(format!("cannot hash the running executable: {error}"))
+        })?;
         if length == 0 {
             break;
         }
@@ -215,14 +265,22 @@ fn generation_cache_key(binary_hash: [u8; 32], palette: &ResolvedPalette) -> Str
     hash_field(&mut hasher, &binary_hash);
     hash_field(&mut hasher, palette.mode.as_bytes());
 
-    hasher.update((palette.colors.len() as u64).to_le_bytes());
-    for (key, value) in &palette.colors {
+    hasher.update((crate::constants::CANONICAL_COLOR_KEYS.len() as u64).to_le_bytes());
+    for key in crate::constants::CANONICAL_COLOR_KEYS {
+        let value = palette
+            .colors
+            .get(*key)
+            .expect("validated palette cache key color must be present");
         hash_field(&mut hasher, key.as_bytes());
         hash_field(&mut hasher, value.as_bytes());
     }
 
-    hasher.update((palette.provenance.len() as u64).to_le_bytes());
-    for (key, provenance) in &palette.provenance {
+    hasher.update((crate::constants::CANONICAL_COLOR_KEYS.len() as u64).to_le_bytes());
+    for key in crate::constants::CANONICAL_COLOR_KEYS {
+        let provenance = palette
+            .provenance
+            .get(*key)
+            .expect("validated palette cache key provenance must be present");
         hash_field(&mut hasher, key.as_bytes());
         hasher.update([match provenance {
             Provenance::Direct => 0,
@@ -238,10 +296,23 @@ fn cache_record(key: &str, output: &[u8]) -> Vec<u8> {
     format!("v1\n{key}\n{:x}\n", Sha256::digest(output)).into_bytes()
 }
 
+fn cache_target_is_usable(cache_path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(cache_path) {
+        Ok(metadata) => Ok(metadata.is_file() && !metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(Error::external(format!(
+            "cannot inspect generation cache {}: {error}",
+            cache_path.display()
+        ))),
+    }
+}
+
 fn cache_matches(cache_path: &Path, target: &Path, key: &str) -> Result<bool> {
-    let record = match read_regular_nofollow(cache_path) {
-        Ok(Some(record)) => record,
-        Ok(None) | Err(_) => return Ok(false),
+    if !cache_target_is_usable(cache_path)? {
+        return Ok(false);
+    }
+    let Some(record) = read_regular_nofollow(cache_path)? else {
+        return Ok(false);
     };
 
     let Some(output) = read_regular_nofollow(target)? else {
@@ -275,7 +346,12 @@ pub fn generate_and_publish(
     let cache_path = destination.join(".omarchy-zed-theme.cache");
     let lock_parent = destination.parent().unwrap_or(destination);
 
-    fs::create_dir_all(lock_parent)?;
+    fs::create_dir_all(lock_parent).map_err(|error| {
+        Error::external(format!(
+            "cannot create generation lock directory {}: {error}",
+            lock_parent.display()
+        ))
+    })?;
 
     let lock_path = lock_parent.join(".omarchy-zed-theme.lock");
     let lock = OpenOptions::new()
@@ -286,21 +362,34 @@ pub fn generate_and_publish(
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(&lock_path)
         .map_err(|error| {
-            Error(format!(
+            Error::external(format!(
                 "cannot open generation lock {}: {error}",
                 lock_path.display()
             ))
         })?;
 
-    if !lock.metadata()?.is_file() {
-        return Err(Error(format!(
+    if !lock
+        .metadata()
+        .map_err(|error| {
+            Error::external(format!(
+                "cannot inspect generation lock {}: {error}",
+                lock_path.display()
+            ))
+        })?
+        .is_file()
+    {
+        return Err(Error::external(format!(
             "generation lock is not a regular file: {}",
             lock_path.display()
         )));
     }
 
-    lock.lock_exclusive()
-        .map_err(|error| Error(format!("cannot lock generation: {error}")))?;
+    lock.lock_exclusive().map_err(|error| {
+        Error::external(format!(
+            "cannot lock generation at {}: {error}",
+            lock_path.display()
+        ))
+    })?;
 
     for _ in 0..5 {
         let before = source_identity(colors_file)?;
@@ -325,7 +414,8 @@ pub fn generate_and_publish(
         }
 
         let document = build_theme(&palette)?;
-        let mut content = serde_json::to_vec_pretty(&document)?;
+        let mut content = serde_json::to_vec_pretty(&document)
+            .expect("generated serde_json::Value must always serialize");
         content.push(b'\n');
 
         let Some(changed) =
@@ -333,7 +423,15 @@ pub fn generate_and_publish(
         else {
             continue;
         };
-        let _ = atomic_write_file(&cache_path, &cache_record(&cache_key, &content));
+        if cache_target_is_usable(&cache_path)? {
+            match atomic_write_file(&cache_path, &cache_record(&cache_key, &content)) {
+                Ok(_) => {}
+                // A cache target may be replaced by an unsafe file after the
+                // metadata check; refusing it must not invalidate published output.
+                Err(error) if error.kind() == crate::ErrorKind::InvalidInput => {}
+                Err(error) => return Err(error.context("cannot update generation cache")),
+            }
+        }
 
         return Ok(ThemeUpdate {
             target,
@@ -342,7 +440,7 @@ pub fn generate_and_publish(
         });
     }
 
-    Err(Error(format!(
+    Err(Error::external(format!(
         "colors.toml did not remain stable after 5 attempts: {}",
         colors_file.display()
     )))
@@ -439,10 +537,20 @@ mod tests {
 
     #[test]
     fn cache_key_covers_the_binary_and_effective_inputs() {
+        let colors = crate::constants::CANONICAL_COLOR_KEYS
+            .iter()
+            .map(|key| ((*key).to_owned(), "#101010".to_owned()))
+            .collect();
+        let mut provenance: std::collections::BTreeMap<String, Provenance> =
+            crate::constants::CANONICAL_COLOR_KEYS
+                .iter()
+                .map(|key| ((*key).to_owned(), Provenance::Derived))
+                .collect();
+        provenance.insert("background".into(), Provenance::Direct);
         let palette = ResolvedPalette {
             mode: "dark".into(),
-            colors: [("background".into(), "#101010".into())].into(),
-            provenance: [("background".into(), Provenance::Direct)].into(),
+            colors,
+            provenance,
         };
         let binary = [1; 32];
         let original = generation_cache_key(binary, &palette);

@@ -15,7 +15,7 @@ pub(crate) struct OpaqueColor(String);
 impl OpaqueColor {
     pub(crate) fn new(value: String) -> Result<Self> {
         if parse_hex(&value)?.a < 1.0 {
-            return Err(Error(format!(
+            return Err(Error::invalid(format!(
                 "opaque token received translucent color {value}"
             )));
         }
@@ -38,7 +38,7 @@ pub(crate) struct OverlayColor(String);
 impl OverlayColor {
     pub(crate) fn new(value: String) -> Result<Self> {
         if parse_hex(&value)?.a >= 1.0 {
-            return Err(Error(format!(
+            return Err(Error::invalid(format!(
                 "overlay token received opaque color {value}"
             )));
         }

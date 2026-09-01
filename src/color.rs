@@ -155,13 +155,29 @@ impl Rgba32 {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgba {
-    pub r: f64,
-    pub g: f64,
-    pub b: f64,
-    pub a: f64,
+    pub(crate) r: f64,
+    pub(crate) g: f64,
+    pub(crate) b: f64,
+    pub(crate) a: f64,
 }
 
 impl Rgba {
+    pub fn red(self) -> f64 {
+        self.r
+    }
+
+    pub fn green(self) -> f64 {
+        self.g
+    }
+
+    pub fn blue(self) -> f64 {
+        self.b
+    }
+
+    pub fn alpha(self) -> f64 {
+        self.a
+    }
+
     pub fn opaque_hex(self) -> String {
         format!(
             "#{:02x}{:02x}{:02x}",
@@ -350,13 +366,13 @@ pub fn parse_hex(value: &str) -> Result<Rgba> {
         || bytes.first() != Some(&b'#')
         || !bytes[1..].iter().all(u8::is_ascii_hexdigit)
     {
-        return Err(Error(format!("invalid hex color: {value:?}")));
+        return Err(Error::invalid(format!("invalid hex color: {value:?}")));
     }
 
     let parse = |range: std::ops::Range<usize>| {
         u8::from_str_radix(&value[range], 16)
             .map(|part| part as f64 / 255.0)
-            .map_err(|_| Error(format!("invalid hex color: {value:?}")))
+            .map_err(|_| Error::invalid(format!("invalid hex color: {value:?}")))
     };
     Ok(Rgba {
         r: parse(1..3)?,
@@ -371,7 +387,7 @@ pub fn normalize_hex(value: &str, key: &str) -> Result<String> {
         || !value.starts_with('#')
         || !value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(Error(format!(
+        return Err(Error::invalid(format!(
             "resolved palette key {key:?} must be a six-digit hex color, got {value:?}"
         )));
     }
@@ -420,7 +436,7 @@ fn linear_rgb_to_oklab([r, g, b]: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-pub fn oklab_to_linear_rgb([lightness, a, b]: [f64; 3]) -> [f64; 3] {
+pub(crate) fn oklab_to_linear_rgb([lightness, a, b]: [f64; 3]) -> [f64; 3] {
     let l = lightness + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
     let m = lightness - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
     let s = lightness - 0.089_484_177_5 * a - 1.291_485_548 * b;
@@ -432,7 +448,15 @@ pub fn oklab_to_linear_rgb([lightness, a, b]: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-pub fn oklab_to_rgb(lab: [f64; 3], alpha: f64) -> Rgba {
+pub(crate) fn oklab_to_rgb(lab: [f64; 3], alpha: f64) -> Rgba {
+    assert!(
+        lab.into_iter().all(f64::is_finite),
+        "internal OKLab color must have finite components"
+    );
+    assert!(
+        alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+        "internal alpha must be finite and in 0..=1"
+    );
     let [r, g, b] = oklab_to_linear_rgb(lab);
     Rgba {
         r: linear_to_srgb(r),
@@ -474,9 +498,31 @@ pub fn endpoint_chroma_taper(lightness: f64) -> f64 {
     smoothstep(0.0, 0.12, lightness).min(smoothstep(0.0, 0.12, 1.0 - lightness))
 }
 
-pub fn gamut_map_oklch(lightness: f64, chroma: f64, hue: f64) -> Rgba {
-    let lightness = lightness.clamp(0.0, 1.0);
-    let chroma = chroma.max(0.0);
+pub fn gamut_map_oklch(lightness: f64, chroma: f64, hue: f64) -> Result<Rgba> {
+    finite_unit_interval("OKLCH lightness", lightness)?;
+    if !chroma.is_finite() || chroma < 0.0 {
+        return Err(Error::invalid(format!(
+            "OKLCH chroma must be finite and non-negative, got {chroma:?}"
+        )));
+    }
+    if !hue.is_finite() {
+        return Err(Error::invalid(format!(
+            "OKLCH hue must be finite, got {hue:?}"
+        )));
+    }
+    Ok(gamut_map_oklch_unchecked(lightness, chroma, hue))
+}
+
+pub(crate) fn gamut_map_oklch_unchecked(lightness: f64, chroma: f64, hue: f64) -> Rgba {
+    assert!(
+        lightness.is_finite() && (0.0..=1.0).contains(&lightness),
+        "internal OKLCH lightness must be finite and in 0..=1"
+    );
+    assert!(
+        chroma.is_finite() && chroma >= 0.0,
+        "internal OKLCH chroma must be finite and non-negative"
+    );
+    assert!(hue.is_finite(), "internal OKLCH hue must be finite");
     let candidate = oklch_to_oklab([lightness, chroma, hue]);
     if in_gamut(candidate) {
         return oklab_to_rgb(candidate, 1.0);
@@ -484,7 +530,7 @@ pub fn gamut_map_oklch(lightness: f64, chroma: f64, hue: f64) -> Rgba {
     gamut_map_oklch_with_limit(lightness, chroma, hue, gamut_chroma_limit(lightness, hue))
 }
 
-pub fn gamut_chroma_limit(lightness: f64, hue: f64) -> f64 {
+pub(crate) fn gamut_chroma_limit(lightness: f64, hue: f64) -> f64 {
     gamut_chroma_limit_with_components(lightness, hue.cos(), hue.sin())
 }
 
@@ -527,12 +573,25 @@ pub(crate) fn oklch_in_gamut_with_components(
     ])
 }
 
-pub fn gamut_map_oklch_with_limit(
+pub(crate) fn gamut_map_oklch_with_limit(
     lightness: f64,
     chroma: f64,
     hue: f64,
     chroma_limit: f64,
 ) -> Rgba {
+    assert!(
+        lightness.is_finite() && (0.0..=1.0).contains(&lightness),
+        "internal OKLCH lightness must be finite and in 0..=1"
+    );
+    assert!(
+        chroma.is_finite() && chroma >= 0.0,
+        "internal OKLCH chroma must be finite and non-negative"
+    );
+    assert!(hue.is_finite(), "internal OKLCH hue must be finite");
+    assert!(
+        !chroma_limit.is_nan() && chroma_limit >= 0.0,
+        "internal gamut chroma limit must be non-negative and not NaN"
+    );
     gamut_map_oklch_with_components(lightness, chroma, hue.cos(), hue.sin(), chroma_limit)
 }
 
@@ -543,8 +602,22 @@ pub(crate) fn gamut_map_oklch_with_components(
     hue_sin: f64,
     chroma_limit: f64,
 ) -> Rgba {
-    let lightness = lightness.clamp(0.0, 1.0);
-    let chroma = chroma.max(0.0);
+    assert!(
+        lightness.is_finite() && (0.0..=1.0).contains(&lightness),
+        "internal OKLCH lightness must be finite and in 0..=1"
+    );
+    assert!(
+        chroma.is_finite() && chroma >= 0.0,
+        "internal OKLCH chroma must be finite and non-negative"
+    );
+    assert!(
+        hue_cos.is_finite() && hue_sin.is_finite(),
+        "internal hue components must be finite"
+    );
+    assert!(
+        !chroma_limit.is_nan() && chroma_limit >= 0.0,
+        "internal gamut chroma limit must be non-negative and not NaN"
+    );
     oklab_to_rgb(
         [
             lightness,
@@ -631,38 +704,58 @@ pub fn render_layers(base: &str, overlays: &[&str]) -> Result<String> {
 }
 
 pub fn with_alpha(value: &str, alpha: f64) -> Result<String> {
+    finite_unit_interval("alpha", alpha)?;
     Ok(Rgba {
-        a: alpha.clamp(0.0, 1.0),
+        a: alpha,
         ..parse_hex(value)?
     }
     .hex())
 }
 
 pub fn apply_opacity(value: &str, factor: f64) -> Result<String> {
+    finite_unit_interval("opacity factor", factor)?;
     let color = parse_hex(value)?;
     Ok(Rgba {
-        a: color.a * factor.clamp(0.0, 1.0),
+        a: color.a * factor,
         ..color
     }
     .hex())
 }
 
 pub fn composite(value: &str, base: &str, alpha: f64) -> Result<String> {
+    finite_unit_interval("alpha", alpha)?;
     if parse_hex(base)?.a < 1.0 {
-        return Err(Error("explicit compositing requires an opaque base".into()));
+        return Err(Error::invalid(
+            "explicit compositing requires an opaque base",
+        ));
     }
 
     gpui_blend(base, &with_alpha(value, alpha)?).map(Rgba::opaque_hex)
 }
 
 pub fn tone(value: &str, target_lightness: f64, chroma_scale: f64) -> Result<String> {
+    finite_unit_interval("target lightness", target_lightness)?;
+    if !chroma_scale.is_finite() || chroma_scale < 0.0 {
+        return Err(Error::invalid(format!(
+            "chroma scale must be finite and non-negative, got {chroma_scale:?}"
+        )));
+    }
     let [_, chroma, hue] = oklab_to_oklch(lab(value)?);
-    Ok(gamut_map_oklch(
+    Ok(gamut_map_oklch_unchecked(
         target_lightness,
         chroma * chroma_scale * endpoint_chroma_taper(target_lightness),
         hue,
     )
     .opaque_hex())
+}
+
+fn finite_unit_interval(name: &str, value: f64) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(Error::invalid(format!(
+            "{name} must be finite and in 0..=1, got {value:?}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -687,6 +780,22 @@ mod tests {
     #[test]
     fn malformed_non_ascii_hex_is_rejected() {
         assert!(parse_hex("#€éa").is_err());
+    }
+
+    #[test]
+    fn scalar_color_operations_reject_invalid_numeric_domains() {
+        for error in [
+            with_alpha("#112233", f64::NAN).unwrap_err(),
+            with_alpha("#112233", 1.1).unwrap_err(),
+            apply_opacity("#112233", -0.1).unwrap_err(),
+            composite("#112233", "#000000", f64::INFINITY).unwrap_err(),
+            tone("#112233", 0.5, f64::NAN).unwrap_err(),
+            gamut_map_oklch(f64::NAN, 0.1, 0.0).unwrap_err(),
+            gamut_map_oklch(0.5, -0.1, 0.0).unwrap_err(),
+            gamut_map_oklch(0.5, 0.1, f64::INFINITY).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]

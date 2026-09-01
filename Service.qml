@@ -219,9 +219,15 @@ Item {
 
   Process {
     id: activationProcess
+    stderr: StdioCollector {
+      id: activationErrorOutput
+      waitForEnd: true
+    }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        root.fail("cannot select the Omarchy theme in Zed")
+        const detail = String(activationErrorOutput.text || "").trim()
+        root.fail("cannot select the Omarchy theme in Zed"
+          + (detail ? ": " + detail : ""))
       } else {
         root.activationPending = false
       }

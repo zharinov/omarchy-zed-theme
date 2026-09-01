@@ -8,8 +8,8 @@ use self::tokens::{
     RoleColor, StatusChannel, StatusTokens, SurfaceTokens, ThemeTokens,
 };
 use crate::color::{
-    apply_opacity, contrast_ratio, delta_e, gamut_map_oklch, gpui_blend, lab, lightness,
-    normalize_hex, oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
+    apply_opacity, contrast_ratio, delta_e, gamut_map_oklch_unchecked, gpui_blend, lab, lightness,
+    oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
 };
 use crate::constants::*;
 use crate::palette::ResolvedPalette;
@@ -18,7 +18,8 @@ use crate::saliency::{
     fit_relative,
 };
 use crate::search::{
-    FitBounds, OverlayFitRequest, OverlayPairRequest, PairConstraints, Search, cvd_greedy_order,
+    FitBounds, OverlayFitRequest, OverlayPairRequest, PairConstraints, Search, cvd_distance,
+    cvd_greedy_order, pair_constraints_satisfied,
 };
 use crate::syntax::{SyntaxContexts, build_syntax, contrast_floor, overlay_contrast_floor};
 use crate::{Error, Result};
@@ -28,7 +29,10 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 mod tokens;
 
 fn color<'a>(palette: &'a ResolvedPalette, key: &str) -> &'a str {
-    &palette.colors[key]
+    palette
+        .colors
+        .get(key)
+        .expect("validated palette color must be present")
 }
 
 fn unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -72,14 +76,16 @@ fn fit_highlight_with_alpha_fallback(
     let preferred_cap_error =
         match search.fit_readable_overlay_bounded(seed, request, PREFERRED_HIGHLIGHT_MAX_ALPHA) {
             Ok(output) => return Ok(output),
-            Err(error) => error,
+            Err(error) if error.is_infeasible() => error,
+            Err(error) => return Err(error.context(role)),
         };
     search
         .fit_readable_overlay_bounded(seed, request, OVERLAY_MAX_ALPHA)
-        .map_err(|fallback_error| {
-            Error(format!(
+        .map_err(|fallback_error| match fallback_error.is_infeasible() {
+            true => Error::infeasible(format!(
                 "{role}: preferred alpha cap failed: {preferred_cap_error}; relaxed alpha cap failed: {fallback_error}"
-            ))
+            )),
+            false => fallback_error.context(role),
         })
 }
 
@@ -94,10 +100,9 @@ impl StyleBuilder {
                 entry.insert(value);
                 Ok(())
             }
-            Entry::Occupied(entry) => Err(Error(format!(
-                "theme role {} was generated twice",
-                entry.key()
-            ))),
+            Entry::Occupied(entry) => {
+                panic!("theme role {} was generated twice", entry.key())
+            }
         }
     }
 
@@ -126,7 +131,7 @@ impl StyleBuilder {
     fn append_to(self, style: &mut Map<String, Value>) -> Result<()> {
         for (role, color) in self.0 {
             if style.contains_key(&role) {
-                return Err(Error(format!("theme role {role} was generated twice")));
+                panic!("theme role {role} was generated twice");
             }
             style.insert(role, color.into());
         }
@@ -215,7 +220,9 @@ fn derive_surfaces(palette: &ResolvedPalette) -> Result<BTreeMap<String, String>
                     .total_cmp(&(right.2 - target).abs())
                     .then(left.0.cmp(right.0))
             }) else {
-                return Err(Error("no authored surface colors are available".into()));
+                return Err(Error::infeasible(
+                    "no authored surface colors are available",
+                ));
             };
             let mut output = tone(source, target, 1.0)?;
             if lightness(&output)? <= previous + 1e-6 {
@@ -247,13 +254,11 @@ fn minimum_pairwise(
     second: &[String],
     metric: impl Fn(&str, &str) -> Result<f64>,
 ) -> Result<f64> {
-    if first.len() != second.len() {
-        return Err(Error(format!(
-            "paired color contexts have different lengths: {} and {}",
-            first.len(),
-            second.len()
-        )));
-    }
+    assert_eq!(
+        first.len(),
+        second.len(),
+        "paired generated color contexts must have equal lengths"
+    );
     first
         .iter()
         .zip(second)
@@ -266,16 +271,95 @@ fn fit_player_cursors(
     search: &mut Search,
     seeds: &[String],
     backgrounds: &[String],
+    mode: &str,
 ) -> Result<Vec<String>> {
-    match search.fit_distinct_colors(
+    let preferred = search.fit_distinct_colors_with_separation(
         seeds,
         backgrounds,
         TERMINAL_BRIGHT_PREFERRED,
+        PLAYER_CURSOR_NORMAL_DELTA_E,
+        PLAYER_CURSOR_CVD_DELTA_E,
         "players.cursor",
-    ) {
+    );
+    match preferred {
         Ok(values) => Ok(values),
-        Err(_) => search.fit_distinct_colors(seeds, backgrounds, TEXT_CONTRAST, "players.cursor"),
+        Err(error) if error.is_infeasible() => {
+            match search.fit_distinct_colors_with_separation(
+                seeds,
+                backgrounds,
+                TEXT_CONTRAST,
+                PLAYER_CURSOR_NORMAL_DELTA_E,
+                PLAYER_CURSOR_CVD_DELTA_E,
+                "players.cursor",
+            ) {
+                Ok(values) => Ok(values),
+                Err(authored_error) if authored_error.is_infeasible() => {
+                    let generated = generated_distinct_seeds(&seeds[0], seeds.len(), mode)?;
+                    search
+                        .fit_distinct_colors_with_separation(
+                            &generated,
+                            backgrounds,
+                            TEXT_CONTRAST,
+                            PLAYER_CURSOR_NORMAL_DELTA_E,
+                            PLAYER_CURSOR_CVD_DELTA_E,
+                            "players.cursor.generated",
+                        )
+                        .map_err(|generated_error| {
+                            generated_error.context(format!(
+                                "authored player colors were infeasible ({authored_error})"
+                            ))
+                        })
+                }
+                Err(error) => Err(error.context("players.cursor")),
+            }
+        }
+        Err(error) => Err(error.context("players.cursor")),
     }
+}
+
+fn generated_distinct_seeds(anchor: &str, count: usize, mode: &str) -> Result<Vec<String>> {
+    assert!(count > 0, "generated distinct seed set must not be empty");
+    if count == 8 {
+        let [_, anchor_chroma, anchor_hue] = oklab_to_oklch(lab(anchor)?);
+        // Hue-only cursor sets collapse under some CVD transforms; a monotone
+        // tone ladder gives the strict fitter another independent separator.
+        let lightness = if mode == "dark" {
+            [0.66, 0.71, 0.76, 0.81, 0.86, 0.90, 0.95, 0.99]
+        } else {
+            [0.48, 0.43, 0.38, 0.33, 0.28, 0.23, 0.18, 0.13]
+        };
+        let chroma = anchor_chroma.clamp(0.12, 0.20);
+        return Ok(lightness
+            .into_iter()
+            .enumerate()
+            .map(|(index, lightness)| {
+                gamut_map_oklch_unchecked(
+                    lightness,
+                    chroma,
+                    anchor_hue + index as f64 * 137.5_f64.to_radians(),
+                )
+                .opaque_hex()
+            })
+            .collect());
+    }
+    let [_, anchor_chroma, anchor_hue] = oklab_to_oklch(lab(anchor)?);
+    let lightness = if mode == "dark" {
+        [0.68, 0.86, 0.95]
+    } else {
+        [0.52, 0.34, 0.18]
+    };
+    let chroma = anchor_chroma.clamp(0.18, 0.24);
+    Ok((0..count)
+        .map(|index| {
+            let tone = index % lightness.len();
+            gamut_map_oklch_unchecked(
+                lightness[tone],
+                chroma,
+                anchor_hue + index as f64 * std::f64::consts::TAU / count as f64,
+            )
+            .opaque_hex()
+        })
+        .collect())
 }
 
 struct TerminalRequest<'a> {
@@ -357,7 +441,8 @@ fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result
         },
     ) {
         Ok(value) => value,
-        Err(_) => normal.clone(),
+        Err(error) if error.is_infeasible() => normal.clone(),
+        Err(error) => return Err(error.context("terminal dim foreground")),
     };
     let bright = preferred(
         search,
@@ -465,12 +550,12 @@ impl DiffLayers {
         })
     }
 
-    fn preserves_rendered_semantics(
+    fn rendered_semantic_errors(
         &self,
         editor_bases: &[String],
         editor_foreground: &str,
         profile: DiffPresentationProfile,
-    ) -> Result<bool> {
+    ) -> Result<Vec<String>> {
         let added_line = render_on_bases(editor_bases, &[&self.added_line])?;
         let deleted_line = render_on_bases(editor_bases, &[&self.deleted_line])?;
         let added_hollow = render_on_bases(editor_bases, &[&self.added_hollow])?;
@@ -484,6 +569,13 @@ impl DiffLayers {
         ]
         .into_iter()
         .fold(f64::INFINITY, f64::min);
+        let mut errors = Vec::new();
+        if line_visibility < profile.line_target_contrast - 1e-9 {
+            errors.push(format!(
+                "line visibility {line_visibility:.3}:1 is below {:.3}:1",
+                profile.line_target_contrast
+            ));
+        }
         let text_backgrounds = unique(
             added_line
                 .iter()
@@ -492,35 +584,40 @@ impl DiffLayers {
                 .chain(&deleted_hollow)
                 .cloned(),
         );
-        if line_visibility < profile.line_target_contrast - 1e-9
-            || minimum_contrast(editor_foreground, &text_backgrounds)? < HARD_TEXT_CONTRAST - 1e-9
-        {
-            return Ok(false);
+        let text_contrast = minimum_contrast(editor_foreground, &text_backgrounds)?;
+        if text_contrast < HARD_TEXT_CONTRAST - 1e-9 {
+            errors.push(format!(
+                "editor text contrast {text_contrast:.3}:1 is below {HARD_TEXT_CONTRAST:.3}:1"
+            ));
         }
 
-        for (first, second, normal_floor, cvd_floor) in [
+        for (name, first, second, normal_floor, cvd_floor) in [
             (
+                "line",
                 &added_line,
                 &deleted_line,
                 DIFF_NORMAL_FLOOR_DELTA_E,
                 DIFF_CVD_FLOOR_DELTA_E,
             ),
-            (&added_hollow, &deleted_hollow, 0.003, 0.002),
+            ("hollow", &added_hollow, &deleted_hollow, 0.003, 0.002),
             (
+                "border",
                 &added_border,
                 &deleted_border,
                 DIFF_NORMAL_FLOOR_DELTA_E,
                 0.008,
             ),
         ] {
-            if minimum_pairwise(first, second, delta_e)? < normal_floor - 1e-9
-                || minimum_pairwise(first, second, crate::search::cvd_distance)? < cvd_floor - 1e-9
-            {
-                return Ok(false);
+            let normal = minimum_pairwise(first, second, delta_e)?;
+            let cvd = minimum_pairwise(first, second, cvd_distance)?;
+            if normal < normal_floor - 1e-9 || cvd < cvd_floor - 1e-9 {
+                errors.push(format!(
+                    "{name} separation is delta E {normal:.3}, CVD {cvd:.3}; floors are {normal_floor:.3}/{cvd_floor:.3}"
+                ));
             }
         }
 
-        Ok(true)
+        Ok(errors)
     }
 }
 
@@ -541,7 +638,7 @@ fn conventional_semantic_seed(
     } else {
         target_hue
     };
-    Ok(gamut_map_oklch(lightness, source_chroma.clamp(0.080, 0.180), hue).opaque_hex())
+    Ok(gamut_map_oklch_unchecked(lightness, source_chroma.clamp(0.080, 0.180), hue).opaque_hex())
 }
 
 fn diff_overlay_seed(identity: &str, mode: &str, target_hue_degrees: f64) -> Result<String> {
@@ -554,7 +651,7 @@ fn diff_overlay_seed(identity: &str, mode: &str, target_hue_degrees: f64) -> Res
         (0.48, 0.65)
     };
     let lightness = lightness.clamp(minimum_lightness, maximum_lightness);
-    Ok(gamut_map_oklch(
+    Ok(gamut_map_oklch_unchecked(
         lightness,
         chroma.max(DIFF_OVERLAY_PIGMENT_CHROMA_FLOOR),
         target_hue_degrees.to_radians(),
@@ -590,7 +687,7 @@ fn derive_semantics(
             semantic_backgrounds,
             PairConstraints::from_contract(TEXT_CONTRAST, SEMANTIC_PAIR_CONTRACT),
         )
-        .map_err(|error| Error(format!("semantic add/delete foregrounds: {error}")))?;
+        .map_err(|error| error.context("semantic add/delete foregrounds"))?;
     let blue = search.fit_color(color(palette, "blue"), semantic_backgrounds, TEXT_CONTRAST)?;
     let yellow = match search.fit_color_avoiding(
         color(palette, "yellow"),
@@ -599,11 +696,12 @@ fn derive_semantics(
         std::slice::from_ref(&blue),
     ) {
         Ok(yellow) => yellow,
-        Err(_) => search.fit_color(
+        Err(error) if error.is_infeasible() => search.fit_color(
             color(palette, "yellow"),
             semantic_backgrounds,
             TEXT_CONTRAST,
         )?,
+        Err(error) => return Err(error.context("semantic yellow avoidance")),
     };
     Ok(SemanticColors {
         primary,
@@ -631,31 +729,18 @@ fn derive_semantics(
 }
 
 pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
-    if palette.mode != "dark" && palette.mode != "light" {
-        return Err(Error(format!(
-            "resolved mode must be 'dark' or 'light', got {:?}",
-            palette.mode
-        )));
+    palette.validate()?;
+    match build_theme_from_validated_palette(palette) {
+        Err(error) if error.kind() == crate::ErrorKind::InvalidInput => {
+            panic!("validated palette produced invalid internal theme state: {error}")
+        }
+        result => result,
     }
+}
 
-    let missing = CANONICAL_COLOR_KEYS
-        .iter()
-        .filter(|key| !palette.colors.contains_key(**key))
-        .copied()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(Error(format!(
-            "resolved palette omitted canonical keys: {}",
-            missing.join(", ")
-        )));
-    }
-
-    for key in CANONICAL_COLOR_KEYS {
-        normalize_hex(&palette.colors[*key], key)?;
-    }
-
+fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value> {
     let mut search = Search::default();
-    search.prewarm(palette.colors.values().map(String::as_str))?;
+    search.prewarm(CANONICAL_COLOR_KEYS.iter().map(|key| color(palette, key)))?;
     let surfaces = derive_surfaces(palette)?;
     let canvas = surfaces["canvas"].clone();
     let surface = surfaces["surface"].clone();
@@ -681,7 +766,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             &base_ui_backgrounds,
             UI_STATE_TEXT_CONTRAST,
         )
-        .map_err(|error| Error(format!("provisional UI text: {error}")))?;
+        .map_err(|error| error.context("provisional UI text"))?;
     let readable_ui_state = [(
         provisional_ui_text,
         TEXT_CONTRAST,
@@ -696,7 +781,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             STATE_CONSECUTIVE_DELTA_E,
             &readable_ui_state,
         )
-        .map_err(|error| Error(format!("inactive tab: {error}")))?;
+        .map_err(|error| error.context("inactive tab"))?;
     let tab_inactive_reuses_chrome_context = contrast_ratio(&fitted_tab_inactive, &canvas)?
         >= STATE_HOVER_CONTRAST - 1e-12
         && delta_e(&fitted_tab_inactive, &canvas)? >= STATE_HOVER_DELTA_E - 1e-12;
@@ -720,7 +805,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             STATE_CONSECUTIVE_DELTA_E,
             &readable_ui_state,
         )
-        .map_err(|error| Error(format!("panel overlay: {error}")))?;
+        .map_err(|error| error.context("panel overlay"))?;
     let panel_overlay_hover = search
         .fit_state(
             &panel_overlay,
@@ -729,7 +814,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             STATE_HOVER_DELTA_E,
             &readable_ui_state,
         )
-        .map_err(|error| Error(format!("panel overlay hover: {error}")))?;
+        .map_err(|error| error.context("panel overlay hover"))?;
 
     let interaction_bases = unique(
         base_ui_backgrounds
@@ -754,7 +839,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             .with_runtime_state((0.6, STATE_HOVER_CONTRAST, STATE_HOVER_DELTA_E))
             .with_readable_foregrounds(&readable_interaction_foreground),
         )
-        .map_err(|error| Error(format!("element hover: {error}")))?;
+        .map_err(|error| error.context("element hover"))?;
     let element_active = search
         .fit_readable_overlay(
             &surface,
@@ -777,7 +862,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                 RUNTIME_STATE_BASE_CONTRAST_STEP,
             )]),
         )
-        .map_err(|error| Error(format!("element active: {error}")))?;
+        .map_err(|error| error.context("element active"))?;
     let ghost_hover = search
         .fit_readable_overlay(
             &canvas,
@@ -788,7 +873,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             )
             .with_readable_foregrounds(&readable_interaction_foreground),
         )
-        .map_err(|error| Error(format!("ghost hover: {error}")))?;
+        .map_err(|error| error.context("ghost hover"))?;
     let ghost_active = search
         .fit_readable_overlay(
             &canvas,
@@ -804,7 +889,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                 STATE_CONSECUTIVE_DELTA_E,
             )]),
         )
-        .map_err(|error| Error(format!("ghost active: {error}")))?;
+        .map_err(|error| error.context("ghost active"))?;
 
     let panel_guide_ladder = search
         .fit_state_ladder(
@@ -817,7 +902,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             ],
             &[],
         )
-        .map_err(|error| Error(format!("panel guide ladder: {error}")))?;
+        .map_err(|error| error.context("panel guide ladder"))?;
 
     let mut rendered_ui_state_backgrounds = Vec::new();
     for base in &interaction_bases {
@@ -860,7 +945,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             .with_runtime_state((0.5, 1.08, 0.020))
             .with_readable_foregrounds(&[(semantic.primary.clone(), TEXT_CONTRAST)]),
         )
-        .map_err(|error| Error(format!("UI selection: {error}")))?;
+        .map_err(|error| error.context("UI selection"))?;
 
     let editor_active_line = search
         .fit_readable_overlay(
@@ -875,7 +960,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                 EDITOR_BASE_TEXT_CONTRAST,
             )]),
         )
-        .map_err(|error| Error(format!("active editor line: {error}")))?;
+        .map_err(|error| error.context("active editor line"))?;
 
     let rendered_editor_active_line = gpui_blend(&canvas, &editor_active_line)?.opaque_hex();
     let editor_highlighted_line = search
@@ -896,7 +981,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                 STATE_CONSECUTIVE_DELTA_E,
             )]),
         )
-        .map_err(|error| Error(format!("highlighted editor line: {error}")))?;
+        .map_err(|error| error.context("highlighted editor line"))?;
     let rendered_editor_highlighted_line =
         gpui_blend(&canvas, &editor_highlighted_line)?.opaque_hex();
     let debugger_active = search
@@ -917,7 +1002,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                 STATE_CONSECUTIVE_DELTA_E,
             )]),
         )
-        .map_err(|error| Error(format!("debugger active line: {error}")))?;
+        .map_err(|error| error.context("debugger active line"))?;
     let rendered_debugger_active = gpui_blend(&canvas, &debugger_active)?.opaque_hex();
     let editor_bases = unique([
         canvas.clone(),
@@ -969,7 +1054,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             PairConstraints::from_contract(TEXT_CONTRAST, SEMANTIC_PAIR_CONTRACT)
                 .with_minimum_chroma(0.025),
         )
-        .map_err(|error| Error(format!("version-control add/delete foregrounds: {error}")))?;
+        .map_err(|error| error.context("version-control add/delete foregrounds"))?;
     let version_control_modified = search.fit_color_bounded(
         &diff_yellow_seed,
         &interaction_bases,
@@ -1005,7 +1090,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                 1.0,
                 DIFF_PAIR_CONTRAST,
                 DIFF_NORMAL_FLOOR_DELTA_E,
-                DIFF_CVD_FLOOR_DELTA_E,
+                DIFF_CVD_TARGET_DELTA_E,
             )
             .with_minimum_chroma(DIFF_OVERLAY_MINIMUM_CHROMA)
             .balance_rendered_salience(),
@@ -1013,18 +1098,20 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         .with_alpha_range(line_alpha, line_alpha, 512),
     );
     let mut pigment_candidates = Vec::new();
-    if let Ok([added, deleted]) = line_fit {
-        pigment_candidates.push([
+    match line_fit {
+        Ok([added, deleted]) => pigment_candidates.push([
             parse_hex(&added)?.opaque_hex(),
             parse_hex(&deleted)?.opaque_hex(),
-        ]);
+        ]),
+        Err(error) if error.is_infeasible() => {}
+        Err(error) => return Err(error.context("editor diff line pair")),
     }
     let hollow_alpha = opacity_byte(presentation.hollow_opacity);
     let hollow_pair_request = |backgrounds| {
         OverlayFitRequest::new(backgrounds, 1.01, 0.003)
             .with_readable_foregrounds(&readable_diff_text)
     };
-    if let Ok([added, deleted]) = search.fit_overlay_pair(
+    match search.fit_overlay_pair(
         &diff_added_seed,
         &diff_deleted_seed,
         OverlayPairRequest::new(
@@ -1036,25 +1123,32 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         )
         .with_alpha_range(hollow_alpha, hollow_alpha, 512),
     ) {
-        pigment_candidates.push([
+        Ok([added, deleted]) => pigment_candidates.push([
             parse_hex(&added)?.opaque_hex(),
             parse_hex(&deleted)?.opaque_hex(),
-        ]);
+        ]),
+        Err(error) if error.is_infeasible() => {}
+        Err(error) => return Err(error.context("editor diff hollow pair")),
     }
     pigment_candidates.push([diff_added_seed.clone(), diff_deleted_seed.clone()]);
     let mut diff_layers = None;
+    let mut diff_failures = Vec::new();
     for [added, deleted] in &pigment_candidates {
         let candidate = DiffLayers::from_pigments(added, deleted, presentation)?;
-        if candidate.preserves_rendered_semantics(&editor_bases, &editor_primary, presentation)? {
+        let failures =
+            candidate.rendered_semantic_errors(&editor_bases, &editor_primary, presentation)?;
+        if failures.is_empty() {
             diff_layers = Some(candidate);
             break;
         }
+        diff_failures.push(format!("{added}/{deleted}: {}", failures.join(", ")));
     }
-    let diff_layers = diff_layers.unwrap_or(DiffLayers::from_pigments(
-        &diff_added_seed,
-        &diff_deleted_seed,
-        presentation,
-    )?);
+    let diff_layers = diff_layers.ok_or_else(|| {
+        Error::infeasible(format!(
+            "no editor diff pigments preserve the rendered diff contract ({})",
+            diff_failures.join("; ")
+        ))
+    })?;
     let DiffLayers {
         added_line: diff_added,
         deleted_line: diff_deleted,
@@ -1095,7 +1189,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         )]),
     ) {
         Ok(search_active) => (initial_search_match, search_active),
-        Err(sequential_error) => {
+        Err(sequential_error) if sequential_error.is_infeasible() => {
             let [joint_search_match, joint_search_active] = search
                 .fit_overlay_pair(
                     &semantic.yellow,
@@ -1112,13 +1206,15 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                     )
                     .with_limits(PREFERRED_HIGHLIGHT_MAX_ALPHA, 512),
                 )
-                .map_err(|joint_error| {
-                    Error(format!(
+                .map_err(|joint_error| match joint_error.is_infeasible() {
+                    true => Error::infeasible(format!(
                         "search highlights failed sequentially ({sequential_error}) and jointly ({joint_error})"
-                    ))
+                    )),
+                    false => joint_error.context("joint search highlights"),
                 })?;
             (joint_search_match, joint_search_active)
         }
+        Err(error) => return Err(error.context("sequential search highlights")),
     };
 
     let document_read = fit_highlight_with_alpha_fallback(
@@ -1173,10 +1269,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                 conflict_constraints,
             ),
         )
-        .unwrap_or([
-            apply_opacity(&change_identity.added, 0.20)?,
-            apply_opacity(color(palette, "blue"), 0.20)?,
-        ]);
+        .map_err(|error| error.context("version-control conflict markers"))?;
 
     let yank = fit_highlight_with_alpha_fallback(
         &mut search,
@@ -1227,10 +1320,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             )
             .with_alpha_range(word_alpha, word_alpha, 512),
         )
-        .unwrap_or([
-            apply_opacity(&change_identity.added, presentation.word_opacity)?,
-            apply_opacity(&change_identity.deleted, presentation.word_opacity)?,
-        ]);
+        .map_err(|error| error.context("version-control word diff overlays"))?;
     let rendered_editor_overlays = [
         &search_match,
         &search_active,
@@ -1308,7 +1398,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         u8::MAX,
     ) {
         Ok(selection) => selection,
-        Err(source_error) => {
+        Err(source_error) if source_error.is_infeasible() => {
             match search.fit_readable_overlay_alpha_range(
                 &semantic.accent,
                 selection_request(),
@@ -1316,7 +1406,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                 u8::MAX,
             ) {
                 Ok(selection) => selection,
-                Err(accent_error) => {
+                Err(accent_error) if accent_error.is_infeasible() => {
                     let mut fallback_errors = Vec::new();
                     let mut fallback_candidate = None;
                     for seed in player_seeds.iter().skip(1) {
@@ -1330,19 +1420,26 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                                 fallback_candidate = Some((seed, selection));
                                 break;
                             }
-                            Err(error) => fallback_errors.push(format!("{seed}: {error}")),
+                            Err(error) if error.is_infeasible() => {
+                                fallback_errors.push(format!("{seed}: {error}"));
+                            }
+                            Err(error) => {
+                                return Err(error.context("focused selection fallback"));
+                            }
                         }
                     }
                     let (_, selection) = fallback_candidate.ok_or_else(|| {
-                        Error(format!(
+                        Error::infeasible(format!(
                             "focused selection failed for source ({source_error}), accent ({accent_error}), and player seeds ({})",
                             fallback_errors.join("; ")
                         ))
                     })?;
                     selection
                 }
+                Err(error) => return Err(error.context("focused accent selection")),
             }
         }
+        Err(error) => return Err(error.context("focused source selection")),
     };
 
     let mut player_cursor_backgrounds = editor_text_backgrounds.clone();
@@ -1352,12 +1449,15 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             .push(gpui_blend(background, &apply_opacity(&selection, 0.5)?)?.opaque_hex());
     }
     let player_cursor_backgrounds = unique(player_cursor_backgrounds);
-    let provisional_player_cursors =
-        fit_player_cursors(&mut search, &player_seeds, &player_cursor_backgrounds)?;
+    let provisional_player_cursors = fit_player_cursors(
+        &mut search,
+        &player_seeds,
+        &player_cursor_backgrounds,
+        &palette.mode,
+    )?;
 
     let readable = [(editor_primary.clone(), TEXT_CONTRAST)];
     let mut player_selections = vec![selection];
-    let mut shared_selection_fallback = false;
     for cursor in provisional_player_cursors.iter().skip(1) {
         let references = player_selections
             .iter()
@@ -1374,20 +1474,10 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             .with_readable_foregrounds(&readable)
             .with_rendered_references(&references)
         };
-        let fitted = if let Ok(fitted) =
-            search.fit_readable_overlay_alpha_range(cursor, request(), u8::MAX, u8::MAX)
-        {
-            fitted
-        } else {
-            shared_selection_fallback = true;
-            player_selections[0].clone()
-        };
+        let fitted = search
+            .fit_readable_overlay_alpha_range(cursor, request(), u8::MAX, u8::MAX)
+            .map_err(|error| error.context("player selection"))?;
         player_selections.push(fitted);
-    }
-
-    if shared_selection_fallback {
-        let shared = player_selections[0].clone();
-        player_selections.fill(shared);
     }
 
     let mut final_cursor_backgrounds = editor_text_backgrounds.clone();
@@ -1400,18 +1490,13 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
     }
     let final_cursor_backgrounds = unique(final_cursor_backgrounds);
 
-    let player_cursors = if shared_selection_fallback {
-        provisional_player_cursors.clone()
-    } else {
-        match fit_player_cursors(&mut search, &player_seeds, &final_cursor_backgrounds) {
-            Ok(values) => values,
-            Err(_) => {
-                let shared = player_selections[0].clone();
-                player_selections.fill(shared);
-                provisional_player_cursors.clone()
-            }
-        }
-    };
+    let player_cursors = fit_player_cursors(
+        &mut search,
+        &player_seeds,
+        &final_cursor_backgrounds,
+        &palette.mode,
+    )
+    .map_err(|error| error.context("final player cursors"))?;
 
     let mut players = Vec::new();
     for ((seed, cursor), selection) in player_seeds
@@ -1427,7 +1512,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
                 STATE_HOVER_DELTA_E,
                 &[(cursor.clone(), TEXT_CONTRAST, STATE_CONSECUTIVE_DELTA_E)],
             )
-            .unwrap_or_else(|_| canvas.clone());
+            .map_err(|error| error.context("player background"))?;
         players.push(BTreeMap::from([
             ("cursor".into(), cursor.clone()),
             ("background".into(), background),
@@ -1438,7 +1523,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
     let local_selection_overlay = players
         .first()
         .and_then(|player| player.get("selection"))
-        .ok_or_else(|| Error("local player has no selection color".into()))?;
+        .expect("generated local player must have a selection color");
     let local_unfocused_overlay = apply_opacity(local_selection_overlay, 0.5)?;
     let local_selection = gpui_blend(&canvas, local_selection_overlay)?.opaque_hex();
     let local_unfocused_selection = gpui_blend(&canvas, &local_unfocused_overlay)?.opaque_hex();
@@ -1499,7 +1584,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         for player in &players {
             let selection = player
                 .get("selection")
-                .ok_or_else(|| Error("player has no selection color".into()))?;
+                .expect("generated player must have a selection color");
             focused_selections.push(gpui_blend(base, selection)?.opaque_hex());
         }
     }
@@ -1567,17 +1652,35 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             .cloned()
             .chain(std::iter::once(status_backgrounds["deleted"].clone())),
     );
-    if let Ok([created, deleted]) = search.fit_pair_on_backgrounds(
+    let status_pair_constraints =
+        PairConstraints::from_contract(TEXT_CONTRAST, SEMANTIC_PAIR_CONTRACT)
+            .with_minimum_chroma(0.025);
+    let status_pair = search.fit_pair_on_backgrounds(
         &change_identity.added,
         &created_backgrounds,
         &change_identity.deleted,
         &deleted_backgrounds,
-        PairConstraints::from_contract(TEXT_CONTRAST, SEMANTIC_PAIR_CONTRACT)
-            .with_minimum_chroma(0.025),
-    ) {
-        status_foregrounds.insert("created", created);
-        status_foregrounds.insert("deleted", deleted);
-    }
+        status_pair_constraints,
+    );
+    let [created, deleted] = match status_pair {
+        Ok(pair) => pair,
+        Err(error) if error.is_infeasible() => search
+            .fit_pair_on_backgrounds(
+                &diff_added_seed,
+                &created_backgrounds,
+                &diff_deleted_seed,
+                &deleted_backgrounds,
+                status_pair_constraints,
+            )
+            .map_err(|fallback_error| {
+                fallback_error.context(format!(
+                    "palette-native created/deleted status pair was infeasible ({error})"
+                ))
+            })?,
+        Err(error) => return Err(error.context("created/deleted status foregrounds")),
+    };
+    status_foregrounds.insert("created", created);
+    status_foregrounds.insert("deleted", deleted);
     for (name, seed) in &status_seeds {
         if *name == "ignored" || status_foregrounds.contains_key(name) {
             continue;
@@ -1687,12 +1790,31 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
         color(palette, "bright_magenta").into(),
         color(palette, "bright_green").into(),
     ])?;
-    let accents = search.fit_distinct_colors(
+    let accents = match search.fit_distinct_colors(
         &accent_seeds,
         std::slice::from_ref(&canvas),
         CONTROL_CONTRAST,
         "accents",
-    )?;
+    ) {
+        Ok(accents) => accents,
+        Err(authored_error) if authored_error.is_infeasible() => {
+            let generated =
+                generated_distinct_seeds(&accent_seeds[0], accent_seeds.len(), &palette.mode)?;
+            search
+                .fit_distinct_colors(
+                    &generated,
+                    std::slice::from_ref(&canvas),
+                    CONTROL_CONTRAST,
+                    "accents.generated",
+                )
+                .map_err(|generated_error| {
+                    generated_error.context(format!(
+                        "authored accents were infeasible ({authored_error})"
+                    ))
+                })?
+        }
+        Err(error) => return Err(error.context("accents")),
+    };
 
     let drop_target = search.fit_readable_overlay_bounded(
         &semantic.accent,
@@ -1911,7 +2033,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
 
     let vim_yank = vim
         .remove("vim.yank.background")
-        .ok_or_else(|| Error("missing generated Vim yank highlight".into()))?;
+        .expect("generated Vim roles must include the yank highlight");
     fixed.insert_overlay("vim.yank.background", vim_yank)?;
 
     fixed.extend_opaque(vim)?;
@@ -1960,7 +2082,7 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             .chain(std::iter::once(tab_inactive)),
     );
 
-    validate_theme(
+    if let Err(error) = validate_theme(
         &document,
         ValidationContexts {
             ui_backgrounds: &validation_ui_backgrounds,
@@ -1971,28 +2093,28 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
             editor_text_backgrounds: &editor_text_backgrounds,
             terminal_backgrounds: &terminal_backgrounds,
         },
-    )?;
+    ) {
+        panic!("generated theme validation could not inspect its own output: {error}");
+    }
 
     Ok(document)
 }
 
 fn style(document: &Value) -> Result<&Map<String, Value>> {
-    document
+    Ok(document
         .get("themes")
         .and_then(Value::as_array)
         .and_then(|themes| (themes.len() == 1).then(|| &themes[0]))
         .and_then(|theme| theme.get("style"))
         .and_then(Value::as_object)
-        .ok_or_else(|| {
-            Error("theme document must contain exactly one theme with a style object".into())
-        })
+        .expect("generated theme document must contain exactly one theme with a style object"))
 }
 
 fn style_color<'a>(style: &'a Map<String, Value>, name: &str) -> Result<&'a str> {
-    style
+    Ok(style
         .get(name)
         .and_then(Value::as_str)
-        .ok_or_else(|| Error(format!("theme role {name} is not a color string")))
+        .unwrap_or_else(|| panic!("generated theme role {name} must be a color string")))
 }
 
 struct ValidationContexts<'a> {
@@ -2018,7 +2140,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     let style = style(document)?;
     let appearance = document["themes"][0]["appearance"]
         .as_str()
-        .ok_or_else(|| Error("theme appearance is not a string".into()))?;
+        .expect("generated theme appearance must be a string");
     let fixed_expected: BTreeSet<String> = FOUNDATION_FIELDS
         .iter()
         .chain(CHROME_FIELDS)
@@ -2245,7 +2367,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     let syntax = style
         .get("syntax")
         .and_then(Value::as_object)
-        .ok_or_else(|| Error("style.syntax is not an object".into()))?;
+        .expect("generated style.syntax must be an object");
     let expected_syntax: BTreeSet<_> = crate::syntax::policy::CAPTURE_POLICIES
         .iter()
         .map(|policy| policy.capture)
@@ -2263,10 +2385,10 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         let value = spec
             .get("color")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error(format!("syntax role {name} has no color")))?;
+            .unwrap_or_else(|| panic!("generated syntax role {name} must have a color"));
         let normal_actual = minimum_contrast(value, &syntax_normal_contexts)?;
         let normal_target = contrast_floor(name)
-            .ok_or_else(|| Error(format!("syntax role {name} has no capture policy")))?
+            .unwrap_or_else(|| panic!("generated syntax role {name} must have a capture policy"))
             - 0.02;
         if normal_actual < normal_target - 1e-9 {
             errors.push(format!(
@@ -2275,7 +2397,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         }
         let overlay_actual = minimum_contrast(value, syntax_contexts)?;
         let overlay_target = overlay_contrast_floor(name)
-            .ok_or_else(|| Error(format!("syntax role {name} has no overlay policy")))?
+            .unwrap_or_else(|| panic!("generated syntax role {name} must have an overlay policy"))
             - 0.02;
         if overlay_actual < overlay_target - 1e-9 {
             errors.push(format!(
@@ -2288,7 +2410,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             .get("primary")
             .and_then(|spec| spec.get("color"))
             .and_then(Value::as_str)
-            .ok_or_else(|| Error("syntax.primary has no color".into()))?,
+            .expect("generated syntax.primary must have a color"),
         editor_foreground,
         &syntax_normal_contexts,
     )?;
@@ -2297,7 +2419,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             .get("comment")
             .and_then(|spec| spec.get("color"))
             .and_then(Value::as_str)
-            .ok_or_else(|| Error("syntax.comment has no color".into()))?,
+            .expect("generated syntax.comment must have a color"),
         editor_foreground,
         &syntax_normal_contexts,
     )?;
@@ -2307,11 +2429,11 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         ));
     }
     let syntax_color = |name: &str| -> Result<&str> {
-        syntax
+        Ok(syntax
             .get(name)
             .and_then(|spec| spec.get("color"))
             .and_then(Value::as_str)
-            .ok_or_else(|| Error(format!("syntax role {name} has no color")))
+            .unwrap_or_else(|| panic!("generated syntax role {name} must have a color")))
     };
     for (name, expected) in [
         ("primary", editor_foreground),
@@ -2758,28 +2880,6 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
 
     // Diff roles are paint layers. Validate the pixels Zed renders rather than the
     // uncomposited RGBA source channels.
-    let added_solid = render_on_bases(
-        editor_bases,
-        &[style_color(style, "editor.diff_hunk.added.background")?],
-    )?;
-    let deleted_solid = render_on_bases(
-        editor_bases,
-        &[style_color(style, "editor.diff_hunk.deleted.background")?],
-    )?;
-    let added_hollow = render_on_bases(
-        editor_bases,
-        &[style_color(
-            style,
-            "editor.diff_hunk.added.hollow_background",
-        )?],
-    )?;
-    let deleted_hollow = render_on_bases(
-        editor_bases,
-        &[style_color(
-            style,
-            "editor.diff_hunk.deleted.hollow_background",
-        )?],
-    )?;
     let conflict_ours = render_on_bases(
         editor_bases,
         &[style_color(style, "version_control.conflict_marker.ours")?],
@@ -2835,17 +2935,58 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
                 "{family} diff layers do not follow the tuned light/dark opacity profile"
             ));
         }
+        let word_chroma = oklab_to_oklch(lab(&word_value.opaque_hex())?)[1];
+        if word_chroma < DIFF_OVERLAY_MINIMUM_CHROMA - 1e-9 {
+            errors.push(format!(
+                "{family} word diff pigment has only {word_chroma:.3} chroma"
+            ));
+        }
     }
 
-    for rendered in [
-        &added_solid,
-        &deleted_solid,
-        &added_hollow,
-        &deleted_hollow,
-        &conflict_ours,
-        &conflict_theirs,
-    ] {
-        minimum_pairwise(editor_bases, rendered, contrast_ratio)?;
+    let emitted_diff = DiffLayers {
+        added_line: style_color(style, "editor.diff_hunk.added.background")?.to_owned(),
+        deleted_line: style_color(style, "editor.diff_hunk.deleted.background")?.to_owned(),
+        added_hollow: style_color(style, "editor.diff_hunk.added.hollow_background")?.to_owned(),
+        deleted_hollow: style_color(style, "editor.diff_hunk.deleted.hollow_background")?
+            .to_owned(),
+        added_border: style_color(style, "editor.diff_hunk.added.hollow_border")?.to_owned(),
+        deleted_border: style_color(style, "editor.diff_hunk.deleted.hollow_border")?.to_owned(),
+    };
+    errors.extend(
+        emitted_diff
+            .rendered_semantic_errors(editor_bases, editor_foreground, presentation)?
+            .into_iter()
+            .map(|error| format!("editor diff {error}")),
+    );
+
+    let conflict_ours_visibility = minimum_pairwise(editor_bases, &conflict_ours, contrast_ratio)?;
+    let conflict_theirs_visibility =
+        minimum_pairwise(editor_bases, &conflict_theirs, contrast_ratio)?;
+    let conflict_contrast = minimum_pairwise(&conflict_ours, &conflict_theirs, contrast_ratio)?;
+    let conflict_delta = minimum_pairwise(&conflict_ours, &conflict_theirs, delta_e)?;
+    let conflict_cvd = minimum_pairwise(&conflict_ours, &conflict_theirs, cvd_distance)?;
+    let conflict_lightness = conflict_ours.iter().zip(&conflict_theirs).try_fold(
+        f64::INFINITY,
+        |minimum, (ours, theirs)| {
+            Ok::<_, Error>(minimum.min((lightness(ours)? - lightness(theirs)?).abs()))
+        },
+    )?;
+    let conflict_constraints = PairConstraints::new(CONFLICT_FILL_CONTRAST, 1.01, 0.030, 0.030)
+        .with_separation_alternative(Some((1.12, 0.075, 0.035)))
+        .prefer_background();
+    if conflict_ours_visibility < CONFLICT_FILL_CONTRAST - 1e-9
+        || conflict_theirs_visibility < CONFLICT_FILL_CONTRAST - 1e-9
+        || !pair_constraints_satisfied(
+            conflict_contrast,
+            conflict_delta,
+            conflict_cvd,
+            conflict_lightness,
+            conflict_constraints,
+        )
+    {
+        errors.push(format!(
+            "conflict markers violate their rendered contract: ours {conflict_ours_visibility:.3}:1, theirs {conflict_theirs_visibility:.3}:1, pair contrast {conflict_contrast:.3}, delta E {conflict_delta:.3}, CVD {conflict_cvd:.3}"
+        ));
     }
     let added = style_color(style, "version_control.added")?;
     let deleted = style_color(style, "version_control.deleted")?;
@@ -2853,10 +2994,13 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     let pair_lightness = (lightness(added)? - lightness(deleted)?).abs();
     let pair_cvd = crate::search::cvd_distance(added, deleted)?;
     let pair_contrast = contrast_ratio(added, deleted)?;
-    if pair_delta < SEMANTIC_PAIR_CONTRACT.normal_delta_e - 1e-9
-        || pair_cvd < SEMANTIC_PAIR_CONTRACT.cvd_delta_e - 1e-9
-        || pair_contrast < SEMANTIC_PAIR_CONTRACT.contrast - 1e-9
-    {
+    if !pair_constraints_satisfied(
+        pair_contrast,
+        pair_delta,
+        pair_cvd,
+        pair_lightness,
+        PairConstraints::from_contract(1.0, SEMANTIC_PAIR_CONTRACT),
+    ) {
         errors.push(format!("diff added/deleted pair is ambiguous: contrast {pair_contrast:.3}, delta E {pair_delta:.3}, delta L {pair_lightness:.3}, CVD {pair_cvd:.3}"));
     }
     let status_surface = style_color(style, "surface.background")?;
@@ -2923,6 +3067,24 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         }
     }
 
+    let status_created = style_color(style, "created")?;
+    let status_deleted = style_color(style, "deleted")?;
+    let status_pair_contrast = contrast_ratio(status_created, status_deleted)?;
+    let status_pair_delta = delta_e(status_created, status_deleted)?;
+    let status_pair_cvd = cvd_distance(status_created, status_deleted)?;
+    let status_pair_lightness = (lightness(status_created)? - lightness(status_deleted)?).abs();
+    if !pair_constraints_satisfied(
+        status_pair_contrast,
+        status_pair_delta,
+        status_pair_cvd,
+        status_pair_lightness,
+        PairConstraints::from_contract(1.0, SEMANTIC_PAIR_CONTRACT),
+    ) {
+        errors.push(format!(
+            "created/deleted status foregrounds are ambiguous: contrast {status_pair_contrast:.3}, delta E {status_pair_delta:.3}, CVD {status_pair_cvd:.3}"
+        ));
+    }
+
     let status_bar = style_color(style, "status_bar.background")?;
     for name in [
         "normal",
@@ -2956,7 +3118,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     let players = style
         .get("players")
         .and_then(Value::as_array)
-        .ok_or_else(|| Error("players is not an array".into()))?;
+        .expect("generated players must be an array");
     if players.len() != 8 {
         errors.push(format!("expected 8 players, got {}", players.len()));
     }
@@ -2964,23 +3126,20 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     for (index, player) in players.iter().enumerate() {
         let player = player
             .as_object()
-            .ok_or_else(|| Error(format!("players[{index}] is not an object")))?;
+            .unwrap_or_else(|| panic!("generated players[{index}] must be an object"));
         let read = |role| {
             player
                 .get(role)
                 .and_then(Value::as_str)
-                .ok_or_else(|| Error(format!("players[{index}].{role} is not a color")))
+                .unwrap_or_else(|| panic!("generated players[{index}].{role} must be a color"))
         };
-        player_values.push((read("cursor")?, read("background")?, read("selection")?));
+        player_values.push((read("cursor"), read("background"), read("selection")));
     }
     let mut cursor_backgrounds = editor_text_backgrounds.to_vec();
     let mut prior_selections: Vec<Vec<String>> = Vec::new();
-    let shared_selection_mode = player_values
-        .first()
-        .is_some_and(|first| player_values.iter().all(|value| value.2 == first.2));
     let mut raw_selections = BTreeSet::new();
     for (index, (_, _, selection)) in player_values.iter().enumerate() {
-        if !raw_selections.insert(*selection) && !shared_selection_mode {
+        if !raw_selections.insert(*selection) {
             errors.push(format!(
                 "players[{index}].selection duplicates another player"
             ));
@@ -3038,9 +3197,6 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             cursor_backgrounds.extend([rendered, unfocused]);
         }
         for (prior_index, prior) in prior_selections.iter().enumerate() {
-            if shared_selection_mode {
-                continue;
-            }
             for (position, (current, prior)) in rendered_selection.iter().zip(prior).enumerate() {
                 if position % 2 == 1 {
                     continue;
@@ -3064,26 +3220,72 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             ));
         }
         let mermaid_contrast = contrast_ratio(cursor, background)?;
-        if mermaid_contrast < TEXT_CONTRAST - 1e-9 {
+        let mermaid_distance = delta_e(cursor, background)?;
+        if mermaid_contrast < TEXT_CONTRAST - 1e-9
+            || mermaid_distance < STATE_CONSECUTIVE_DELTA_E - 1e-9
+        {
             errors.push(format!(
-                "players[{index}] Mermaid foreground/background is {mermaid_contrast:.3}:1"
+                "players[{index}] Mermaid foreground/background collapses: contrast {mermaid_contrast:.3}:1, delta E {mermaid_distance:.3}"
             ));
+        }
+        let canvas_contrast = contrast_ratio(background, editor_base)?;
+        let canvas_distance = delta_e(background, editor_base)?;
+        if canvas_contrast < STATE_HOVER_CONTRAST - 1e-9
+            || canvas_distance < STATE_HOVER_DELTA_E - 1e-9
+        {
+            errors.push(format!(
+                "players[{index}].background collapses into canvas: contrast {canvas_contrast:.3}:1, delta E {canvas_distance:.3}"
+            ));
+        }
+    }
+
+    for first in 0..player_values.len() {
+        for second in (first + 1)..player_values.len() {
+            let normal = delta_e(player_values[first].0, player_values[second].0)?;
+            let cvd = cvd_distance(player_values[first].0, player_values[second].0)?;
+            if normal < PLAYER_CURSOR_NORMAL_DELTA_E - 1e-9
+                || cvd < PLAYER_CURSOR_CVD_DELTA_E - 1e-9
+            {
+                errors.push(format!(
+                    "player cursors {first} and {second} are ambiguous: delta E {normal:.3}, CVD {cvd:.3}"
+                ));
+            }
         }
     }
 
     let accents = style
         .get("accents")
         .and_then(Value::as_array)
-        .ok_or_else(|| Error("accents is not an array".into()))?;
+        .expect("generated accents must be an array");
     if accents.len() != 12 {
         errors.push(format!("expected 12 accents, got {}", accents.len()));
     }
+    let accent_values = accents
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("generated accents[{index}] must be a color"))
+        })
+        .collect::<Vec<_>>();
+    for first in 0..accent_values.len() {
+        for second in (first + 1)..accent_values.len() {
+            let normal = delta_e(accent_values[first], accent_values[second])?;
+            let cvd = cvd_distance(accent_values[first], accent_values[second])?;
+            if normal < ACCENT_NORMAL_DELTA_E - 1e-9 || cvd < ACCENT_CVD_DELTA_E - 1e-9 {
+                errors.push(format!(
+                    "accents {first} and {second} are ambiguous: delta E {normal:.3}, CVD {cvd:.3}"
+                ));
+            }
+        }
+    }
 
     if !errors.is_empty() {
-        return Err(Error(format!(
-            "theme validation failed:\n  - {}",
+        panic!(
+            "generated theme violated internal invariants:\n  - {}",
             errors.join("\n  - ")
-        )));
+        );
     }
 
     Ok(())
@@ -3094,10 +3296,11 @@ mod tests {
     use super::*;
 
     #[test]
+    #[should_panic(expected = "theme role text was generated twice")]
     fn style_builder_rejects_duplicate_roles() {
         let mut style = StyleBuilder::default();
         style.insert_opaque("text", "#112233".into()).unwrap();
-        assert!(style.insert_opaque("text", "#445566".into()).is_err());
+        let _ = style.insert_opaque("text", "#445566".into());
     }
 
     #[test]
