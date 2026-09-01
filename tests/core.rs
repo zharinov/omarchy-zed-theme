@@ -160,6 +160,72 @@ fn malformed_resolved_palettes_are_rejected() {
 }
 
 #[test]
+fn syntax_inputs_must_be_opaque_colors() {
+    let palette = synthetic_palette();
+    let invalid = |ordinary: Vec<String>,
+                   rendered: Vec<String>,
+                   saliency_reference: &str,
+                   predictive: &str,
+                   diff_sources: [&str; 3]| {
+        build_syntax(
+            &mut Search::default(),
+            &palette,
+            SyntaxContexts {
+                ordinary: &ordinary,
+                rendered: &rendered,
+            },
+            saliency_reference,
+            predictive,
+            diff_sources,
+        )
+        .unwrap_err()
+    };
+    let opaque_context = || vec!["#101010".to_owned()];
+    let opaque_diff = ["#00aa00", "#aaaa00", "#aa0000"];
+
+    for error in [
+        invalid(
+            opaque_context(),
+            opaque_context(),
+            "#ffffff80",
+            "#ffffff",
+            opaque_diff,
+        ),
+        invalid(
+            opaque_context(),
+            opaque_context(),
+            "#ffffff",
+            "#ffffff80",
+            opaque_diff,
+        ),
+        invalid(
+            opaque_context(),
+            opaque_context(),
+            "#ffffff",
+            "#ffffff",
+            ["#00aa0080", "#aaaa00", "#aa0000"],
+        ),
+        invalid(
+            vec!["#10101080".to_owned()],
+            opaque_context(),
+            "#ffffff",
+            "#ffffff",
+            opaque_diff,
+        ),
+        invalid(
+            opaque_context(),
+            vec!["#10101080".to_owned()],
+            "#ffffff",
+            "#ffffff",
+            opaque_diff,
+        ),
+    ] {
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("six-digit hex color"));
+    }
+}
+
+#[test]
 fn missing_palette_file_is_an_external_failure() {
     let missing = temporary("missing-palette");
     let error = resolve_palette(&missing, None).unwrap_err();

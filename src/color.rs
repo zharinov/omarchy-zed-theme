@@ -162,18 +162,6 @@ pub struct Rgba {
 }
 
 impl Rgba {
-    pub fn red(self) -> f64 {
-        self.r
-    }
-
-    pub fn green(self) -> f64 {
-        self.g
-    }
-
-    pub fn blue(self) -> f64 {
-        self.b
-    }
-
     pub fn alpha(self) -> f64 {
         self.a
     }
@@ -193,15 +181,6 @@ impl Rgba {
             opaque
         } else {
             format!("{opaque}{:02x}", byte(self.a))
-        }
-    }
-
-    pub fn quantized(self) -> Self {
-        Self {
-            r: f64::from(byte(self.r)) / 255.0,
-            g: f64::from(byte(self.g)) / 255.0,
-            b: f64::from(byte(self.b)) / 255.0,
-            a: f64::from(byte(self.a)) / 255.0,
         }
     }
 }
@@ -382,15 +361,20 @@ pub fn parse_hex(value: &str) -> Result<Rgba> {
     })
 }
 
-pub fn normalize_hex(value: &str, key: &str) -> Result<String> {
+pub(crate) fn validate_opaque_hex(value: &str, label: impl std::fmt::Display) -> Result<()> {
     if value.len() != 7
         || !value.starts_with('#')
         || !value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(Error::invalid(format!(
-            "resolved palette key {key:?} must be a six-digit hex color, got {value:?}"
+            "{label} must be a six-digit hex color, got {value:?}"
         )));
     }
+    Ok(())
+}
+
+pub fn normalize_hex(value: &str, key: &str) -> Result<String> {
+    validate_opaque_hex(value, format_args!("resolved palette key {key:?}"))?;
     Ok(value.to_ascii_lowercase())
 }
 
@@ -722,17 +706,6 @@ pub fn apply_opacity(value: &str, factor: f64) -> Result<String> {
     .hex())
 }
 
-pub fn composite(value: &str, base: &str, alpha: f64) -> Result<String> {
-    finite_unit_interval("alpha", alpha)?;
-    if parse_hex(base)?.a < 1.0 {
-        return Err(Error::invalid(
-            "explicit compositing requires an opaque base",
-        ));
-    }
-
-    gpui_blend(base, &with_alpha(value, alpha)?).map(Rgba::opaque_hex)
-}
-
 pub fn tone(value: &str, target_lightness: f64, chroma_scale: f64) -> Result<String> {
     finite_unit_interval("target lightness", target_lightness)?;
     if !chroma_scale.is_finite() || chroma_scale < 0.0 {
@@ -788,7 +761,6 @@ mod tests {
             with_alpha("#112233", f64::NAN).unwrap_err(),
             with_alpha("#112233", 1.1).unwrap_err(),
             apply_opacity("#112233", -0.1).unwrap_err(),
-            composite("#112233", "#000000", f64::INFINITY).unwrap_err(),
             tone("#112233", 0.5, f64::NAN).unwrap_err(),
             gamut_map_oklch(f64::NAN, 0.1, 0.0).unwrap_err(),
             gamut_map_oklch(0.5, -0.1, 0.0).unwrap_err(),

@@ -319,6 +319,11 @@ impl StatusTokens {
             (&["deleted", "error"][..], &self.negative),
             (&["conflict", "modified", "warning"][..], &self.warning),
             (&["info", "renamed"][..], &self.informational),
+            (&["predictive"][..], &self.predictive),
+            (&["hint"][..], &self.hint),
+            (&["hidden"][..], &self.hidden),
+            (&["ignored"][..], &self.ignored),
+            (&["unreachable"][..], &self.unreachable),
         ] {
             for name in names {
                 roles.extend([
@@ -327,20 +332,6 @@ impl StatusTokens {
                     RoleColor::opaque(format!("{name}.border"), &channel.border),
                 ]);
             }
-        }
-
-        for (name, channel) in [
-            ("predictive", &self.predictive),
-            ("hint", &self.hint),
-            ("hidden", &self.hidden),
-            ("ignored", &self.ignored),
-            ("unreachable", &self.unreachable),
-        ] {
-            roles.extend([
-                RoleColor::opaque(name, &channel.foreground),
-                RoleColor::opaque(format!("{name}.background"), &channel.background),
-                RoleColor::opaque(format!("{name}.border"), &channel.border),
-            ]);
         }
 
         roles

@@ -162,11 +162,6 @@ impl PairConstraints {
         }
     }
 
-    pub const fn with_foreground_contrast(mut self, foreground_contrast: f64) -> Self {
-        self.foreground_contrast = foreground_contrast;
-        self
-    }
-
     pub const fn with_minimum_chroma(mut self, minimum_chroma: f64) -> Self {
         self.minimum_chroma = minimum_chroma;
         self
@@ -237,11 +232,6 @@ impl<'a> OverlayFitRequest<'a> {
             runtime_rendered_references: &[],
             prefer_source_fidelity: false,
         }
-    }
-
-    pub const fn with_target(mut self, target: f64) -> Self {
-        self.target = target;
-        self
     }
 
     pub const fn with_runtime_state(mut self, runtime_state: (f64, f64, f64)) -> Self {
@@ -391,11 +381,6 @@ fn finite_in_range(name: &str, value: f64, minimum: f64, maximum: f64) -> Result
 
 fn valid_contrast(name: &str, value: f64) -> Result<()> {
     finite_in_range(name, value, 1.0, 21.0)
-}
-
-pub struct OverlayPairFallback {
-    pub colors: [String; 2],
-    pub strong_error: Option<String>,
 }
 
 type FillRank = [f64; 5];
@@ -1786,68 +1771,6 @@ impl Search {
         )
     }
 
-    pub fn fit_overlay_pair_with_fallback(
-        &mut self,
-        first_seed: &str,
-        second_seed: &str,
-        request: OverlayPairRequest<'_>,
-        fallback_constraints: PairConstraints,
-        fallback_frontier_limit: usize,
-    ) -> Result<OverlayPairFallback> {
-        request.validate()?;
-        fallback_constraints.validate()?;
-        if fallback_frontier_limit < 128 {
-            return Err(Error::invalid(
-                "fallback overlay frontier limit must be at least 128",
-            ));
-        }
-        let prepared = self.prepare_overlay_pair(
-            first_seed,
-            second_seed,
-            request.first,
-            request.second,
-            request.minimum_alpha,
-            request.maximum_alpha,
-        )?;
-        match Self::solve_overlay_pair(
-            &prepared,
-            first_seed,
-            second_seed,
-            request.constraints,
-            request.frontier_limit,
-        ) {
-            Ok(colors) => Ok(OverlayPairFallback {
-                colors,
-                strong_error: None,
-            }),
-            Err(strong_error) if strong_error.is_infeasible() => {
-                let colors = Self::solve_overlay_pair(
-                    &prepared,
-                    first_seed,
-                    second_seed,
-                    fallback_constraints,
-                    fallback_frontier_limit,
-                )
-                .map_err(|fallback_error| {
-                    if fallback_error.is_infeasible() {
-                        Error::infeasible(format!(
-                            "strong overlay contract failed ({strong_error}); fallback overlay contract failed ({fallback_error})"
-                        ))
-                    } else {
-                        fallback_error.context(format!(
-                            "fallback overlay search after strong contract failed ({strong_error})"
-                        ))
-                    }
-                })?;
-                Ok(OverlayPairFallback {
-                    colors,
-                    strong_error: Some(strong_error.to_string()),
-                })
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     pub fn fit_state(
         &mut self,
         seed: &str,
@@ -2802,36 +2725,5 @@ mod tests {
             assert!(delta_e(&left, &right).unwrap() >= 0.030 - 1e-9);
             assert!(cvd_distance(&left, &right).unwrap() >= 0.020 - 1e-9);
         }
-    }
-
-    #[test]
-    fn overlay_pair_fallback_reuses_candidates_without_changing_the_weak_result() {
-        let backgrounds = vec!["#16181d".to_owned(), "#242730".to_owned()];
-        let constraints = PairConstraints::new(1.10, 1.01, 0.030, 0.020).prefer_background();
-        let request = |constraints| {
-            OverlayPairRequest::new(
-                OverlayFitRequest::new(&backgrounds, 1.10, 0.025),
-                OverlayFitRequest::new(&backgrounds, 1.10, 0.025),
-                constraints,
-            )
-            .with_limits(198, 128)
-        };
-        let impossible = constraints.with_cvd_delta(1.0);
-        let mut search = Search::default();
-        let fallback = search
-            .fit_overlay_pair_with_fallback(
-                "#4fa66b",
-                "#d75b68",
-                request(impossible),
-                constraints,
-                512,
-            )
-            .unwrap();
-        let direct = search
-            .fit_overlay_pair("#4fa66b", "#d75b68", request(constraints))
-            .unwrap();
-
-        assert!(fallback.strong_error.is_some());
-        assert_eq!(fallback.colors, direct);
     }
 }

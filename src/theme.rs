@@ -89,11 +89,14 @@ fn fit_highlight_with_alpha_fallback(
         };
     search
         .fit_readable_overlay_bounded(seed, request, OVERLAY_MAX_ALPHA)
-        .map_err(|fallback_error| match fallback_error.is_infeasible() {
-            true => Error::infeasible(format!(
-                "{role}: preferred alpha cap failed: {preferred_cap_error}; relaxed alpha cap failed: {fallback_error}"
-            )),
-            false => fallback_error.context(role),
+        .map_err(|fallback_error| {
+            if fallback_error.is_infeasible() {
+                Error::infeasible(format!(
+                    "{role}: preferred alpha cap failed: {preferred_cap_error}; relaxed alpha cap failed: {fallback_error}"
+                ))
+            } else {
+                fallback_error.context(role)
+            }
         })
 }
 
@@ -101,12 +104,11 @@ fn fit_highlight_with_alpha_fallback(
 struct StyleBuilder(BTreeMap<String, String>);
 
 impl StyleBuilder {
-    fn insert(&mut self, role: RoleColor) -> Result<()> {
+    fn insert(&mut self, role: RoleColor) {
         let (name, value) = role.into_parts();
         match self.0.entry(name) {
             Entry::Vacant(entry) => {
                 entry.insert(value);
-                Ok(())
             }
             Entry::Occupied(entry) => {
                 panic!("theme role {} was generated twice", entry.key())
@@ -115,18 +117,19 @@ impl StyleBuilder {
     }
 
     fn insert_opaque(&mut self, role: impl Into<String>, color: String) -> Result<()> {
-        self.insert(RoleColor::opaque_value(role, color)?)
+        self.insert(RoleColor::opaque_value(role, color)?);
+        Ok(())
     }
 
     fn insert_overlay(&mut self, role: impl Into<String>, color: String) -> Result<()> {
-        self.insert(RoleColor::overlay_value(role, color)?)
+        self.insert(RoleColor::overlay_value(role, color)?);
+        Ok(())
     }
 
-    fn extend(&mut self, roles: impl IntoIterator<Item = RoleColor>) -> Result<()> {
+    fn extend(&mut self, roles: impl IntoIterator<Item = RoleColor>) {
         for role in roles {
-            self.insert(role)?;
+            self.insert(role);
         }
-        Ok(())
     }
 
     fn extend_opaque(&mut self, roles: impl IntoIterator<Item = (String, String)>) -> Result<()> {
@@ -136,14 +139,13 @@ impl StyleBuilder {
         Ok(())
     }
 
-    fn append_to(self, style: &mut Map<String, Value>) -> Result<()> {
+    fn append_to(self, style: &mut Map<String, Value>) {
         for (role, color) in self.0 {
             if style.contains_key(&role) {
                 panic!("theme role {role} was generated twice");
             }
             style.insert(role, color.into());
         }
-        Ok(())
     }
 }
 
@@ -218,11 +220,10 @@ fn derive_surfaces(palette: &ResolvedPalette) -> Result<BTreeMap<String, String>
 
         eligible.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(right.1)));
 
-        let output = if let Some((_, key, value, value_lightness)) = eligible.first() {
-            let _ = (key, value_lightness);
+        let output = if let Some((_, _, value, _)) = eligible.first() {
             (*value).to_owned()
         } else {
-            let (key, source, source_lightness) = authored
+            let (_, source, _) = authored
                 .iter()
                 .min_by(|left, right| {
                     (left.2 - target)
@@ -235,7 +236,6 @@ fn derive_surfaces(palette: &ResolvedPalette) -> Result<BTreeMap<String, String>
             if lightness(&output)? <= previous + 1e-6 {
                 output = tone(source, (previous + 0.004).min(1.0), 1.0)?;
             }
-            let _ = (key, source_lightness);
             output
         };
 
@@ -1222,11 +1222,14 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
                     )
                     .with_limits(PREFERRED_HIGHLIGHT_MAX_ALPHA, 512),
                 )
-                .map_err(|joint_error| match joint_error.is_infeasible() {
-                    true => Error::infeasible(format!(
-                        "search highlights failed sequentially ({sequential_error}) and jointly ({joint_error})"
-                    )),
-                    false => joint_error.context("joint search highlights"),
+                .map_err(|joint_error| {
+                    if joint_error.is_infeasible() {
+                        Error::infeasible(format!(
+                            "search highlights failed sequentially ({sequential_error}) and jointly ({joint_error})"
+                        ))
+                    } else {
+                        joint_error.context("joint search highlights")
+                    }
                 })?;
             (joint_search_match, joint_search_active)
         }
@@ -2072,14 +2075,14 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     fixed.insert_overlay("vim.yank.background", vim_yank)?;
 
     fixed.extend_opaque(vim)?;
-    fixed.extend(theme_tokens.zed_roles())?;
+    fixed.extend(theme_tokens.zed_roles());
     let mut status_roles = StyleBuilder::default();
-    status_roles.extend(theme_tokens.statuses.zed_roles())?;
+    status_roles.extend(theme_tokens.statuses.zed_roles());
 
     let mut style = Map::new();
     style.insert("background.appearance".into(), "opaque".into());
-    status_roles.append_to(&mut style)?;
-    fixed.append_to(&mut style)?;
+    status_roles.append_to(&mut style);
+    fixed.append_to(&mut style);
 
     style.insert(
         "accents".into(),
@@ -2135,21 +2138,21 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     Ok(document)
 }
 
-fn style(document: &Value) -> Result<&Map<String, Value>> {
-    Ok(document
+fn style(document: &Value) -> &Map<String, Value> {
+    document
         .get("themes")
         .and_then(Value::as_array)
         .and_then(|themes| (themes.len() == 1).then(|| &themes[0]))
         .and_then(|theme| theme.get("style"))
         .and_then(Value::as_object)
-        .expect("generated theme document must contain exactly one theme with a style object"))
+        .expect("generated theme document must contain exactly one theme with a style object")
 }
 
-fn style_color<'a>(style: &'a Map<String, Value>, name: &str) -> Result<&'a str> {
-    Ok(style
+fn style_color<'a>(style: &'a Map<String, Value>, name: &str) -> &'a str {
+    style
         .get(name)
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("generated theme role {name} must be a color string")))
+        .unwrap_or_else(|| panic!("generated theme role {name} must be a color string"))
 }
 
 struct ValidationContexts<'a> {
@@ -2172,7 +2175,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         editor_text_backgrounds,
         terminal_backgrounds,
     } = contexts;
-    let style = style(document)?;
+    let style = style(document);
     let appearance = document["themes"][0]["appearance"]
         .as_str()
         .expect("generated theme appearance must be a string");
@@ -2241,9 +2244,9 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             "title_bar.inactive_background",
         ],
     ] {
-        let expected = style_color(style, group[0])?;
+        let expected = style_color(style, group[0]);
         for name in &group[1..] {
-            if style_color(style, name)? != expected {
+            if style_color(style, name) != expected {
                 errors.push(format!("{name} does not share the {} token", group[0]));
             }
         }
@@ -2253,7 +2256,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         "ghost_element.background",
         "scrollbar.track.background",
     ] {
-        if style_color(style, name)? != "#00000000" {
+        if style_color(style, name) != "#00000000" {
             errors.push(format!("{name} is not canonical transparent black"));
         }
     }
@@ -2264,27 +2267,27 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         ("info", &["renamed"]),
     ] {
         for suffix in ["", ".background", ".border"] {
-            let expected = style_color(style, &format!("{source}{suffix}"))?;
+            let expected = style_color(style, &format!("{source}{suffix}"));
             for alias in aliases {
                 let name = format!("{alias}{suffix}");
-                if style_color(style, &name)? != expected {
+                if style_color(style, &name) != expected {
                     errors.push(format!("{name} does not share the {source}{suffix} token"));
                 }
             }
         }
     }
-    let structural_rgb = parse_hex(style_color(style, "border")?)?.opaque_hex();
+    let structural_rgb = parse_hex(style_color(style, "border"))?.opaque_hex();
     for name in ["editor.wrap_guide", "editor.active_wrap_guide"] {
-        if parse_hex(style_color(style, name)?)?.opaque_hex() != structural_rgb {
+        if parse_hex(style_color(style, name))?.opaque_hex() != structural_rgb {
             errors.push(format!("{name} does not preserve the structural RGB"));
         }
     }
-    let editor_canvas = style_color(style, "editor.background")?;
+    let editor_canvas = style_color(style, "editor.background");
     let rendered_wrap =
-        gpui_blend(editor_canvas, style_color(style, "editor.wrap_guide")?)?.opaque_hex();
+        gpui_blend(editor_canvas, style_color(style, "editor.wrap_guide"))?.opaque_hex();
     let rendered_active_wrap = gpui_blend(
         editor_canvas,
-        style_color(style, "editor.active_wrap_guide")?,
+        style_color(style, "editor.active_wrap_guide"),
     )?
     .opaque_hex();
     if contrast_ratio(&rendered_active_wrap, editor_canvas)?
@@ -2343,20 +2346,20 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         (&semantic_text_fields[..], interaction_bases),
     ] {
         for name in names {
-            let value = style_color(style, name)?;
+            let value = style_color(style, name);
             let actual = minimum_contrast(value, backgrounds)?;
             if actual < HARD_TEXT_CONTRAST - 1e-9 {
                 errors.push(format!("{name} reaches only {actual:.3}:1"));
             }
         }
     }
-    let editor_foreground = style_color(style, "editor.foreground")?;
+    let editor_foreground = style_color(style, "editor.foreground");
     for (name, floor) in [
         ("editor.line_number", HARD_PASSIVE_CONTRAST),
         ("editor.hover_line_number", HARD_CONTROL_CONTRAST),
         ("editor.active_line_number", HARD_TEXT_CONTRAST),
     ] {
-        let actual = minimum_contrast(style_color(style, name)?, editor_bases)?;
+        let actual = minimum_contrast(style_color(style, name), editor_bases)?;
         if actual < floor - 1e-9 {
             errors.push(format!(
                 "{name} reaches only {actual:.3}:1; floor is {floor:.2}:1"
@@ -2364,17 +2367,17 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         }
     }
     let inactive_saliency = crate::saliency::relative_saliency(
-        style_color(style, "editor.line_number")?,
+        style_color(style, "editor.line_number"),
         editor_foreground,
         editor_bases,
     )?;
     let hover_saliency = crate::saliency::relative_saliency(
-        style_color(style, "editor.hover_line_number")?,
+        style_color(style, "editor.hover_line_number"),
         editor_foreground,
         editor_bases,
     )?;
     let active_saliency = crate::saliency::relative_saliency(
-        style_color(style, "editor.active_line_number")?,
+        style_color(style, "editor.active_line_number"),
         editor_foreground,
         editor_bases,
     )?;
@@ -2415,7 +2418,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             actual_syntax.len()
         ));
     }
-    let syntax_normal_contexts = [style_color(style, "editor.background")?.to_owned()];
+    let syntax_normal_contexts = [style_color(style, "editor.background").to_owned()];
     for (name, spec) in syntax {
         let value = spec
             .get("color")
@@ -2463,26 +2466,26 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             "subdued syntax does not remain below primary saliency: subdued {syntax_subdued_saliency:.3}, primary {syntax_primary_saliency:.3}"
         ));
     }
-    let syntax_color = |name: &str| -> Result<&str> {
-        Ok(syntax
+    let syntax_color = |name: &str| {
+        syntax
             .get(name)
             .and_then(|spec| spec.get("color"))
             .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("generated syntax role {name} must have a color")))
+            .unwrap_or_else(|| panic!("generated syntax role {name} must have a color"))
     };
     for (name, expected) in [
         ("primary", editor_foreground),
         ("variable", editor_foreground),
-        ("predictive", style_color(style, "predictive")?),
+        ("predictive", style_color(style, "predictive")),
     ] {
-        if syntax_color(name)? != expected {
+        if syntax_color(name) != expected {
             errors.push(format!(
                 "syntax.{name} does not share its semantic content token"
             ));
         }
     }
-    let syntax_added = syntax_color("diff.plus")?;
-    let syntax_deleted = syntax_color("diff.minus")?;
+    let syntax_added = syntax_color("diff.plus");
+    let syntax_deleted = syntax_color("diff.minus");
     let syntax_diff_contrast = contrast_ratio(syntax_added, syntax_deleted)?;
     let syntax_diff_delta = delta_e(syntax_added, syntax_deleted)?;
     let syntax_diff_cvd = crate::search::cvd_distance(syntax_added, syntax_deleted)?;
@@ -2500,7 +2503,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         .filter(|name| !matches!(*name, "terminal.background" | "terminal.ansi.background"))
         .collect();
     for name in terminal_names {
-        let actual = minimum_contrast(style_color(style, name)?, terminal_backgrounds)?;
+        let actual = minimum_contrast(style_color(style, name), terminal_backgrounds)?;
         if actual < HARD_TEXT_CONTRAST - 1e-9 {
             errors.push(format!("{name} reaches only {actual:.3}:1"));
         }
@@ -2580,8 +2583,8 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     ];
     for (foreground, background, target) in structural {
         let actual = contrast_ratio(
-            style_color(style, foreground)?,
-            style_color(style, background)?,
+            style_color(style, foreground),
+            style_color(style, background),
         )?;
         if actual < target - 1e-9 {
             errors.push(format!(
@@ -2590,13 +2593,13 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         }
     }
     let generic_scrollbar_border = gpui_blend(
-        style_color(style, "surface.background")?,
-        &apply_opacity(style_color(style, "border.variant")?, 0.6)?,
+        style_color(style, "surface.background"),
+        &apply_opacity(style_color(style, "border.variant"), 0.6)?,
     )?
     .opaque_hex();
     let generic_scrollbar_border_contrast = contrast_ratio(
         &generic_scrollbar_border,
-        style_color(style, "surface.background")?,
+        style_color(style, "surface.background"),
     )?;
     if generic_scrollbar_border_contrast < PASSIVE_CONTRAST - 1e-9 {
         errors.push(format!(
@@ -2685,8 +2688,8 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         ),
     ];
     for (foreground, background, target, target_delta) in states {
-        let foreground = style_color(style, foreground)?;
-        let background = style_color(style, background)?;
+        let foreground = style_color(style, foreground);
+        let background = style_color(style, background);
         let rendered = gpui_blend(background, foreground)?.opaque_hex();
         let ratio = contrast_ratio(&rendered, background)?;
         let distance = delta_e(&rendered, background)?;
@@ -2735,7 +2738,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             None,
         ),
     ] {
-        let value = style_color(style, name)?;
+        let value = style_color(style, name);
         for base in interaction_bases {
             let raw_rendered = gpui_blend(base, value)?.opaque_hex();
             let raw_ratio = contrast_ratio(&raw_rendered, base)?;
@@ -2757,8 +2760,8 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             }
         }
     }
-    let runtime_hover = apply_opacity(style_color(style, "element.hover")?, 0.6)?;
-    let runtime_active = apply_opacity(style_color(style, "element.active")?, 0.5)?;
+    let runtime_hover = apply_opacity(style_color(style, "element.hover"), 0.6)?;
+    let runtime_active = apply_opacity(style_color(style, "element.active"), 0.5)?;
     for base in interaction_bases {
         let hover = gpui_blend(base, &runtime_hover)?.opaque_hex();
         let active = gpui_blend(base, &runtime_active)?.opaque_hex();
@@ -2785,7 +2788,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         for base in interaction_bases {
             let mut previous_ratio = 1.0;
             for name in names {
-                let rendered = gpui_blend(base, style_color(style, name)?)?.opaque_hex();
+                let rendered = gpui_blend(base, style_color(style, name))?.opaque_hex();
                 let ratio = contrast_ratio(&rendered, base)?;
                 if ratio < previous_ratio + STATE_BASE_CONTRAST_STEP - 1e-9 {
                     errors.push(format!(
@@ -2800,14 +2803,14 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         ("element.active", "element.selected"),
         ("ghost_element.active", "ghost_element.selected"),
     ] {
-        if style_color(style, active)? != style_color(style, selected)? {
+        if style_color(style, active) != style_color(style, selected) {
             errors.push(format!(
                 "{active} and {selected} must share the engaged token"
             ));
         }
     }
-    let ui_selection = style_color(style, "element.selection_background")?;
-    let ui_text = style_color(style, "text")?;
+    let ui_selection = style_color(style, "element.selection_background");
+    let ui_text = style_color(style, "text");
     for base in interaction_bases {
         for (opacity, target, target_delta, label) in [
             (
@@ -2832,14 +2835,14 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             }
         }
     }
-    let editor_base = style_color(style, "editor.background")?;
+    let editor_base = style_color(style, "editor.background");
     let mut previous_editor_state: Option<(String, &str)> = None;
     for name in [
         "editor.active_line.background",
         "editor.highlighted_line.background",
         "editor.debugger_active_line.background",
     ] {
-        let rendered = gpui_blend(editor_base, style_color(style, name)?)?.opaque_hex();
+        let rendered = gpui_blend(editor_base, style_color(style, name))?.opaque_hex();
         if let Some((previous, previous_name)) = &previous_editor_state {
             let ratio = contrast_ratio(&rendered, previous)?;
             let distance = delta_e(&rendered, previous)?;
@@ -2877,11 +2880,11 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             true,
         ),
     ] {
-        let base = style_color(style, background)?;
+        let base = style_color(style, background);
         let mut previous_ratio = 1.0;
         let mut previous_color = base.to_owned();
         for name in names {
-            let value = gpui_blend(base, style_color(style, name)?)?.opaque_hex();
+            let value = gpui_blend(base, style_color(style, name))?.opaque_hex();
             let ratio = contrast_ratio(&value, base)?;
             let consecutive_ratio = contrast_ratio(&value, &previous_color)?;
             let consecutive_delta = delta_e(&value, &previous_color)?;
@@ -2904,8 +2907,8 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     }
     {
         let (first, second, family) = ("tab.inactive_background", "tab.active_background", "tab");
-        let contrast = contrast_ratio(style_color(style, first)?, style_color(style, second)?)?;
-        let distance = delta_e(style_color(style, first)?, style_color(style, second)?)?;
+        let contrast = contrast_ratio(style_color(style, first), style_color(style, second))?;
+        let distance = delta_e(style_color(style, first), style_color(style, second))?;
         if contrast < TAB_STATE_CONTRAST - 1e-9 || distance < STATE_CONSECUTIVE_DELTA_E - 1e-9 {
             errors.push(format!(
                 "{family} states collapse: contrast {contrast:.3}, delta E {distance:.3}"
@@ -2917,14 +2920,11 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     // uncomposited RGBA source channels.
     let conflict_ours = render_on_bases(
         editor_bases,
-        &[style_color(style, "version_control.conflict_marker.ours")?],
+        &[style_color(style, "version_control.conflict_marker.ours")],
     )?;
     let conflict_theirs = render_on_bases(
         editor_bases,
-        &[style_color(
-            style,
-            "version_control.conflict_marker.theirs",
-        )?],
+        &[style_color(style, "version_control.conflict_marker.theirs")],
     )?;
     let presentation = DiffPresentationProfile::for_mode(appearance);
     for (family, filled, hollow, border, word) in [
@@ -2943,10 +2943,10 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             "version_control.word_deleted",
         ),
     ] {
-        let filled_value = parse_hex(style_color(style, filled)?)?;
-        let hollow_value = parse_hex(style_color(style, hollow)?)?;
-        let border_value = parse_hex(style_color(style, border)?)?;
-        let word_value = parse_hex(style_color(style, word)?)?;
+        let filled_value = parse_hex(style_color(style, filled))?;
+        let hollow_value = parse_hex(style_color(style, hollow))?;
+        let border_value = parse_hex(style_color(style, border))?;
+        let word_value = parse_hex(style_color(style, word))?;
         let pigment = filled_value.opaque_hex();
         if [hollow_value, border_value]
             .iter()
@@ -2979,13 +2979,12 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     }
 
     let emitted_diff = DiffLayers {
-        added_line: style_color(style, "editor.diff_hunk.added.background")?.to_owned(),
-        deleted_line: style_color(style, "editor.diff_hunk.deleted.background")?.to_owned(),
-        added_hollow: style_color(style, "editor.diff_hunk.added.hollow_background")?.to_owned(),
-        deleted_hollow: style_color(style, "editor.diff_hunk.deleted.hollow_background")?
-            .to_owned(),
-        added_border: style_color(style, "editor.diff_hunk.added.hollow_border")?.to_owned(),
-        deleted_border: style_color(style, "editor.diff_hunk.deleted.hollow_border")?.to_owned(),
+        added_line: style_color(style, "editor.diff_hunk.added.background").to_owned(),
+        deleted_line: style_color(style, "editor.diff_hunk.deleted.background").to_owned(),
+        added_hollow: style_color(style, "editor.diff_hunk.added.hollow_background").to_owned(),
+        deleted_hollow: style_color(style, "editor.diff_hunk.deleted.hollow_background").to_owned(),
+        added_border: style_color(style, "editor.diff_hunk.added.hollow_border").to_owned(),
+        deleted_border: style_color(style, "editor.diff_hunk.deleted.hollow_border").to_owned(),
     };
     errors.extend(
         emitted_diff
@@ -3023,8 +3022,8 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
             "conflict markers violate their rendered contract: ours {conflict_ours_visibility:.3}:1, theirs {conflict_theirs_visibility:.3}:1, pair contrast {conflict_contrast:.3}, delta E {conflict_delta:.3}, CVD {conflict_cvd:.3}"
         ));
     }
-    let added = style_color(style, "version_control.added")?;
-    let deleted = style_color(style, "version_control.deleted")?;
+    let added = style_color(style, "version_control.added");
+    let deleted = style_color(style, "version_control.deleted");
     let pair_delta = delta_e(added, deleted)?;
     let pair_lightness = (lightness(added)? - lightness(deleted)?).abs();
     let pair_cvd = crate::search::cvd_distance(added, deleted)?;
@@ -3038,15 +3037,15 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     ) {
         errors.push(format!("diff added/deleted pair is ambiguous: contrast {pair_contrast:.3}, delta E {pair_delta:.3}, delta L {pair_lightness:.3}, CVD {pair_cvd:.3}"));
     }
-    let status_surface = style_color(style, "surface.background")?;
-    let global_text = style_color(style, "text")?;
-    let global_icon = style_color(style, "icon")?;
+    let status_surface = style_color(style, "surface.background");
+    let global_text = style_color(style, "text");
+    let global_icon = style_color(style, "icon");
     for name in STATUS_NAMES {
-        let foreground = style_color(style, name)?;
+        let foreground = style_color(style, name);
         let background_name = format!("{name}.background");
         let border_name = format!("{name}.border");
-        let background = style_color(style, &background_name)?;
-        let border = style_color(style, &border_name)?;
+        let background = style_color(style, &background_name);
+        let border = style_color(style, &border_name);
         let state_contrast = contrast_ratio(background, status_surface)?;
         let state_distance = delta_e(background, status_surface)?;
         let status_foreground_backgrounds = unique(
@@ -3102,8 +3101,8 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         }
     }
 
-    let status_created = style_color(style, "created")?;
-    let status_deleted = style_color(style, "deleted")?;
+    let status_created = style_color(style, "created");
+    let status_deleted = style_color(style, "deleted");
     let status_pair_contrast = contrast_ratio(status_created, status_deleted)?;
     let status_pair_delta = delta_e(status_created, status_deleted)?;
     let status_pair_cvd = cvd_distance(status_created, status_deleted)?;
@@ -3120,7 +3119,7 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
         ));
     }
 
-    let status_bar = style_color(style, "status_bar.background")?;
+    let status_bar = style_color(style, "status_bar.background");
     for name in [
         "normal",
         "insert",
@@ -3133,8 +3132,8 @@ fn validate_theme(document: &Value, contexts: ValidationContexts<'_>) -> Result<
     ] {
         let foreground_name = format!("vim.{name}.foreground");
         let background_name = format!("vim.{name}.background");
-        let foreground = style_color(style, &foreground_name)?;
-        let background = style_color(style, &background_name)?;
+        let foreground = style_color(style, &foreground_name);
+        let background = style_color(style, &background_name);
         let content_contrast = contrast_ratio(foreground, background)?;
         let state_contrast = contrast_ratio(background, status_bar)?;
         let state_distance = delta_e(background, status_bar)?;
@@ -3348,7 +3347,7 @@ mod tests {
     fn style_builder_rejects_duplicate_roles() {
         let mut style = StyleBuilder::default();
         style.insert_opaque("text", "#112233".into()).unwrap();
-        let _ = style.insert_opaque("text", "#445566".into());
+        style.insert_opaque("text", "#445566".into()).unwrap();
     }
 
     #[test]

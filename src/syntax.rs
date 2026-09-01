@@ -10,7 +10,9 @@ pub mod policy;
 pub mod profile;
 
 use crate::Result;
-use crate::color::{contrast_ratio, delta_e, gamut_map_oklch_unchecked, lab, oklab_to_oklch};
+use crate::color::{
+    contrast_ratio, delta_e, gamut_map_oklch_unchecked, lab, oklab_to_oklch, validate_opaque_hex,
+};
 use crate::constants::SYNTAX_DIFF_CONTRACT;
 use crate::palette::ResolvedPalette;
 use crate::saliency::SaliencyFit;
@@ -701,17 +703,17 @@ pub fn build_syntax(
         ("saliency reference", saliency_reference),
         ("predictive", predictive),
     ] {
-        lab(value).map_err(|error| error.context(name))?;
+        validate_opaque_hex(value, name)?;
     }
     for (index, source) in diff_sources.iter().enumerate() {
-        lab(source).map_err(|error| error.context(format!("diff source {index}")))?;
+        validate_opaque_hex(source, format_args!("diff source {index}"))?;
     }
     for (kind, values) in [
         ("ordinary syntax context", preference_contexts),
         ("rendered syntax context", required_contexts),
     ] {
         for (index, value) in values.iter().enumerate() {
-            lab(value).map_err(|error| error.context(format!("{kind} {index}")))?;
+            validate_opaque_hex(value, format_args!("{kind} {index}"))?;
         }
     }
     match build_syntax_from_validated_inputs(

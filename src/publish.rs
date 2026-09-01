@@ -275,18 +275,14 @@ fn generation_cache_key(binary_hash: [u8; 32], palette: &ResolvedPalette) -> Str
         hash_field(&mut hasher, value.as_bytes());
     }
 
-    hasher.update((crate::constants::CANONICAL_COLOR_KEYS.len() as u64).to_le_bytes());
-    for key in crate::constants::CANONICAL_COLOR_KEYS {
+    hasher.update((crate::syntax::profile::EVIDENCE_KEYS.len() as u64).to_le_bytes());
+    for key in crate::syntax::profile::EVIDENCE_KEYS {
         let provenance = palette
             .provenance
-            .get(*key)
+            .get(key)
             .expect("validated palette cache key provenance must be present");
         hash_field(&mut hasher, key.as_bytes());
-        hasher.update([match provenance {
-            Provenance::Direct => 0,
-            Provenance::Alias => 1,
-            Provenance::Derived => 2,
-        }]);
+        hasher.update([u8::from(*provenance == Provenance::Derived)]);
     }
 
     format!("{:x}", hasher.finalize())
@@ -547,6 +543,7 @@ mod tests {
                 .map(|key| ((*key).to_owned(), Provenance::Derived))
                 .collect();
         provenance.insert("background".into(), Provenance::Direct);
+        provenance.insert("red".into(), Provenance::Direct);
         let palette = ResolvedPalette {
             mode: "dark".into(),
             colors,
@@ -566,9 +563,17 @@ mod tests {
         assert_ne!(original, generation_cache_key(binary, &changed));
 
         let mut changed = palette.clone();
+        changed.provenance.insert("red".into(), Provenance::Alias);
+        assert_eq!(original, generation_cache_key(binary, &changed));
+
+        let mut changed = palette.clone();
         changed
             .provenance
             .insert("background".into(), Provenance::Derived);
+        assert_eq!(original, generation_cache_key(binary, &changed));
+
+        let mut changed = palette.clone();
+        changed.provenance.insert("red".into(), Provenance::Derived);
         assert_ne!(original, generation_cache_key(binary, &changed));
     }
 }

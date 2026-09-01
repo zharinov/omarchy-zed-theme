@@ -18,8 +18,6 @@ pub struct SaliencyRequest<'a> {
     pub backgrounds: &'a [String],
     pub hard_floor: f64,
     pub preferred_saliency: f64,
-    pub avoid: &'a [String],
-    pub bounds: FitBounds,
 }
 
 impl<'a> SaliencyRequest<'a> {
@@ -28,19 +26,7 @@ impl<'a> SaliencyRequest<'a> {
             backgrounds,
             hard_floor,
             preferred_saliency,
-            avoid: &[],
-            bounds: FitBounds::default(),
         }
-    }
-
-    pub fn with_avoid(mut self, avoid: &'a [String]) -> Self {
-        self.avoid = avoid;
-        self
-    }
-
-    pub fn with_bounds(mut self, bounds: FitBounds) -> Self {
-        self.bounds = bounds;
-        self
     }
 }
 
@@ -75,8 +61,6 @@ pub fn fit_relative(
         backgrounds,
         hard_floor,
         preferred_saliency,
-        avoid,
-        mut bounds,
     } = request;
 
     if !hard_floor.is_finite() || !(1.0..=21.0).contains(&hard_floor) {
@@ -94,9 +78,12 @@ pub fn fit_relative(
     let preferred_contrast = (reference_contrast.ln() * preferred_saliency)
         .exp()
         .max(hard_floor);
-    bounds.preferred_contrast = Some(preferred_contrast);
+    let bounds = FitBounds {
+        preferred_contrast: Some(preferred_contrast),
+        ..FitBounds::default()
+    };
 
-    let output = search.fit_color_bounded(seed, backgrounds, hard_floor, avoid, bounds)?;
+    let output = search.fit_color_bounded(seed, backgrounds, hard_floor, &[], bounds)?;
     let actual_contrast = geometric_contrast(&output, backgrounds)?;
     let actual_saliency = actual_contrast.ln() / reference_contrast.ln().max(1e-12);
 
