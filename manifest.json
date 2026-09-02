@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.zharinov.omarchy-zed-theme",
   "name": "Omarchy Zed Theme",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "zharinov",
   "description": "Keep Zed in sync with the active Omarchy theme.",
   "license": "MIT",
