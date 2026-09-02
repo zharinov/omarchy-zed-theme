@@ -1,7 +1,7 @@
 //! Shared contrast-relative saliency policy for editor foreground roles.
 
 use crate::color::contrast_ratio;
-use crate::search::{FitBounds, Search};
+use crate::search::{FitBounds, MetricBand, Search};
 use crate::{Error, Result};
 
 pub const INACTIVE_LINE_NUMBER_SALIENCY: f64 = 0.394;
@@ -18,6 +18,8 @@ pub struct SaliencyRequest<'a> {
     pub backgrounds: &'a [String],
     pub hard_floor: f64,
     pub preferred_saliency: f64,
+    pub maximum_saliency: Option<f64>,
+    pub contrast_ceiling: Option<&'a str>,
 }
 
 impl<'a> SaliencyRequest<'a> {
@@ -26,7 +28,19 @@ impl<'a> SaliencyRequest<'a> {
             backgrounds,
             hard_floor,
             preferred_saliency,
+            maximum_saliency: None,
+            contrast_ceiling: None,
         }
+    }
+
+    pub fn with_maximum_saliency(mut self, maximum_saliency: f64) -> Self {
+        self.maximum_saliency = Some(maximum_saliency);
+        self
+    }
+
+    pub fn with_contrast_ceiling(mut self, reference: &'a str) -> Self {
+        self.contrast_ceiling = Some(reference);
+        self
     }
 }
 
@@ -55,6 +69,8 @@ pub fn fit_relative(
         backgrounds,
         hard_floor,
         preferred_saliency,
+        maximum_saliency,
+        contrast_ceiling,
     } = request;
 
     if !hard_floor.is_finite() || !(1.0..=21.0).contains(&hard_floor) {
@@ -67,17 +83,45 @@ pub fn fit_relative(
             "preferred saliency must be finite and in 0..=1, got {preferred_saliency:?}"
         )));
     }
+    if let Some(maximum) = maximum_saliency
+        && (!maximum.is_finite() || !(preferred_saliency..=1.0).contains(&maximum))
+    {
+        return Err(Error::invalid(format!(
+            "saliency maximum must be finite and in {preferred_saliency}..=1, got {maximum:?}"
+        )));
+    }
 
     let reference_contrast = geometric_contrast(reference, backgrounds)?;
     let preferred_contrast = (reference_contrast.ln() * preferred_saliency)
         .exp()
         .max(hard_floor);
-    let bounds = FitBounds {
-        preferred_contrast: Some(preferred_contrast),
-        ..FitBounds::default()
-    };
+    let maximum_contrast =
+        maximum_saliency.map(|maximum| (reference_contrast.ln() * maximum).exp().max(hard_floor));
+    let contrast = maximum_contrast.map_or_else(
+        || MetricBand::with_preference(hard_floor, preferred_contrast),
+        |maximum| MetricBand::bounded(hard_floor, preferred_contrast, maximum),
+    );
+    let bounds = FitBounds::new(contrast);
+    let contrast_ceilings = contrast_ceiling
+        .map(|reference| {
+            backgrounds
+                .iter()
+                .map(|background| {
+                    contrast_ratio(reference, background).map(|value| value.max(hard_floor))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
 
-    let output = search.fit_color_bounded(seed, backgrounds, hard_floor, &[], bounds)?;
+    let output = search.fit_color_bounded_with_contrast_ceilings(
+        seed,
+        backgrounds,
+        backgrounds,
+        &contrast_ceilings,
+        &[],
+        bounds,
+    )?;
     let actual_contrast = geometric_contrast(&output, backgrounds)?;
     let actual_saliency = actual_contrast.ln() / reference_contrast.ln().max(1e-12);
 

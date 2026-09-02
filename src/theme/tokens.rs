@@ -59,29 +59,6 @@ impl OverlayColor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PaintColor {
-    Opaque(OpaqueColor),
-    Overlay(OverlayColor),
-}
-
-impl PaintColor {
-    pub(crate) fn new(value: String) -> Result<Self> {
-        if parse_hex(&value)?.a >= 1.0 {
-            Ok(Self::Opaque(OpaqueColor(value)))
-        } else {
-            Ok(Self::Overlay(OverlayColor(value)))
-        }
-    }
-
-    pub(crate) fn to_hex(&self) -> String {
-        match self {
-            Self::Opaque(color) => color.to_hex(),
-            Self::Overlay(color) => color.to_hex(),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct SurfaceTokens {
     pub(crate) editor_canvas: OpaqueColor,
@@ -89,12 +66,18 @@ pub(crate) struct SurfaceTokens {
     pub(crate) elevated: OpaqueColor,
     pub(crate) secondary: OpaqueColor,
     pub(crate) inactive_control: OpaqueColor,
-    pub(crate) editor_highlighted_line: PaintColor,
+    pub(crate) editor_highlighted_line: OverlayColor,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ContentTokens {
     pub(crate) primary: OpaqueColor,
+    pub(crate) muted: OpaqueColor,
+    pub(crate) placeholder: OpaqueColor,
+    pub(crate) disabled: OpaqueColor,
+    pub(crate) icon_muted: OpaqueColor,
+    pub(crate) icon_placeholder: OpaqueColor,
+    pub(crate) icon_disabled: OpaqueColor,
     pub(crate) accent: OpaqueColor,
     pub(crate) editor_primary: OpaqueColor,
 }
@@ -102,9 +85,11 @@ pub(crate) struct ContentTokens {
 #[derive(Clone, Debug)]
 pub(crate) struct InteractionTokens {
     pub(crate) element_hover: OverlayColor,
-    pub(crate) element_engaged: OverlayColor,
+    pub(crate) element_active: OverlayColor,
+    pub(crate) element_selected: OverlayColor,
     pub(crate) ghost_hover: OverlayColor,
-    pub(crate) ghost_engaged: OverlayColor,
+    pub(crate) ghost_active: OverlayColor,
+    pub(crate) ghost_selected: OverlayColor,
 }
 
 #[derive(Clone, Debug)]
@@ -163,10 +148,6 @@ impl RoleColor {
     }
 
     fn overlay(role: impl Into<String>, color: &OverlayColor) -> Self {
-        Self::new(role, color.to_hex())
-    }
-
-    fn paint(role: impl Into<String>, color: &PaintColor) -> Self {
         Self::new(role, color.to_hex())
     }
 
@@ -234,22 +215,22 @@ impl ThemeTokens {
             ],
             &self.surfaces.inactive_control,
         );
-        roles.push(RoleColor::paint(
+        roles.push(RoleColor::overlay(
             "editor.highlighted_line.background",
             &self.surfaces.editor_highlighted_line,
         ));
 
         push_opaque(&mut roles, &["text", "icon"], &self.content.primary);
+        push_opaque(&mut roles, &["text.muted"], &self.content.muted);
+        push_opaque(&mut roles, &["text.placeholder"], &self.content.placeholder);
+        push_opaque(&mut roles, &["text.disabled"], &self.content.disabled);
+        push_opaque(&mut roles, &["icon.muted"], &self.content.icon_muted);
         push_opaque(
             &mut roles,
-            &["text.muted", "icon.muted", "icon.placeholder"],
-            &self.statuses.unreachable.foreground,
+            &["icon.placeholder"],
+            &self.content.icon_placeholder,
         );
-        push_opaque(
-            &mut roles,
-            &["text.placeholder", "text.disabled", "icon.disabled"],
-            &self.statuses.hidden.foreground,
-        );
+        push_opaque(&mut roles, &["icon.disabled"], &self.content.icon_disabled);
         push_opaque(
             &mut roles,
             &["text.accent", "icon.accent", "link_text.hover"],
@@ -267,8 +248,13 @@ impl ThemeTokens {
         );
         push_overlay(
             &mut roles,
-            &["element.active", "element.selected"],
-            &self.interactions.element_engaged,
+            &["element.active"],
+            &self.interactions.element_active,
+        );
+        push_overlay(
+            &mut roles,
+            &["element.selected"],
+            &self.interactions.element_selected,
         );
         push_overlay(
             &mut roles,
@@ -277,8 +263,13 @@ impl ThemeTokens {
         );
         push_overlay(
             &mut roles,
-            &["ghost_element.active", "ghost_element.selected"],
-            &self.interactions.ghost_engaged,
+            &["ghost_element.active"],
+            &self.interactions.ghost_active,
+        );
+        push_overlay(
+            &mut roles,
+            &["ghost_element.selected"],
+            &self.interactions.ghost_selected,
         );
         push_overlay(
             &mut roles,

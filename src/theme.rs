@@ -4,8 +4,8 @@
 //! Visual targets rank candidates; they never prevent generation.
 
 use self::tokens::{
-    ContentTokens, DerivedTokens, InteractionTokens, OpaqueColor, OverlayColor, PaintColor,
-    RoleColor, StatusChannel, StatusTokens, SurfaceTokens, ThemeTokens,
+    ContentTokens, DerivedTokens, InteractionTokens, OpaqueColor, OverlayColor, RoleColor,
+    StatusChannel, StatusTokens, SurfaceTokens, ThemeTokens,
 };
 use crate::color::{
     apply_opacity, contrast_ratio, delta_e, gamut_map_oklch_unchecked, gpui_blend, lab, lightness,
@@ -18,8 +18,8 @@ use crate::saliency::{
     fit_relative,
 };
 use crate::search::{
-    FitBounds, OverlayFitRequest, OverlayPairRequest, PairConstraints, Search, cvd_distance,
-    cvd_greedy_order,
+    FitBounds, MetricBand, OverlayFitRequest, OverlayPairRequest, PairConstraints, Search,
+    StateFitRequest, cvd_distance, cvd_greedy_order,
 };
 use crate::syntax::{SyntaxContexts, build_syntax};
 use crate::{Error, Result};
@@ -27,6 +27,9 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 mod tokens;
+mod ui_policy;
+
+use self::ui_policy::{TerminalPolicy, UiPolicy, VisualBand};
 
 fn color<'a>(palette: &'a ResolvedPalette, key: &str) -> &'a str {
     palette
@@ -73,6 +76,22 @@ fn render_with_bounded_generic_highlights(
 
 fn opacity_byte(opacity: f64) -> u8 {
     (opacity * 255.0).round() as u8
+}
+
+fn bounded_overlay_request<'a>(
+    backgrounds: &'a [String],
+    band: VisualBand,
+) -> OverlayFitRequest<'a> {
+    OverlayFitRequest::new(backgrounds, band.contrast, band.delta_e)
+}
+
+fn fit_bounded_color(
+    search: &mut Search,
+    seed: &str,
+    backgrounds: &[String],
+    band: MetricBand,
+) -> Result<String> {
+    search.fit_color_bounded(seed, backgrounds, &[], FitBounds::new(band))
 }
 
 fn quality_shortfall(actual: f64, target: f64) -> f64 {
@@ -162,24 +181,23 @@ impl StyleBuilder {
     }
 }
 
-fn derive_surfaces(palette: &ResolvedPalette) -> Result<BTreeMap<String, String>> {
+fn derive_surfaces(
+    palette: &ResolvedPalette,
+    policy: &UiPolicy,
+) -> Result<BTreeMap<String, String>> {
     let canvas = color(palette, "background");
     let canvas_lightness = lightness(canvas)?;
     let offsets = if is_dark_mode(&palette.mode) {
         [
-            ("sunken", -0.045),
-            ("chrome", -0.025),
-            ("surface", 0.018),
-            ("raised", 0.035),
-            ("elevated", 0.055),
+            ("chrome", -policy.surfaces.lower_depth * 0.55),
+            ("surface", policy.surfaces.upper_depth * 0.35),
+            ("elevated", policy.surfaces.upper_depth),
         ]
     } else {
         [
-            ("sunken", -0.070),
-            ("chrome", -0.045),
-            ("surface", -0.025),
-            ("raised", 0.010),
-            ("elevated", 0.020),
+            ("chrome", -policy.surfaces.lower_depth * 0.65),
+            ("surface", -policy.surfaces.lower_depth * 0.35),
+            ("elevated", policy.surfaces.upper_depth),
         ]
     };
     let authored = [
@@ -300,7 +318,6 @@ fn fit_player_cursors(
             CONTROL_CONTRAST,
             PLAYER_CURSOR_NORMAL_DELTA_E,
             PLAYER_CURSOR_CVD_DELTA_E,
-            "players.cursor",
         )
         .map_err(|error| error.context(format!("players.cursor ({mode})")))
 }
@@ -309,95 +326,94 @@ struct TerminalRequest<'a> {
     seeds: [&'a str; 3],
     backgrounds: &'a [String],
     mode: &'a str,
+    policy: TerminalPolicy,
 }
 
 fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result<[String; 3]> {
     let [dim_seed, normal_seed, bright_seed] = request.seeds;
     let backgrounds = request.backgrounds;
-    let endpoint = if is_dark_mode(request.mode) {
-        "#ffffff"
-    } else {
-        "#000000"
-    };
-    let preferred = |search: &mut Search,
-                     seed: &str,
-                     target: f64,
-                     lower: f64,
-                     upper: f64,
-                     prefer_background: bool|
-     -> Result<String> {
-        if lightness(endpoint)? >= lower - 1e-12
-            && lightness(endpoint)? <= upper + 1e-12
-            && minimum_contrast(endpoint, backgrounds)? >= target - 1e-12
-        {
-            search.fit_color_bounded(
-                seed,
-                backgrounds,
-                target,
-                &[],
-                FitBounds {
-                    lower_lightness: lower,
-                    upper_lightness: upper,
-                    prefer_background,
-                    ..FitBounds::default()
-                },
-            )
-        } else {
-            search.fit_color_bounded(
-                seed,
-                backgrounds,
-                TEXT_CONTRAST,
-                &[],
-                FitBounds {
-                    lower_lightness: lower,
-                    upper_lightness: upper,
-                    prefer_background,
-                    ..FitBounds::default()
-                },
-            )
-        }
-    };
-    let normal = preferred(
-        search,
+    let authored_normal = minimum_contrast(normal_seed, backgrounds)?.max(TEXT_CONTRAST);
+    let normal_maximum = (authored_normal * 1.10).min(21.0);
+    let normal = search.fit_color_bounded(
         normal_seed,
-        TERMINAL_NORMAL_PREFERRED,
-        0.0,
-        1.0,
-        false,
+        backgrounds,
+        &[],
+        FitBounds::new(MetricBand::bounded(
+            TEXT_CONTRAST,
+            authored_normal.min(21.0),
+            normal_maximum,
+        )),
     )?;
     let normal_l = lightness(&normal)?;
+    let normal_contrast = minimum_contrast(&normal, backgrounds)?;
     let (dim_lower, dim_upper, bright_lower, bright_upper) = if is_dark_mode(request.mode) {
         (0.0, normal_l, normal_l, 1.0)
     } else {
         (normal_l, 1.0, 0.0, normal_l)
     };
+    let dim_preferred = (normal_contrast.ln() * request.policy.dim_saliency)
+        .exp()
+        .max(HARD_TEXT_CONTRAST);
+    let dim_maximum = (normal_contrast.ln() * (request.policy.dim_saliency + 0.08).min(0.90))
+        .exp()
+        .max(dim_preferred);
     let dim = search.fit_color_bounded(
         dim_seed,
         backgrounds,
-        TEXT_CONTRAST,
         &[],
         FitBounds {
             lower_lightness: dim_lower,
             upper_lightness: dim_upper,
-            prefer_background: true,
-            ..FitBounds::default()
+            ..FitBounds::new(MetricBand::bounded(
+                HARD_TEXT_CONTRAST,
+                dim_preferred,
+                dim_maximum,
+            ))
         },
     )?;
-    let bright = preferred(
-        search,
+    let bright_preferred = (normal_contrast.ln() * request.policy.bright_saliency)
+        .exp()
+        .max(normal_contrast)
+        .min(21.0);
+    let bright_maximum = (normal_contrast.ln() * (request.policy.bright_saliency + 0.08).min(1.24))
+        .exp()
+        .max(bright_preferred)
+        .min(21.0);
+    let bright = search.fit_color_bounded(
         bright_seed,
-        TERMINAL_BRIGHT_PREFERRED,
-        bright_lower,
-        bright_upper,
-        false,
+        backgrounds,
+        &[],
+        FitBounds {
+            lower_lightness: bright_lower,
+            upper_lightness: bright_upper,
+            ..FitBounds::new(MetricBand::bounded(
+                normal_contrast,
+                bright_preferred,
+                bright_maximum,
+            ))
+        },
     )?;
     Ok([dim, normal, bright])
+}
+
+struct ContentColors {
+    primary: String,
+    secondary: String,
+    placeholder: String,
+    disabled: String,
+    icon_muted: String,
+    icon_placeholder: String,
+    icon_disabled: String,
 }
 
 struct SemanticColors {
     primary: String,
     secondary: String,
+    placeholder: String,
     disabled: String,
+    icon_muted: String,
+    icon_placeholder: String,
+    icon_disabled: String,
     accent: String,
     structural: String,
     passive: String,
@@ -577,27 +593,131 @@ fn diff_overlay_seed(identity: &str, mode: &str, target_hue_degrees: f64) -> Res
     .opaque_hex())
 }
 
+fn derive_content(
+    search: &mut Search,
+    palette: &ResolvedPalette,
+    policy: &UiPolicy,
+    backgrounds: &[String],
+) -> Result<ContentColors> {
+    let primary = search.fit_color(
+        color(palette, "foreground"),
+        backgrounds,
+        TEXT_CONTRAST * 1.25,
+    )?;
+    let secondary = fit_relative(
+        search,
+        color(palette, "muted"),
+        &primary,
+        SaliencyRequest::new(
+            backgrounds,
+            HARD_TEXT_CONTRAST,
+            policy.content.muted_saliency,
+        )
+        .with_maximum_saliency((policy.content.muted_saliency + 0.08).min(0.86))
+        .with_contrast_ceiling(&primary),
+    )?
+    .output;
+    let placeholder = fit_relative(
+        search,
+        color(palette, "dark_foreground"),
+        &primary,
+        SaliencyRequest::new(
+            backgrounds,
+            HARD_TEXT_CONTRAST,
+            policy.content.placeholder_saliency,
+        )
+        .with_maximum_saliency(policy.content.muted_saliency)
+        .with_contrast_ceiling(&secondary),
+    )?
+    .output;
+    let disabled = fit_relative(
+        search,
+        color(palette, "dark_foreground"),
+        &primary,
+        SaliencyRequest::new(
+            backgrounds,
+            CONTROL_CONTRAST,
+            policy.content.disabled_saliency,
+        )
+        .with_maximum_saliency(policy.content.placeholder_saliency)
+        .with_contrast_ceiling(&placeholder),
+    )?
+    .output;
+    let icon_muted_saliency = (policy.content.muted_saliency * 0.84).clamp(0.36, 0.64);
+    let icon_muted = fit_relative(
+        search,
+        color(palette, "muted"),
+        &primary,
+        SaliencyRequest::new(backgrounds, CONTROL_CONTRAST, icon_muted_saliency)
+            .with_maximum_saliency(0.70)
+            .with_contrast_ceiling(&primary),
+    )?
+    .output;
+    let icon_placeholder = fit_relative(
+        search,
+        color(palette, "dark_foreground"),
+        &primary,
+        SaliencyRequest::new(backgrounds, 2.25, icon_muted_saliency * 0.82)
+            .with_maximum_saliency(icon_muted_saliency)
+            .with_contrast_ceiling(&icon_muted),
+    )?
+    .output;
+    let icon_disabled = fit_relative(
+        search,
+        color(palette, "dark_foreground"),
+        &primary,
+        SaliencyRequest::new(
+            backgrounds,
+            PASSIVE_CONTRAST,
+            icon_muted_saliency * 0.82 * 0.78,
+        )
+        .with_maximum_saliency(icon_muted_saliency * 0.82)
+        .with_contrast_ceiling(&icon_placeholder),
+    )?
+    .output;
+
+    Ok(ContentColors {
+        primary,
+        secondary,
+        placeholder,
+        disabled,
+        icon_muted,
+        icon_placeholder,
+        icon_disabled,
+    })
+}
+
 fn derive_semantics(
     search: &mut Search,
     palette: &ResolvedPalette,
-    text_backgrounds: &[String],
+    policy: &UiPolicy,
+    content: ContentColors,
+    ui_backgrounds: &[String],
+    structure_backgrounds: &[String],
     semantic_backgrounds: &[String],
 ) -> Result<SemanticColors> {
-    let primary = search.fit_color(
-        color(palette, "foreground"),
-        text_backgrounds,
-        TEXT_CONTRAST,
+    let ContentColors {
+        primary,
+        secondary,
+        placeholder,
+        disabled,
+        icon_muted,
+        icon_placeholder,
+        icon_disabled,
+    } = content;
+    let accent = search.fit_color(color(palette, "accent"), ui_backgrounds, CONTROL_CONTRAST)?;
+    let structural = fit_bounded_color(
+        search,
+        color(palette, "muted"),
+        structure_backgrounds,
+        policy.structure.normal,
     )?;
-    let secondary = search.fit_color(color(palette, "muted"), text_backgrounds, TEXT_CONTRAST)?;
-    let disabled = search.fit_color(
-        color(palette, "dark_foreground"),
-        text_backgrounds,
-        TEXT_CONTRAST,
+    let passive = fit_bounded_color(
+        search,
+        color(palette, "muted"),
+        structure_backgrounds,
+        policy.structure.passive,
     )?;
-    let accent = search.fit_color(color(palette, "accent"), text_backgrounds, CONTROL_CONTRAST)?;
-    let structural =
-        search.fit_color(color(palette, "muted"), text_backgrounds, CONTROL_CONTRAST)?;
-    let passive = search.fit_color(color(palette, "muted"), text_backgrounds, PASSIVE_CONTRAST)?;
     let [green, red] = search
         .fit_pair(
             color(palette, "green"),
@@ -616,7 +736,11 @@ fn derive_semantics(
     Ok(SemanticColors {
         primary,
         secondary,
+        placeholder,
         disabled,
+        icon_muted,
+        icon_placeholder,
+        icon_disabled,
         accent,
         structural,
         passive,
@@ -646,12 +770,12 @@ pub fn build_theme(palette: &ResolvedPalette) -> Result<Value> {
 fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value> {
     let mut search = Search::default();
     search.prewarm(CANONICAL_COLOR_KEYS.iter().map(|key| color(palette, key)))?;
-    let surfaces = derive_surfaces(palette)?;
+    let ui_policy = UiPolicy::derive(palette)?;
+    let surfaces = derive_surfaces(palette, &ui_policy)?;
     let canvas = surfaces["canvas"].clone();
     let surface = surfaces["surface"].clone();
     let elevated = surfaces["elevated"].clone();
     let chrome = surfaces["chrome"].clone();
-    let sunken = surfaces["sunken"].clone();
     let provisional_editor_text = search.fit_color(
         color(palette, "foreground"),
         &[canvas.clone(), chrome.clone()],
@@ -663,61 +787,74 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         surface.clone(),
         elevated.clone(),
         chrome.clone(),
-        sunken.clone(),
     ]);
-    let provisional_ui_text = search
-        .fit_color(
-            color(palette, "foreground"),
-            &base_ui_backgrounds,
-            UI_STATE_TEXT_CONTRAST,
-        )
-        .map_err(|error| error.context("provisional UI text"))?;
+    let content = derive_content(&mut search, palette, &ui_policy, &base_ui_backgrounds)?;
     let readable_ui_state = [(
-        provisional_ui_text,
+        content.primary.clone(),
         TEXT_CONTRAST,
         STATE_CONSECUTIVE_DELTA_E,
     )];
 
-    let fitted_tab_inactive = search
-        .fit_state(
-            color(palette, "background"),
-            std::slice::from_ref(&chrome),
-            TAB_STATE_CONTRAST,
-            STATE_CONSECUTIVE_DELTA_E,
-            &readable_ui_state,
-        )
-        .map_err(|error| error.context("inactive tab"))?;
-    let tab_inactive_reuses_chrome_context = contrast_ratio(&fitted_tab_inactive, &canvas)?
-        >= STATE_HOVER_CONTRAST - 1e-12
-        && delta_e(&fitted_tab_inactive, &canvas)? >= STATE_HOVER_DELTA_E - 1e-12;
-    let tab_inactive = if tab_inactive_reuses_chrome_context {
-        fitted_tab_inactive
+    let chrome_separates_active_tab = contrast_ratio(&chrome, &canvas)? >= 1.08 - 1e-12
+        && delta_e(&chrome, &canvas)? >= 0.025 - 1e-12;
+    let tab_inactive = if chrome_separates_active_tab {
+        chrome.clone()
     } else {
-        search.fit_state(
-            &canvas,
-            std::slice::from_ref(&canvas),
-            STATE_HOVER_CONTRAST,
-            STATE_HOVER_DELTA_E,
-            &readable_ui_state,
-        )?
+        let tab_backgrounds = [canvas.clone()];
+        search
+            .fit_state_request(
+                &chrome,
+                StateFitRequest::new(
+                    &tab_backgrounds,
+                    MetricBand::bounded(
+                        1.08,
+                        ui_policy
+                            .structure
+                            .passive
+                            .preferred()
+                            .expect("UI structure bands are bounded")
+                            .max(1.10),
+                        ui_policy
+                            .structure
+                            .normal
+                            .maximum()
+                            .expect("UI structure bands are bounded"),
+                    ),
+                    MetricBand::bounded(0.025, 0.040, 0.120),
+                )
+                .with_references(&readable_ui_state),
+            )
+            .map_err(|error| error.context("inactive tab"))?
     };
 
+    let panel_overlay_backgrounds = [surface.clone()];
     let panel_overlay = search
-        .fit_state(
+        .fit_state_request(
             &elevated,
-            std::slice::from_ref(&surface),
-            TAB_STATE_CONTRAST,
-            STATE_CONSECUTIVE_DELTA_E,
-            &readable_ui_state,
+            StateFitRequest::new(
+                &panel_overlay_backgrounds,
+                ui_policy.structure.passive,
+                MetricBand::bounded(0.020, 0.035, 0.100),
+            )
+            .with_references(&readable_ui_state),
         )
         .map_err(|error| error.context("panel overlay"))?;
+    let panel_hover_references = std::iter::once((
+        panel_overlay.clone(),
+        ui_policy.interactions.adjacent_contrast,
+        ui_policy.interactions.adjacent_delta_e,
+    ))
+    .chain(readable_ui_state.iter().cloned())
+    .collect::<Vec<_>>();
     let panel_overlay_hover = search
-        .fit_state(
+        .fit_state_request(
             &panel_overlay,
-            std::slice::from_ref(&panel_overlay),
-            STATE_HOVER_CONTRAST,
-            STATE_HOVER_DELTA_E,
-            &readable_ui_state,
+            StateFitRequest::new(
+                &panel_overlay_backgrounds,
+                ui_policy.interactions.hover.contrast,
+                ui_policy.interactions.hover.delta_e,
+            )
+            .with_references(&panel_hover_references),
         )
         .map_err(|error| error.context("panel overlay hover"))?;
 
@@ -727,91 +864,135 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             .cloned()
             .chain([panel_overlay.clone(), canvas.clone()]),
     );
-    let interaction_ui_text = search.fit_color(
-        color(palette, "foreground"),
-        &interaction_bases,
-        UI_STATE_TEXT_CONTRAST,
-    )?;
-    let readable_interaction_foreground = [(interaction_ui_text, TEXT_CONTRAST)];
+    let readable_interaction_foreground = [(content.primary.clone(), TEXT_CONTRAST)];
     let element_hover = search
         .fit_readable_overlay(
             &surface,
-            OverlayFitRequest::new(
-                &interaction_bases,
-                LAYER_HOVER_CONTRAST,
-                STATE_HOVER_DELTA_E,
-            )
-            .with_runtime_state((0.6, STATE_HOVER_CONTRAST, STATE_HOVER_DELTA_E))
-            .with_readable_foregrounds(&readable_interaction_foreground),
+            bounded_overlay_request(&interaction_bases, ui_policy.interactions.hover)
+                .with_runtime_state((0.6, 1.10, 0.025))
+                .with_readable_foregrounds(&readable_interaction_foreground),
         )
         .map_err(|error| error.context("element hover"))?;
+    let element_active_references = [(
+        element_hover.clone(),
+        ui_policy.interactions.adjacent_contrast,
+        ui_policy.interactions.adjacent_delta_e,
+    )];
+    let element_runtime_hover = apply_opacity(&element_hover, 0.6)?;
+    let element_runtime_references = [(
+        element_runtime_hover,
+        ui_policy.interactions.adjacent_contrast,
+        ui_policy.interactions.adjacent_delta_e,
+        0.01,
+    )];
     let element_active = search
         .fit_readable_overlay(
             &surface,
-            OverlayFitRequest::new(
-                &interaction_bases,
-                LAYER_ACTIVE_CONTRAST,
-                STATE_ACTIVE_DELTA_E,
-            )
-            .with_runtime_state((0.5, STATE_HOVER_CONTRAST, STATE_HOVER_DELTA_E))
-            .with_readable_foregrounds(&readable_interaction_foreground)
-            .with_rendered_references(&[(
-                element_hover.clone(),
-                STATE_CONSECUTIVE_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )])
-            .with_runtime_rendered_references(&[(
-                apply_opacity(&element_hover, 0.6)?,
-                RUNTIME_STATE_CONSECUTIVE_CONTRAST,
-                RUNTIME_STATE_CONSECUTIVE_DELTA_E,
-                RUNTIME_STATE_BASE_CONTRAST_STEP,
-            )]),
+            bounded_overlay_request(&interaction_bases, ui_policy.interactions.active)
+                .with_runtime_state((0.5, 1.14, 0.035))
+                .with_readable_foregrounds(&readable_interaction_foreground)
+                .with_rendered_references(&element_active_references)
+                .with_runtime_rendered_references(&element_runtime_references),
         )
         .map_err(|error| error.context("element active"))?;
     let ghost_hover = search
         .fit_readable_overlay(
             &canvas,
-            OverlayFitRequest::new(
-                &interaction_bases,
-                LAYER_HOVER_CONTRAST,
-                STATE_HOVER_DELTA_E,
-            )
-            .with_readable_foregrounds(&readable_interaction_foreground),
+            bounded_overlay_request(&interaction_bases, ui_policy.interactions.hover)
+                .with_readable_foregrounds(&readable_interaction_foreground),
         )
         .map_err(|error| error.context("ghost hover"))?;
+    let ghost_active_references = [(
+        ghost_hover.clone(),
+        ui_policy.interactions.adjacent_contrast,
+        ui_policy.interactions.adjacent_delta_e,
+    )];
     let ghost_active = search
         .fit_readable_overlay(
             &canvas,
-            OverlayFitRequest::new(
-                &interaction_bases,
-                LAYER_ACTIVE_CONTRAST,
-                STATE_ACTIVE_DELTA_E,
-            )
-            .with_readable_foregrounds(&readable_interaction_foreground)
-            .with_rendered_references(&[(
-                ghost_hover.clone(),
-                STATE_CONSECUTIVE_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )]),
+            bounded_overlay_request(&interaction_bases, ui_policy.interactions.active)
+                .with_readable_foregrounds(&readable_interaction_foreground)
+                .with_rendered_references(&ghost_active_references),
         )
         .map_err(|error| error.context("ghost active"))?;
-
-    let panel_guide_ladder = search
-        .fit_state_ladder(
-            color(palette, "accent"),
-            std::slice::from_ref(&surface),
-            &[
-                (PASSIVE_CONTRAST, 0.025),
-                (CONTROL_CONTRAST, 0.040),
-                (THUMB_HOVER_CONTRAST, 0.065),
-            ],
-            &[],
+    let selected_references = [
+        (
+            element_active.clone(),
+            ui_policy.interactions.adjacent_contrast,
+            ui_policy.interactions.adjacent_delta_e,
+        ),
+        (
+            ghost_active.clone(),
+            ui_policy.interactions.adjacent_contrast,
+            ui_policy.interactions.adjacent_delta_e,
+        ),
+    ];
+    let element_selected = search
+        .fit_readable_overlay(
+            color(palette, "selection"),
+            bounded_overlay_request(&interaction_bases, ui_policy.interactions.selected)
+                .with_runtime_state((0.5, 1.08, 0.020))
+                .with_readable_foregrounds(&readable_interaction_foreground)
+                .with_rendered_references(&selected_references),
         )
-        .map_err(|error| error.context("panel guide ladder"))?;
+        .map_err(|error| error.context("selected controls"))?;
+    let ghost_selected = element_selected.clone();
+
+    let panel_guide_backgrounds = [surface.clone()];
+    let panel_guide_passive = search
+        .fit_state_request(
+            color(palette, "muted"),
+            StateFitRequest::new(
+                &panel_guide_backgrounds,
+                ui_policy.structure.passive,
+                MetricBand::bounded(0.020, 0.035, 0.090),
+            ),
+        )
+        .map_err(|error| error.context("passive panel guide"))?;
+    let panel_guide_hover_references = [(
+        panel_guide_passive.clone(),
+        ui_policy.interactions.adjacent_contrast,
+        ui_policy.interactions.adjacent_delta_e,
+    )];
+    let panel_guide_hover = search
+        .fit_state_request(
+            color(palette, "accent"),
+            StateFitRequest::new(
+                &panel_guide_backgrounds,
+                ui_policy.structure.normal,
+                MetricBand::bounded(0.035, 0.055, 0.130),
+            )
+            .with_references(&panel_guide_hover_references),
+        )
+        .map_err(|error| error.context("hovered panel guide"))?;
+    let panel_guide_active_references = [(
+        panel_guide_hover.clone(),
+        ui_policy.interactions.adjacent_contrast,
+        ui_policy.interactions.adjacent_delta_e,
+    )];
+    let panel_guide_active = search
+        .fit_state_request(
+            color(palette, "accent"),
+            StateFitRequest::new(
+                &panel_guide_backgrounds,
+                ui_policy.structure.active_guide,
+                MetricBand::bounded(0.050, 0.080, 0.180),
+            )
+            .with_references(&panel_guide_active_references),
+        )
+        .map_err(|error| error.context("active panel guide"))?;
+    let panel_guide_ladder = [panel_guide_passive, panel_guide_hover, panel_guide_active];
 
     let mut rendered_ui_state_backgrounds = Vec::new();
     for base in &interaction_bases {
-        for layer in [&element_hover, &element_active, &ghost_hover, &ghost_active] {
+        for layer in [
+            &element_hover,
+            &element_active,
+            &element_selected,
+            &ghost_hover,
+            &ghost_active,
+            &ghost_selected,
+        ] {
             rendered_ui_state_backgrounds.push(gpui_blend(base, layer)?.opaque_hex());
         }
         rendered_ui_state_backgrounds
@@ -833,37 +1014,50 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         interaction_bases
             .iter()
             .cloned()
-            .chain(tab_inactive_reuses_chrome_context.then(|| tab_inactive.clone())),
+            .chain(chrome_separates_active_tab.then(|| tab_inactive.clone())),
     );
 
-    let semantic = derive_semantics(&mut search, palette, &ui_backgrounds, &semantic_backgrounds)?;
+    let semantic = derive_semantics(
+        &mut search,
+        palette,
+        &ui_policy,
+        content,
+        &ui_backgrounds,
+        &base_ui_backgrounds,
+        &semantic_backgrounds,
+    )?;
 
     let content_accent = search.fit_color(&semantic.accent, &ui_backgrounds, TEXT_CONTRAST)?;
-    let element_selection = search
-        .fit_readable_overlay(
-            color(palette, "selection"),
-            OverlayFitRequest::new(
-                &interaction_bases,
-                FOCUSED_SELECTION_CONTRAST,
-                FOCUSED_SELECTION_DELTA_E,
-            )
-            .with_runtime_state((0.5, 1.08, 0.020))
-            .with_readable_foregrounds(&[(semantic.primary.clone(), TEXT_CONTRAST)]),
+    let focus_backgrounds = unique([
+        canvas.clone(),
+        surface.clone(),
+        elevated.clone(),
+        chrome.clone(),
+    ]);
+    let focus_references = [(
+        semantic.structural.clone(),
+        ui_policy.interactions.adjacent_contrast,
+        ui_policy.interactions.adjacent_delta_e,
+    )];
+    let focus_border = search.fit_state_request(
+        &semantic.accent,
+        StateFitRequest::new(
+            &focus_backgrounds,
+            ui_policy.structure.focus,
+            MetricBand::bounded(0.060, 0.120, 0.400),
         )
-        .map_err(|error| error.context("UI selection"))?;
+        .with_references(&focus_references),
+    )?;
+    let element_selection = element_selected.clone();
 
     let editor_active_line = search
         .fit_readable_overlay(
             &canvas,
-            OverlayFitRequest::new(
-                std::slice::from_ref(&canvas),
-                STATE_HOVER_CONTRAST,
-                STATE_HOVER_DELTA_E,
-            )
-            .with_readable_foregrounds(&[(
-                provisional_editor_text.clone(),
-                EDITOR_BASE_TEXT_CONTRAST,
-            )]),
+            bounded_overlay_request(std::slice::from_ref(&canvas), ui_policy.interactions.hover)
+                .with_readable_foregrounds(&[(
+                    provisional_editor_text.clone(),
+                    EDITOR_BASE_TEXT_CONTRAST,
+                )]),
         )
         .map_err(|error| error.context("active editor line"))?;
 
@@ -871,20 +1065,16 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     let editor_highlighted_line = search
         .fit_readable_overlay(
             &surface,
-            OverlayFitRequest::new(
-                std::slice::from_ref(&canvas),
-                STATE_ACTIVE_CONTRAST,
-                STATE_ACTIVE_DELTA_E,
-            )
-            .with_readable_foregrounds(&[(
-                provisional_editor_text.clone(),
-                EDITOR_BASE_TEXT_CONTRAST,
-            )])
-            .with_rendered_references(&[(
-                rendered_editor_active_line.clone(),
-                STATE_CONSECUTIVE_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            )]),
+            bounded_overlay_request(std::slice::from_ref(&canvas), ui_policy.interactions.active)
+                .with_readable_foregrounds(&[(
+                    provisional_editor_text.clone(),
+                    EDITOR_BASE_TEXT_CONTRAST,
+                )])
+                .with_rendered_references(&[(
+                    rendered_editor_active_line.clone(),
+                    STATE_CONSECUTIVE_CONTRAST,
+                    STATE_CONSECUTIVE_DELTA_E,
+                )]),
         )
         .map_err(|error| error.context("highlighted editor line"))?;
     let rendered_editor_highlighted_line =
@@ -892,10 +1082,9 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     let debugger_active = search
         .fit_readable_overlay(
             &semantic.red,
-            OverlayFitRequest::new(
+            bounded_overlay_request(
                 std::slice::from_ref(&canvas),
-                STATE_SELECTED_CONTRAST,
-                STATE_SELECTED_DELTA_E,
+                ui_policy.interactions.selected,
             )
             .with_readable_foregrounds(&[(
                 provisional_editor_text.clone(),
@@ -931,13 +1120,15 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             &editor_bases,
             PASSIVE_CONTRAST,
             INACTIVE_LINE_NUMBER_SALIENCY,
-        ),
+        )
+        .with_maximum_saliency(0.52),
     )?;
     let editor_hover_line_number = fit_relative(
         &mut search,
         color(palette, "muted"),
         &editor_primary,
-        SaliencyRequest::new(&editor_bases, CONTROL_CONTRAST, HOVER_LINE_NUMBER_SALIENCY),
+        SaliencyRequest::new(&editor_bases, CONTROL_CONTRAST, HOVER_LINE_NUMBER_SALIENCY)
+            .with_maximum_saliency(0.80),
     )?;
     let editor_active_line_number = fit_relative(
         &mut search,
@@ -963,11 +1154,10 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     let version_control_modified = search.fit_color_bounded(
         &diff_yellow_seed,
         &interaction_bases,
-        TEXT_CONTRAST,
         &[],
         FitBounds {
             lower_chroma: 0.025,
-            ..FitBounds::default()
+            ..FitBounds::new(MetricBand::floor(TEXT_CONTRAST))
         },
     )?;
 
@@ -978,8 +1168,8 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     let diff_line_request = |backgrounds| {
         OverlayFitRequest::new(
             backgrounds,
-            presentation.line_target_contrast,
-            presentation.line_minimum_delta_e,
+            MetricBand::floor(presentation.line_target_contrast),
+            MetricBand::floor(presentation.line_minimum_delta_e),
         )
         .with_readable_foregrounds(&readable_diff_text)
         .prefer_source_fidelity()
@@ -1008,8 +1198,12 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     ]];
     let hollow_alpha = opacity_byte(presentation.hollow_opacity);
     let hollow_pair_request = |backgrounds| {
-        OverlayFitRequest::new(backgrounds, 1.01, 0.003)
-            .with_readable_foregrounds(&readable_diff_text)
+        OverlayFitRequest::new(
+            backgrounds,
+            MetricBand::floor(1.01),
+            MetricBand::floor(0.003),
+        )
+        .with_readable_foregrounds(&readable_diff_text)
     };
     let [hollow_added, hollow_deleted] = search.fit_overlay_pair(
         &diff_added_seed,
@@ -1057,13 +1251,16 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     let added_hollow_scenes = render_on_bases(&editor_bases, &[&diff_added_hollow])?;
     let deleted_hollow_scenes = render_on_bases(&editor_bases, &[&diff_deleted_hollow])?;
     let readable_editor_overlay_text = [(editor_primary.clone(), EDITOR_OVERLAY_TEXT_CONTRAST)];
-    let search_match_request =
-        OverlayFitRequest::new(&editor_bases, SEARCH_MATCH_CONTRAST, STATE_HOVER_DELTA_E)
-            .with_readable_foregrounds(&readable_editor_overlay_text);
+    let search_match_request = OverlayFitRequest::new(
+        &editor_bases,
+        MetricBand::floor(SEARCH_MATCH_CONTRAST),
+        MetricBand::floor(STATE_HOVER_DELTA_E),
+    )
+    .with_readable_foregrounds(&readable_editor_overlay_text);
     let search_active_request = OverlayFitRequest::new(
         &editor_bases,
-        SEARCH_ACTIVE_CONTRAST,
-        STATE_SELECTED_DELTA_E,
+        MetricBand::floor(SEARCH_ACTIVE_CONTRAST),
+        MetricBand::floor(STATE_SELECTED_DELTA_E),
     )
     .with_readable_foregrounds(&readable_editor_overlay_text);
     let sequential_search = match fit_highlight_strict(
@@ -1113,8 +1310,8 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         &semantic.accent,
         OverlayFitRequest::new(
             &editor_bases,
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
+            MetricBand::floor(STATE_SELECTED_CONTRAST),
+            MetricBand::floor(STATE_SELECTED_DELTA_E),
         )
         .with_readable_foregrounds(&readable_editor_overlay_text),
     )?;
@@ -1125,8 +1322,8 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         &semantic.orange,
         OverlayFitRequest::new(
             &editor_bases,
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
+            MetricBand::floor(STATE_SELECTED_CONTRAST),
+            MetricBand::floor(STATE_SELECTED_DELTA_E),
         )
         .with_readable_foregrounds(&readable_editor_overlay_text),
     )?;
@@ -1136,8 +1333,8 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         &semantic.cyan,
         OverlayFitRequest::new(
             &editor_bases,
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
+            MetricBand::floor(STATE_SELECTED_CONTRAST),
+            MetricBand::floor(STATE_SELECTED_DELTA_E),
         )
         .with_readable_foregrounds(&readable_editor_overlay_text),
     )?;
@@ -1146,8 +1343,12 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         .with_separation_alternative(Some((1.12, 0.075, 0.035)))
         .prefer_background();
     let conflict_fill_request = |backgrounds| {
-        OverlayFitRequest::new(backgrounds, CONFLICT_FILL_CONTRAST, 0.030)
-            .with_readable_foregrounds(&readable_diff_text)
+        OverlayFitRequest::new(
+            backgrounds,
+            MetricBand::floor(CONFLICT_FILL_CONTRAST),
+            MetricBand::floor(0.030),
+        )
+        .with_readable_foregrounds(&readable_diff_text)
     };
     let [conflict_ours, conflict_theirs] = search
         .fit_overlay_pair(
@@ -1167,8 +1368,8 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         &semantic.yellow,
         OverlayFitRequest::new(
             &editor_bases,
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
+            MetricBand::floor(STATE_SELECTED_CONTRAST),
+            MetricBand::floor(STATE_SELECTED_DELTA_E),
         )
         .with_readable_foregrounds(&readable_editor_overlay_text),
     )?;
@@ -1195,8 +1396,10 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         render_with_bounded_generic_highlights(&word_added_bases, &generic_highlights)?;
     let word_deleted_underlays =
         render_with_bounded_generic_highlights(&word_deleted_bases, &generic_highlights)?;
-    let word_request =
-        |backgrounds| OverlayFitRequest::new(backgrounds, 1.0, 0.0).prefer_source_fidelity();
+    let word_request = |backgrounds| {
+        OverlayFitRequest::new(backgrounds, MetricBand::floor(1.0), MetricBand::floor(0.0))
+            .prefer_source_fidelity()
+    };
     let word_alpha = opacity_byte(presentation.word_opacity);
     let [word_added, word_deleted] = search
         .fit_overlay_pair(
@@ -1253,19 +1456,17 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             color(palette, "foreground"),
             &editor_text_backgrounds,
             &editor_bases,
-            target,
             &[],
-            FitBounds::default(),
+            FitBounds::new(MetricBand::floor(target)),
         )
     };
     let editor_primary = fit_editor_primary(&mut search, EDITOR_OVERLAY_TEXT_CONTRAST)?;
 
     let selection_readable = [(editor_primary.clone(), TEXT_CONTRAST)];
     let selection_request = || {
-        OverlayFitRequest::new(
+        bounded_overlay_request(
             &selection_visibility_backgrounds,
-            FOCUSED_SELECTION_CONTRAST,
-            FOCUSED_SELECTION_DELTA_E,
+            ui_policy.interactions.selected,
         )
         .with_runtime_state((0.5, 1.08, 0.020))
         .with_readability_backgrounds(&editor_text_backgrounds)
@@ -1292,6 +1493,7 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             ],
             backgrounds: &terminal_backgrounds,
             mode: &palette.mode,
+            policy: ui_policy.terminal,
         },
     )?;
     let mut terminal = BTreeMap::from([
@@ -1325,6 +1527,7 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
                 ],
                 backgrounds: &terminal_backgrounds,
                 mode: &palette.mode,
+                policy: ui_policy.terminal,
             },
         )?;
         terminal.insert(format!("terminal.ansi.dim_{name}"), triplet[0].clone());
@@ -1363,25 +1566,29 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     ]);
     let mut status_backgrounds = BTreeMap::new();
     for name in status_seeds.keys() {
+        let status_background_contexts = [surface.clone()];
+        let status_references = [
+            (
+                semantic.primary.clone(),
+                TEXT_CONTRAST,
+                STATE_CONSECUTIVE_DELTA_E,
+            ),
+            (
+                semantic.structural.clone(),
+                ui_policy.interactions.adjacent_contrast,
+                ui_policy.interactions.adjacent_delta_e,
+            ),
+        ];
         status_backgrounds.insert(
             *name,
-            search.fit_state(
+            search.fit_state_request(
                 status_seeds[name],
-                std::slice::from_ref(&surface),
-                STATE_SELECTED_CONTRAST,
-                STATE_SELECTED_DELTA_E,
-                &[
-                    (
-                        semantic.primary.clone(),
-                        TEXT_CONTRAST,
-                        STATE_CONSECUTIVE_DELTA_E,
-                    ),
-                    (
-                        semantic.structural.clone(),
-                        CONTROL_CONTRAST,
-                        STATE_CONSECUTIVE_DELTA_E,
-                    ),
-                ],
+                StateFitRequest::new(
+                    &status_background_contexts,
+                    ui_policy.interactions.selected.contrast,
+                    ui_policy.interactions.selected.delta_e,
+                )
+                .with_references(&status_references),
             )?,
         );
     }
@@ -1434,11 +1641,10 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             search.fit_color_bounded(
                 seed,
                 &status_foreground_backgrounds,
-                TEXT_CONTRAST,
                 &[],
                 FitBounds {
                     lower_chroma: 0.025,
-                    ..FitBounds::default()
+                    ..FitBounds::new(MetricBand::floor(TEXT_CONTRAST))
                 },
             )?
         } else {
@@ -1451,10 +1657,11 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     let mut statuses = BTreeMap::new();
     for name in status_seeds.keys() {
         let background = status_backgrounds[name].clone();
-        let border = search.fit_color(
+        let border = fit_bounded_color(
+            &mut search,
             status_seeds[name],
             &[surface.clone(), background.clone()],
-            CONTROL_CONTRAST,
+            ui_policy.structure.status_border,
         )?;
         statuses.insert((*name).to_owned(), status_foregrounds[name].clone());
         statuses.insert(format!("{name}.background"), background);
@@ -1478,12 +1685,14 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         ),
     ]);
     for (name, seed) in mode_seeds {
-        let background = search.fit_state(
+        let background_contexts = [chrome.clone()];
+        let background = search.fit_state_request(
             seed,
-            std::slice::from_ref(&chrome),
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
-            &[],
+            StateFitRequest::new(
+                &background_contexts,
+                ui_policy.interactions.selected.contrast,
+                ui_policy.interactions.selected.delta_e,
+            ),
         )?;
         vim.insert(
             format!("vim.{name}.foreground"),
@@ -1526,15 +1735,13 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         &accent_seeds,
         std::slice::from_ref(&canvas),
         CONTROL_CONTRAST,
-        "accents",
     )?;
 
     let drop_target = search.fit_readable_overlay_bounded(
         &semantic.accent,
-        OverlayFitRequest::new(
+        bounded_overlay_request(
             std::slice::from_ref(&surface),
-            STATE_SELECTED_CONTRAST,
-            STATE_SELECTED_DELTA_E,
+            ui_policy.interactions.selected,
         ),
         OVERLAY_MAX_ALPHA,
     )?;
@@ -1548,57 +1755,59 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     let thumb_contexts = unique([chrome.clone(), surface.clone(), canvas.clone()]);
     let thumb_base = search.fit_readable_overlay_bounded(
         &semantic.primary,
-        OverlayFitRequest::new(&thumb_contexts, CONTROL_CONTRAST, STATE_SELECTED_DELTA_E),
+        bounded_overlay_request(&thumb_contexts, ui_policy.scroll.idle),
         OVERLAY_MAX_ALPHA,
     )?;
+    let thumb_hover_references = [(
+        thumb_base.clone(),
+        ui_policy.interactions.adjacent_contrast,
+        ui_policy.interactions.adjacent_delta_e,
+    )];
     let thumb_hover = search.fit_readable_overlay_bounded(
         &semantic.primary,
-        OverlayFitRequest::new(
-            &thumb_contexts,
-            THUMB_HOVER_CONTRAST,
-            STATE_SELECTED_DELTA_E,
-        )
-        .with_rendered_references(&[(
-            thumb_base.clone(),
-            STATE_CONSECUTIVE_CONTRAST,
-            STATE_CONSECUTIVE_DELTA_E,
-        )]),
+        bounded_overlay_request(&thumb_contexts, ui_policy.scroll.hover)
+            .with_rendered_references(&thumb_hover_references),
         OVERLAY_MAX_ALPHA,
     )?;
+    let thumb_active_references = [(
+        thumb_hover.clone(),
+        ui_policy.interactions.adjacent_contrast,
+        ui_policy.interactions.adjacent_delta_e,
+    )];
     let thumb_active = search.fit_readable_overlay_bounded(
         &semantic.primary,
-        OverlayFitRequest::new(
-            &thumb_contexts,
-            THUMB_ACTIVE_CONTRAST,
-            STATE_SELECTED_DELTA_E,
-        )
-        .with_rendered_references(&[(
-            thumb_hover.clone(),
-            STATE_CONSECUTIVE_CONTRAST,
-            STATE_CONSECUTIVE_DELTA_E,
-        )]),
+        bounded_overlay_request(&thumb_contexts, ui_policy.scroll.active)
+            .with_rendered_references(&thumb_active_references),
         OVERLAY_MAX_ALPHA,
     )?;
     let thumb_ladder = [thumb_base, thumb_hover, thumb_active];
     let thumb_border = semantic.structural.clone();
-    let track_border = search.fit_color(&semantic.passive, &thumb_contexts, PASSIVE_CONTRAST)?;
+    let track_border = fit_bounded_color(
+        &mut search,
+        &semantic.passive,
+        &thumb_contexts,
+        ui_policy.structure.passive,
+    )?;
 
     let wrap_guide = with_alpha(&semantic.structural, 0x0d as f64 / 255.0)?;
     let active_wrap_guide = with_alpha(&semantic.structural, 0x1a as f64 / 255.0)?;
-    let editor_invisible = search.fit_color(
+    let editor_invisible = fit_bounded_color(
+        &mut search,
         color(palette, "muted"),
         std::slice::from_ref(&canvas),
-        CONTROL_CONTRAST,
+        ui_policy.structure.normal,
     )?;
-    let editor_indent_guide = search.fit_color(
+    let editor_indent_guide = fit_bounded_color(
+        &mut search,
         &semantic.passive,
         std::slice::from_ref(&canvas),
-        PASSIVE_CONTRAST,
+        ui_policy.structure.passive,
     )?;
-    let editor_indent_guide_active = search.fit_color(
+    let editor_indent_guide_active = fit_bounded_color(
+        &mut search,
         &semantic.structural,
         std::slice::from_ref(&canvas),
-        CONTROL_CONTRAST,
+        ui_policy.structure.active_guide,
     )?;
 
     // Multiplayer is the final color-allocation stage so lower-priority player
@@ -1634,10 +1843,12 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             .iter()
             .map(|selection| (selection.clone(), 1.0, PLAYER_SELECTION_DELTA_E))
             .collect::<Vec<_>>();
+        // Simultaneous player identities outrank the ordinary selection ceiling:
+        // a crowded session may need more salience to keep every owner distinct.
         let request = OverlayFitRequest::new(
             &selection_visibility_backgrounds,
-            FOCUSED_SELECTION_CONTRAST,
-            FOCUSED_SELECTION_DELTA_E,
+            MetricBand::floor(ui_policy.interactions.selected.contrast.minimum()),
+            MetricBand::floor(ui_policy.interactions.selected.delta_e.minimum()),
         )
         .with_runtime_state((0.5, 1.08, 0.020))
         .with_readability_backgrounds(&editor_text_backgrounds)
@@ -1656,12 +1867,16 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         .zip(&player_cursors)
         .zip(player_selections)
     {
-        let background = search.fit_state(
+        let background_contexts = [canvas.clone()];
+        let background_references = [(cursor.clone(), CONTROL_CONTRAST, STATE_CONSECUTIVE_DELTA_E)];
+        let background = search.fit_state_request(
             seed,
-            std::slice::from_ref(&canvas),
-            STATE_HOVER_CONTRAST,
-            STATE_HOVER_DELTA_E,
-            &[(cursor.clone(), CONTROL_CONTRAST, STATE_CONSECUTIVE_DELTA_E)],
+            StateFitRequest::new(
+                &background_contexts,
+                MetricBand::floor(ui_policy.interactions.hover.contrast.minimum()),
+                MetricBand::floor(ui_policy.interactions.hover.delta_e.minimum()),
+            )
+            .with_references(&background_references),
         )?;
         players.push(BTreeMap::from([
             ("cursor".into(), cursor.clone()),
@@ -1685,18 +1900,26 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             elevated: OpaqueColor::new(elevated.clone())?,
             secondary: OpaqueColor::new(surface.clone())?,
             inactive_control: OpaqueColor::new(chrome.clone())?,
-            editor_highlighted_line: PaintColor::new(editor_highlighted_line.clone())?,
+            editor_highlighted_line: OverlayColor::new(editor_highlighted_line.clone())?,
         },
         content: ContentTokens {
             primary: OpaqueColor::new(semantic.primary.clone())?,
+            muted: OpaqueColor::new(semantic.secondary.clone())?,
+            placeholder: OpaqueColor::new(semantic.placeholder.clone())?,
+            disabled: OpaqueColor::new(semantic.disabled.clone())?,
+            icon_muted: OpaqueColor::new(semantic.icon_muted.clone())?,
+            icon_placeholder: OpaqueColor::new(semantic.icon_placeholder.clone())?,
+            icon_disabled: OpaqueColor::new(semantic.icon_disabled.clone())?,
             accent: OpaqueColor::new(content_accent)?,
             editor_primary: OpaqueColor::new(editor_primary.clone())?,
         },
         interactions: InteractionTokens {
             element_hover: OverlayColor::new(element_hover.clone())?,
-            element_engaged: OverlayColor::new(element_active.clone())?,
+            element_active: OverlayColor::new(element_active.clone())?,
+            element_selected: OverlayColor::new(element_selected.clone())?,
             ghost_hover: OverlayColor::new(ghost_hover.clone())?,
-            ghost_engaged: OverlayColor::new(ghost_active.clone())?,
+            ghost_active: OverlayColor::new(ghost_active.clone())?,
+            ghost_selected: OverlayColor::new(ghost_selected.clone())?,
         },
         statuses: StatusTokens {
             positive: status_channel("created")?,
@@ -1729,9 +1952,9 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         };
     }
     put!("border", semantic.structural.clone());
-    put!("border.variant", semantic.structural.clone());
-    put!("border.focused", semantic.accent.clone());
-    put!("border.selected", semantic.accent.clone());
+    put!("border.variant", semantic.passive.clone());
+    put!("border.focused", focus_border.clone());
+    put!("border.selected", focus_border.clone());
     put!("border.disabled", semantic.passive.clone());
     put!("element.background", surface.clone());
     put_overlay!("element.selection_background", element_selection);
@@ -1743,13 +1966,13 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     put_overlay!("search.match_background", search_match);
     put_overlay!("search.active_match_background", search_active);
     put!("panel.background", surface.clone());
-    put!("panel.focused_border", semantic.accent.clone());
+    put!("panel.focused_border", focus_border.clone());
     put!("panel.indent_guide", panel_guide_ladder[0].clone());
     put!("panel.indent_guide_hover", panel_guide_ladder[1].clone());
     put!("panel.indent_guide_active", panel_guide_ladder[2].clone());
     put!("panel.overlay_background", panel_overlay);
     put!("panel.overlay_hover", panel_overlay_hover);
-    put!("pane.focused_border", semantic.accent.clone());
+    put!("pane.focused_border", focus_border);
     put!("pane_group.border", semantic.structural.clone());
     put_overlay!("scrollbar.thumb.background", thumb_ladder[0].clone());
     put_overlay!("scrollbar.thumb.hover_background", thumb_ladder[1].clone());

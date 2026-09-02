@@ -21,13 +21,72 @@ pub enum PaletteMutation {
     Random(BTreeMap<usize, [u8; 3]>),
     CollapseAll([u8; 3]),
     CollapseSurfaces([u8; 3]),
+    CollapseForegrounds([u8; 3]),
     ForegroundMatchesBackground,
     CollapseSemantics([u8; 3]),
     SelectionMatchesBackground,
     SwapEndpoints,
+    NoAuthoredSyntax,
+    NarrowSemantics {
+        hue_degrees: u16,
+        spread_degrees: u8,
+        chroma_step: u8,
+    },
+    NeutralSemantics {
+        lightness_step: u8,
+    },
 }
 
-pub fn production_palette_specs() -> impl Strategy<Value = PaletteSpec> {
+const SURFACE_KEYS: &[&str] = &[
+    "background",
+    "dark_background",
+    "darker_background",
+    "lighter_background",
+    "color0",
+    "color8",
+];
+const FOREGROUND_KEYS: &[&str] = &[
+    "foreground",
+    "dark_foreground",
+    "light_foreground",
+    "bright_foreground",
+    "muted",
+    "selection_foreground",
+    "color7",
+    "color15",
+];
+const SEMANTIC_KEYS: &[&str] = &[
+    "accent",
+    "cursor",
+    "red",
+    "orange",
+    "brown",
+    "yellow",
+    "green",
+    "cyan",
+    "blue",
+    "magenta",
+    "bright_red",
+    "bright_yellow",
+    "bright_green",
+    "bright_cyan",
+    "bright_blue",
+    "bright_magenta",
+    "color1",
+    "color2",
+    "color3",
+    "color4",
+    "color5",
+    "color6",
+    "color9",
+    "color10",
+    "color11",
+    "color12",
+    "color13",
+    "color14",
+];
+
+pub fn generated_palette_specs() -> impl Strategy<Value = PaletteSpec> {
     (
         any::<bool>(),
         0_u8..=24,
@@ -94,30 +153,58 @@ pub fn arbitrary_resolved_palettes() -> impl Strategy<Value = ResolvedPalette> {
         })
 }
 
-pub fn pathological_palette_specs() -> impl Strategy<Value = (PaletteSpec, Vec<PaletteMutation>)> {
+pub fn pathological_palette_sets() -> impl Strategy<Value = (PaletteSpec, Vec<PaletteMutation>)> {
     (
-        production_palette_specs(),
+        generated_palette_specs(),
         prop::collection::btree_map(
             0..CANONICAL_COLOR_KEYS.len(),
             edge_rgb(),
             1..=CANONICAL_COLOR_KEYS.len(),
         ),
-        prop::array::uniform3(edge_rgb()),
+        edge_rgb(),
+        edge_rgb(),
+        edge_rgb(),
+        edge_rgb(),
+        0_u16..360,
+        0_u8..=24,
+        0_u8..=12,
+        0_u8..=24,
     )
-        .prop_map(|(spec, random, [all, surfaces, semantics])| {
-            (
+        .prop_map(
+            |(
                 spec,
-                vec![
-                    PaletteMutation::Random(random),
-                    PaletteMutation::CollapseAll(all),
-                    PaletteMutation::CollapseSurfaces(surfaces),
-                    PaletteMutation::ForegroundMatchesBackground,
-                    PaletteMutation::CollapseSemantics(semantics),
-                    PaletteMutation::SelectionMatchesBackground,
-                    PaletteMutation::SwapEndpoints,
-                ],
-            )
-        })
+                random,
+                collapse_all,
+                collapse_surfaces,
+                collapse_foregrounds,
+                collapse_semantics,
+                hue_degrees,
+                spread_degrees,
+                chroma_step,
+                lightness_step,
+            )| {
+                (
+                    spec,
+                    vec![
+                        PaletteMutation::Random(random),
+                        PaletteMutation::CollapseAll(collapse_all),
+                        PaletteMutation::CollapseSurfaces(collapse_surfaces),
+                        PaletteMutation::CollapseForegrounds(collapse_foregrounds),
+                        PaletteMutation::ForegroundMatchesBackground,
+                        PaletteMutation::CollapseSemantics(collapse_semantics),
+                        PaletteMutation::SelectionMatchesBackground,
+                        PaletteMutation::SwapEndpoints,
+                        PaletteMutation::NoAuthoredSyntax,
+                        PaletteMutation::NarrowSemantics {
+                            hue_degrees,
+                            spread_degrees,
+                            chroma_step,
+                        },
+                        PaletteMutation::NeutralSemantics { lightness_step },
+                    ],
+                )
+            },
+        )
 }
 
 impl PaletteSpec {
@@ -265,6 +352,53 @@ impl PaletteSpec {
     }
 }
 
+fn assign_semantic_families(
+    palette: &mut ResolvedPalette,
+    normal: [String; 8],
+    bright: [String; 8],
+) {
+    for (key, value) in [
+        ("red", &normal[0]),
+        ("orange", &normal[1]),
+        ("brown", &normal[2]),
+        ("yellow", &normal[3]),
+        ("green", &normal[4]),
+        ("cyan", &normal[5]),
+        ("blue", &normal[6]),
+        ("magenta", &normal[7]),
+        ("accent", &normal[6]),
+        ("cursor", &normal[7]),
+        ("bright_red", &bright[0]),
+        ("bright_yellow", &bright[3]),
+        ("bright_green", &bright[4]),
+        ("bright_cyan", &bright[5]),
+        ("bright_blue", &bright[6]),
+        ("bright_magenta", &bright[7]),
+    ] {
+        palette.colors.insert(key.into(), value.clone());
+    }
+    for (key, index) in [
+        ("color1", 0),
+        ("color2", 4),
+        ("color3", 3),
+        ("color4", 6),
+        ("color5", 7),
+        ("color6", 5),
+    ] {
+        palette.colors.insert(key.into(), normal[index].clone());
+    }
+    for (key, index) in [
+        ("color9", 0),
+        ("color10", 4),
+        ("color11", 3),
+        ("color12", 6),
+        ("color13", 7),
+        ("color14", 5),
+    ] {
+        palette.colors.insert(key.into(), bright[index].clone());
+    }
+}
+
 pub fn apply_color_mutation(palette: &mut ResolvedPalette, mutation: &PaletteMutation) {
     let set = |palette: &mut ResolvedPalette, key: &str, value: String| {
         palette.colors.insert(key.to_owned(), value);
@@ -281,22 +415,23 @@ pub fn apply_color_mutation(palette: &mut ResolvedPalette, mutation: &PaletteMut
             }
         }
         PaletteMutation::CollapseSurfaces(value) => {
-            for key in [
-                "background",
-                "dark_background",
-                "darker_background",
-                "lighter_background",
-            ] {
+            for key in SURFACE_KEYS {
+                set(palette, key, hex(*value));
+            }
+        }
+        PaletteMutation::CollapseForegrounds(value) => {
+            for key in FOREGROUND_KEYS {
                 set(palette, key, hex(*value));
             }
         }
         PaletteMutation::ForegroundMatchesBackground => {
-            set(palette, "foreground", palette.colors["background"].clone());
+            let background = palette.colors["background"].clone();
+            for key in ["foreground", "color7"] {
+                set(palette, key, background.clone());
+            }
         }
         PaletteMutation::CollapseSemantics(value) => {
-            for key in [
-                "red", "orange", "brown", "yellow", "green", "cyan", "blue", "magenta",
-            ] {
+            for key in SEMANTIC_KEYS {
                 set(palette, key, hex(*value));
             }
         }
@@ -308,8 +443,60 @@ pub fn apply_color_mutation(palette: &mut ResolvedPalette, mutation: &PaletteMut
         PaletteMutation::SwapEndpoints => {
             let background = palette.colors["background"].clone();
             let foreground = palette.colors["foreground"].clone();
-            set(palette, "background", foreground);
-            set(palette, "foreground", background);
+            for key in ["background", "color0"] {
+                set(palette, key, foreground.clone());
+            }
+            for key in ["foreground", "color7"] {
+                set(palette, key, background.clone());
+            }
+        }
+        PaletteMutation::NoAuthoredSyntax => {
+            for provenance in palette.provenance.values_mut() {
+                *provenance = Provenance::Derived;
+            }
+        }
+        PaletteMutation::NarrowSemantics {
+            hue_degrees,
+            spread_degrees,
+            chroma_step,
+        } => {
+            let hue = f64::from(*hue_degrees) * TAU / 360.0;
+            let spread = f64::from(*spread_degrees) * TAU / 360.0;
+            let chroma = 0.025 + f64::from(*chroma_step) / 100.0;
+            let (normal_lightness, bright_lightness) = if palette.mode == "dark" {
+                (0.68, 0.78)
+            } else {
+                (0.46, 0.36)
+            };
+            let normal = std::array::from_fn(|index| {
+                let offset = (index as f64 / 7.0 - 0.5) * spread;
+                color(normal_lightness, chroma, hue + offset)
+            });
+            let bright = std::array::from_fn(|index| {
+                let offset = (index as f64 / 7.0 - 0.5) * spread;
+                color(bright_lightness, chroma * 0.9, hue + offset)
+            });
+            assign_semantic_families(palette, normal, bright);
+        }
+        PaletteMutation::NeutralSemantics { lightness_step } => {
+            let center = if palette.mode == "dark" {
+                150 + *lightness_step
+            } else {
+                105_u8.saturating_sub(*lightness_step)
+            };
+            let normal = std::array::from_fn(|index| {
+                let value = center.saturating_add(index as u8 * 3);
+                hex([value, value, value])
+            });
+            let bright = std::array::from_fn(|index| {
+                let value = if palette.mode == "dark" {
+                    center.saturating_add(28).saturating_add(index as u8 * 2)
+                } else {
+                    center.saturating_sub(28).saturating_sub(index as u8 * 2)
+                };
+                hex([value, value, value])
+            });
+            assign_semantic_families(palette, normal, bright);
         }
     }
 }

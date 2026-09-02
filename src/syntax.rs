@@ -16,7 +16,7 @@ use crate::color::{
 use crate::constants::SYNTAX_DIFF_CONTRACT;
 use crate::palette::ResolvedPalette;
 use crate::saliency::SaliencyFit;
-use crate::search::{FitBounds, PairConstraints, Search};
+use crate::search::{FitBounds, MetricBand, PairConstraints, Search};
 use plan::{MergePlan, SemanticRole};
 use policy::{
     CAPTURE_POLICIES, SYNTAX_ADAPTIVE_OVERLAY_FLOOR, SYNTAX_SEMANTIC_FLOOR, SYNTAX_SUBDUED_FLOOR,
@@ -138,12 +138,11 @@ fn fit_tone(search: &mut Search, request: ToneFitRequest<'_>) -> Result<Saliency
         .exp()
         .max(request.preference_floor);
     let mut bounds = request.bounds;
-    bounds.preferred_contrast = Some(preferred_contrast);
+    bounds.contrast = MetricBand::with_preference(request.required_floor, preferred_contrast);
     let output = search.fit_color_bounded_with_preference_backgrounds(
         request.seed,
         request.required_contexts,
         request.preference_contexts,
-        request.required_floor,
         &[],
         bounds,
     )?;
@@ -246,7 +245,7 @@ fn allocate_family(search: &mut Search, request: FamilyFitRequest<'_>) -> Result
             bounds: FitBounds {
                 lower_chroma: chroma_floor,
                 upper_chroma: chroma_cap,
-                ..FitBounds::default()
+                ..FitBounds::new(MetricBand::floor(SYNTAX_ADAPTIVE_OVERLAY_FLOOR))
             },
         },
     )?;
@@ -594,7 +593,7 @@ fn fit_subdued(
             preferred_saliency: SUBDUED_SALIENCY,
             bounds: FitBounds {
                 upper_chroma: subdued_chroma_cap,
-                ..FitBounds::default()
+                ..FitBounds::new(MetricBand::floor(SYNTAX_SUBDUED_OVERLAY_FLOOR))
             },
         },
     )?;
@@ -615,7 +614,7 @@ fn fit_subdued(
             preferred_saliency: SUBDUED_SALIENCY,
             bounds: FitBounds {
                 upper_chroma: reference_chroma.max(1e-9),
-                ..FitBounds::default()
+                ..FitBounds::new(MetricBand::floor(SYNTAX_SUBDUED_OVERLAY_FLOOR))
             },
         },
     )?;
