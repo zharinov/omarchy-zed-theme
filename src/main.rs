@@ -5,6 +5,8 @@ use omarchy_zed_theme::{Error, Result};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+mod scheduler;
+
 fn home() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -33,6 +35,7 @@ fn print_update(update: ThemeUpdate) {
 }
 
 fn sync() -> Result<()> {
+    scheduler::prioritize_generation();
     let home = home()?;
     let (colors, output) = current_paths(&home);
     let update = generate_and_publish(&colors, Some(&output), None)?;

@@ -392,10 +392,57 @@ struct FillCandidate {
     source_chroma: f64,
 }
 
+fn fill_candidate_cmp(left: &FillCandidate, right: &FillCandidate) -> Ordering {
+    rank_cmp(&left.rank, &right.rank).then_with(|| left.emitted.hex_cmp(right.emitted))
+}
+
+#[inline]
+fn select_alpha_candidates<const KEEP_HIGHEST: bool>(
+    alpha_values: &[u8],
+    mut evaluate: impl FnMut(u8) -> Option<FillCandidate>,
+) -> (Option<FillCandidate>, Option<FillCandidate>) {
+    // Pair frontiers need the highest feasible alpha as well as the best one;
+    // single-overlay searches compile without retaining that second candidate.
+    let mut best = None;
+    let mut highest = None;
+
+    for &alpha in alpha_values {
+        let Some(candidate) = evaluate(alpha) else {
+            continue;
+        };
+        let replace = best
+            .as_ref()
+            .is_none_or(|best| fill_candidate_cmp(&candidate, best) == Ordering::Less);
+        if KEEP_HIGHEST {
+            if replace {
+                best = Some(candidate.clone());
+            }
+            highest = Some(candidate);
+        } else if replace {
+            best = Some(candidate);
+        }
+    }
+
+    (best, highest)
+}
+
 struct FrontierCandidate {
     core: FillCandidate,
     rendered: Box<[ColorMetrics]>,
     cvd: OnceLock<Box<[CvdLabs]>>,
+}
+
+struct RenderedReference {
+    color: ColorMetrics,
+    minimum_contrast: f64,
+    minimum_delta_e: f64,
+}
+
+struct RuntimeRenderedReference {
+    color: ColorMetrics,
+    minimum_contrast: f64,
+    minimum_delta_e: f64,
+    minimum_background_contrast: f64,
 }
 
 impl FrontierCandidate {
@@ -445,8 +492,8 @@ struct PreparedFill {
     minimum_delta_e: f64,
     runtime_state: Option<(f64, f64, f64)>,
     readable_foregrounds: Vec<(ColorMetrics, f64)>,
-    rendered_references: Vec<Vec<(ColorMetrics, f64, f64)>>,
-    runtime_rendered_references: Vec<Vec<(ColorMetrics, f64, f64, f64)>>,
+    rendered_references: Vec<Vec<RenderedReference>>,
+    runtime_rendered_references: Vec<Vec<RuntimeRenderedReference>>,
     prefer_source_fidelity: bool,
 }
 
@@ -469,8 +516,7 @@ fn overlay_frontier(candidates: &[FillCandidate], limit: usize) -> Vec<FillCandi
             .emitted
             .alpha()
             .cmp(&left.emitted.alpha())
-            .then_with(|| rank_cmp(&left.rank, &right.rank))
-            .then_with(|| left.emitted.hex_cmp(right.emitted))
+            .then_with(|| fill_candidate_cmp(left, right))
     });
     selected.extend(alpha_order.into_iter().take(limit / 2).cloned());
     selected.sort_by_key(|candidate| candidate.emitted);
@@ -518,45 +564,71 @@ impl PreparedFill {
             .iter()
             .map(|(foreground, target)| Ok((ColorMetrics::from_hex(foreground)?, *target)))
             .collect::<Result<Vec<_>>>()?;
+        let rendered_reference_specs = request
+            .rendered_references
+            .iter()
+            .map(|(color, minimum_contrast, minimum_delta_e)| {
+                Ok((
+                    ColorMetrics::from_hex(color)?,
+                    *minimum_contrast,
+                    *minimum_delta_e,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let rendered_references = backgrounds
             .iter()
             .map(|background| {
-                request
-                    .rendered_references
+                rendered_reference_specs
                     .iter()
-                    .map(|(reference, target, delta)| {
-                        Ok((
-                            ColorMetrics::blend(
-                                *background,
-                                ColorMetrics::from_hex(reference)?.rgba.rgba(),
-                            ),
-                            *target,
-                            *delta,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()
+                    .map(
+                        |(reference, minimum_contrast, minimum_delta_e)| RenderedReference {
+                            color: ColorMetrics::blend(*background, reference.rgba.rgba()),
+                            minimum_contrast: *minimum_contrast,
+                            minimum_delta_e: *minimum_delta_e,
+                        },
+                    )
+                    .collect()
             })
+            .collect();
+        let runtime_reference_specs = request
+            .runtime_rendered_references
+            .iter()
+            .map(
+                |(color, minimum_contrast, minimum_delta_e, background_contrast_step)| {
+                    Ok((
+                        ColorMetrics::from_hex(color)?,
+                        *minimum_contrast,
+                        *minimum_delta_e,
+                        *background_contrast_step,
+                    ))
+                },
+            )
             .collect::<Result<Vec<_>>>()?;
         let runtime_rendered_references = backgrounds
             .iter()
             .map(|background| {
-                request
-                    .runtime_rendered_references
+                runtime_reference_specs
                     .iter()
-                    .map(|(reference, target, delta, base_step)| {
-                        Ok((
-                            ColorMetrics::blend(
-                                *background,
-                                ColorMetrics::from_hex(reference)?.rgba.rgba(),
-                            ),
-                            *target,
-                            *delta,
-                            *base_step,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()
+                    .map(
+                        |(
+                            reference,
+                            minimum_contrast,
+                            minimum_delta_e,
+                            background_contrast_step,
+                        )| {
+                            let reference = ColorMetrics::blend(*background, reference.rgba.rgba());
+                            RuntimeRenderedReference {
+                                color: reference,
+                                minimum_contrast: *minimum_contrast,
+                                minimum_delta_e: *minimum_delta_e,
+                                minimum_background_contrast: reference.contrast(*background)
+                                    + *background_contrast_step,
+                            }
+                        },
+                    )
+                    .collect()
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
         Ok(Self {
             backgrounds,
             readability_backgrounds,
@@ -577,29 +649,11 @@ impl PreparedFill {
         retention: f64,
         alpha_values: &[u8],
     ) -> (Option<FillCandidate>, Option<FillCandidate>) {
-        let mut best: Option<FillCandidate> = None;
-        let mut highest: Option<FillCandidate> = None;
         let opaque_rgb = opaque.rgb24();
         let source_chroma = lab_chroma(opaque.lab);
-
-        for &alpha in alpha_values {
-            let Some(candidate) =
-                self.evaluate_alpha(opaque_rgb, alpha, distance, retention, source_chroma)
-            else {
-                continue;
-            };
-
-            highest = Some(candidate.clone());
-            if best.as_ref().is_none_or(|best| {
-                rank_cmp(&candidate.rank, &best.rank)
-                    .then_with(|| candidate.emitted.hex_cmp(best.emitted))
-                    == Ordering::Less
-            }) {
-                best = Some(candidate);
-            }
-        }
-
-        (best, highest)
+        select_alpha_candidates::<true>(alpha_values, |alpha| {
+            self.evaluate_alpha(opaque_rgb, alpha, distance, retention, source_chroma)
+        })
     }
 
     fn best_for(
@@ -609,8 +663,12 @@ impl PreparedFill {
         retention: f64,
         alpha_values: &[u8],
     ) -> Option<FillCandidate> {
-        self.best_and_highest_for(opaque, distance, retention, alpha_values)
-            .0
+        let opaque_rgb = opaque.rgb24();
+        let source_chroma = lab_chroma(opaque.lab);
+        select_alpha_candidates::<false>(alpha_values, |alpha| {
+            self.evaluate_alpha(opaque_rgb, alpha, distance, retention, source_chroma)
+        })
+        .0
     }
 
     fn best_effort_and_highest_for(
@@ -622,24 +680,19 @@ impl PreparedFill {
     ) -> (FillCandidate, FillCandidate) {
         let opaque_rgb = opaque.rgb24();
         let source_chroma = lab_chroma(opaque.lab);
-        let mut candidates = alpha_values.iter().map(|alpha| {
-            self.evaluate_alpha_best_effort(opaque_rgb, *alpha, distance, retention, source_chroma)
+        let (best, highest) = select_alpha_candidates::<true>(alpha_values, |alpha| {
+            Some(self.evaluate_alpha_best_effort(
+                opaque_rgb,
+                alpha,
+                distance,
+                retention,
+                source_chroma,
+            ))
         });
-        let first = candidates
-            .next()
-            .expect("validated alpha range must contain a candidate");
-        let mut best = first.clone();
-        let mut highest = first;
-        for candidate in candidates {
-            highest = candidate.clone();
-            if rank_cmp(&candidate.rank, &best.rank)
-                .then_with(|| candidate.emitted.hex_cmp(best.emitted))
-                == Ordering::Less
-            {
-                best = candidate;
-            }
-        }
-        (best, highest)
+        (
+            best.expect("validated alpha range must contain a candidate"),
+            highest.expect("validated alpha range must contain a candidate"),
+        )
     }
 
     fn best_effort_for(
@@ -649,8 +702,19 @@ impl PreparedFill {
         retention: f64,
         alpha_values: &[u8],
     ) -> FillCandidate {
-        self.best_effort_and_highest_for(opaque, distance, retention, alpha_values)
-            .0
+        let opaque_rgb = opaque.rgb24();
+        let source_chroma = lab_chroma(opaque.lab);
+        select_alpha_candidates::<false>(alpha_values, |alpha| {
+            Some(self.evaluate_alpha_best_effort(
+                opaque_rgb,
+                alpha,
+                distance,
+                retention,
+                source_chroma,
+            ))
+        })
+        .0
+        .expect("validated alpha range must contain a candidate")
     }
 
     fn evaluate_alpha(
@@ -667,45 +731,50 @@ impl PreparedFill {
 
         for (background_index, background) in self.backgrounds.iter().enumerate() {
             let rendered_prepared = ColorMetrics::blend_rgb24(*background, opaque_rgb, alpha);
-            let ratio = rendered_prepared.contrast(*background);
-            if ratio < self.target - 1e-12
-                || self.rendered_references[background_index].iter().any(
-                    |(reference, target, _)| {
-                        rendered_prepared.contrast(*reference) < *target - 1e-12
-                    },
-                )
+            if !rendered_prepared.contrast_at_least(*background, self.target - 1e-12)
+                || self.rendered_references[background_index]
+                    .iter()
+                    .any(|reference| {
+                        !rendered_prepared
+                            .contrast_at_least(reference.color, reference.minimum_contrast - 1e-12)
+                    })
                 || self
                     .readable_foregrounds
                     .iter()
                     .any(|(foreground, target)| {
-                        rendered_prepared.contrast(*foreground) < *target - 1e-12
+                        !rendered_prepared.contrast_at_least(*foreground, *target - 1e-12)
                     })
             {
                 return None;
             }
+            let ratio = rendered_prepared.contrast(*background);
             let runtime = match self.runtime_state {
                 Some((runtime_opacity, runtime_target, minimum_distance)) => {
                     let runtime_alpha = (f64::from(alpha) * runtime_opacity + 0.5).floor() as u8;
                     let prepared =
                         ColorMetrics::blend_rgb24(*background, opaque_rgb, runtime_alpha);
-                    let runtime_ratio = prepared.contrast(*background);
-                    if runtime_ratio < runtime_target - 1e-12
+                    if !prepared.contrast_at_least(*background, runtime_target - 1e-12)
                         || self.runtime_rendered_references[background_index]
                             .iter()
-                            .any(|(reference, target, _, base_step)| {
-                                prepared.contrast(*reference) < *target - 1e-12
-                                    || runtime_ratio
-                                        < reference.contrast(*background) + *base_step - 1e-12
+                            .any(|reference| {
+                                !prepared.contrast_at_least(
+                                    reference.color,
+                                    reference.minimum_contrast - 1e-12,
+                                ) || !prepared.contrast_at_least(
+                                    *background,
+                                    reference.minimum_background_contrast - 1e-12,
+                                )
                             })
                         || self
                             .readable_foregrounds
                             .iter()
                             .any(|(foreground, target)| {
-                                prepared.contrast(*foreground) < *target - 1e-12
+                                !prepared.contrast_at_least(*foreground, *target - 1e-12)
                             })
                     {
                         return None;
                     }
+                    let runtime_ratio = prepared.contrast(*background);
                     Some((
                         prepared,
                         runtime_ratio + self.target - runtime_target,
@@ -719,7 +788,9 @@ impl PreparedFill {
             if rendered_distance < self.minimum_delta_e - 1e-12
                 || self.rendered_references[background_index]
                     .iter()
-                    .any(|(reference, _, delta)| rendered.delta_e(*reference) < *delta - 1e-12)
+                    .any(|reference| {
+                        rendered.delta_e(reference.color) < reference.minimum_delta_e - 1e-12
+                    })
             {
                 return None;
             }
@@ -732,8 +803,9 @@ impl PreparedFill {
                 if runtime_distance < minimum_distance - 1e-12
                     || self.runtime_rendered_references[background_index]
                         .iter()
-                        .any(|(reference, _, delta, _)| {
-                            runtime_metrics.delta_e(*reference) < *delta - 1e-12
+                        .any(|reference| {
+                            runtime_metrics.delta_e(reference.color)
+                                < reference.minimum_delta_e - 1e-12
                         })
                 {
                     return None;
@@ -748,7 +820,9 @@ impl PreparedFill {
             if self
                 .readable_foregrounds
                 .iter()
-                .any(|(foreground, target)| rendered.contrast(*foreground) < *target - 1e-12)
+                .any(|(foreground, target)| {
+                    !rendered.contrast_at_least(*foreground, *target - 1e-12)
+                })
             {
                 return None;
             }
@@ -758,7 +832,9 @@ impl PreparedFill {
                 if self
                     .readable_foregrounds
                     .iter()
-                    .any(|(foreground, target)| runtime.contrast(*foreground) < *target - 1e-12)
+                    .any(|(foreground, target)| {
+                        !runtime.contrast_at_least(*foreground, *target - 1e-12)
+                    })
                 {
                     return None;
                 }
@@ -812,8 +888,11 @@ impl PreparedFill {
             deficit += shortfall(ratio, self.target);
             deficit += self.rendered_references[background_index]
                 .iter()
-                .map(|(reference, target, _)| {
-                    shortfall(rendered_prepared.contrast(*reference), *target)
+                .map(|reference| {
+                    shortfall(
+                        rendered_prepared.contrast(reference.color),
+                        reference.minimum_contrast,
+                    )
                 })
                 .sum::<f64>();
             deficit += self
@@ -833,12 +912,11 @@ impl PreparedFill {
                     deficit += shortfall(runtime_ratio, runtime_target);
                     deficit += self.runtime_rendered_references[background_index]
                         .iter()
-                        .map(|(reference, target, _, base_step)| {
-                            shortfall(prepared.contrast(*reference), *target)
-                                + shortfall(
-                                    runtime_ratio,
-                                    reference.contrast(*background) + *base_step,
-                                )
+                        .map(|reference| {
+                            shortfall(
+                                prepared.contrast(reference.color),
+                                reference.minimum_contrast,
+                            ) + shortfall(runtime_ratio, reference.minimum_background_contrast)
                         })
                         .sum::<f64>();
                     deficit += self
@@ -863,7 +941,9 @@ impl PreparedFill {
             deficit += shortfall(rendered_distance, self.minimum_delta_e);
             deficit += self.rendered_references[background_index]
                 .iter()
-                .map(|(reference, _, delta)| shortfall(rendered.delta_e(*reference), *delta))
+                .map(|reference| {
+                    shortfall(rendered.delta_e(reference.color), reference.minimum_delta_e)
+                })
                 .sum::<f64>();
             overshoot += (ratio - self.target).max(0.0);
             final_distance += rendered_distance;
@@ -874,8 +954,11 @@ impl PreparedFill {
                 deficit += shortfall(runtime_distance, minimum_distance);
                 deficit += self.runtime_rendered_references[background_index]
                     .iter()
-                    .map(|(reference, _, delta, _)| {
-                        shortfall(runtime_metrics.delta_e(*reference), *delta)
+                    .map(|reference| {
+                        shortfall(
+                            runtime_metrics.delta_e(reference.color),
+                            reference.minimum_delta_e,
+                        )
                     })
                     .sum::<f64>();
                 overshoot += (adjusted_ratio - self.target).max(0.0);
@@ -935,6 +1018,171 @@ struct PairCandidate {
     source_index: usize,
     background_distance: f64,
     constraint_deficit: f64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PairCandidateMode {
+    Feasible,
+    BestEffort,
+}
+
+struct PairCandidateInputs {
+    backgrounds: Vec<ColorMetrics>,
+    table: TransformTable,
+}
+
+struct DistinctCandidateContext<'a> {
+    backgrounds: &'a [ColorMetrics],
+    chosen: &'a [(ColorMetrics, CvdLabs)],
+    target: f64,
+    minimum_normal_delta_e: f64,
+    minimum_cvd_delta_e: f64,
+}
+
+impl DistinctCandidateContext<'_> {
+    fn feasible_rank(
+        &self,
+        metrics: ColorMetrics,
+        transform: f64,
+        retention: f64,
+    ) -> Option<[f64; 3]> {
+        let mut overshoot = 0.0;
+        let mut contrast_deficit = 0.0;
+        for background in self.backgrounds {
+            let ratio = metrics.contrast(*background);
+            contrast_deficit += shortfall(ratio, self.target);
+            if contrast_deficit > 1e-12 {
+                return None;
+            }
+            overshoot += (ratio - self.target).max(0.0);
+        }
+
+        let normal = self
+            .chosen
+            .iter()
+            .map(|(reference, _)| metrics.delta_e(*reference))
+            .fold(f64::INFINITY, f64::min);
+        if normal < self.minimum_normal_delta_e - 1e-12 {
+            return None;
+        }
+
+        let candidate_cvd = cvd_labs(metrics.rgba.rgba());
+        let cvd = self
+            .chosen
+            .iter()
+            .map(|(reference, reference_cvd)| {
+                cvd_distance_facts(&candidate_cvd, reference_cvd, metrics.delta_e(*reference))
+            })
+            .fold(f64::INFINITY, f64::min);
+        (cvd >= self.minimum_cvd_delta_e - 1e-12).then_some([transform, overshoot, -retention])
+    }
+
+    fn best_effort_rank(&self, metrics: ColorMetrics, transform: f64, retention: f64) -> [f64; 6] {
+        let mut overshoot = 0.0;
+        let mut contrast_deficit = 0.0;
+        for background in self.backgrounds {
+            let ratio = metrics.contrast(*background);
+            contrast_deficit += shortfall(ratio, self.target);
+            overshoot += (ratio - self.target).max(0.0);
+        }
+        let candidate_cvd = cvd_labs(metrics.rgba.rgba());
+        let normal = self
+            .chosen
+            .iter()
+            .map(|(reference, _)| metrics.delta_e(*reference))
+            .fold(f64::INFINITY, f64::min);
+        let cvd = self
+            .chosen
+            .iter()
+            .map(|(reference, reference_cvd)| {
+                cvd_distance_facts(&candidate_cvd, reference_cvd, metrics.delta_e(*reference))
+            })
+            .fold(f64::INFINITY, f64::min);
+        [
+            contrast_deficit,
+            -normal.min(self.minimum_normal_delta_e),
+            -cvd.min(self.minimum_cvd_delta_e),
+            transform,
+            overshoot,
+            -retention,
+        ]
+    }
+}
+
+struct StateReference {
+    color: ColorMetrics,
+    minimum_contrast: f64,
+    minimum_delta_e: f64,
+}
+
+struct StateCandidateContext<'a> {
+    backgrounds: &'a [ColorMetrics],
+    references: &'a [StateReference],
+    target: f64,
+    minimum_delta_e: f64,
+}
+
+impl StateCandidateContext<'_> {
+    fn feasible_rank(&self, candidate: &TransformCandidate) -> Option<[f64; 4]> {
+        let mut final_distance = 0.0;
+        let mut overshoot = 0.0;
+        let mut deficit = 0.0;
+
+        for background in self.backgrounds {
+            let ratio = candidate.metrics.contrast(*background);
+            let distance = candidate.metrics.delta_e(*background);
+            deficit += shortfall(ratio, self.target) + shortfall(distance, self.minimum_delta_e);
+            if deficit > 1e-12 {
+                return None;
+            }
+            overshoot += (ratio - self.target).max(0.0);
+            final_distance += distance;
+        }
+
+        for reference in self.references {
+            let ratio = candidate.metrics.contrast(reference.color);
+            deficit += shortfall(ratio, reference.minimum_contrast)
+                + shortfall(
+                    candidate.metrics.delta_e(reference.color),
+                    reference.minimum_delta_e,
+                );
+            if deficit > 1e-12 {
+                return None;
+            }
+            overshoot += (ratio - reference.minimum_contrast).max(0.0);
+        }
+
+        Some([
+            final_distance,
+            overshoot,
+            candidate.distance,
+            -candidate.retention,
+        ])
+    }
+
+    fn best_effort_rank(&self, candidate: &TransformCandidate) -> [f64; 4] {
+        let mut overshoot = 0.0;
+        let mut deficit = 0.0;
+
+        for background in self.backgrounds {
+            let ratio = candidate.metrics.contrast(*background);
+            deficit += shortfall(ratio, self.target)
+                + shortfall(candidate.metrics.delta_e(*background), self.minimum_delta_e);
+            overshoot += (ratio - self.target).max(0.0);
+        }
+
+        for reference in self.references {
+            let ratio = candidate.metrics.contrast(reference.color);
+            deficit += shortfall(ratio, reference.minimum_contrast)
+                + shortfall(
+                    candidate.metrics.delta_e(reference.color),
+                    reference.minimum_delta_e,
+                );
+            overshoot += (ratio - reference.minimum_contrast).max(0.0);
+        }
+
+        [deficit, candidate.distance, overshoot, -candidate.retention]
+    }
 }
 
 fn pair_is_separated(
@@ -1122,13 +1370,13 @@ impl Search {
         assert!(
             table
                 .iter()
-                .any(|candidate| candidate.metrics.rgb24().hex() == "#000000"),
+                .any(|candidate| candidate.metrics.rgb24() == Rgb24::BLACK),
             "transform tables must contain the black endpoint"
         );
         assert!(
             table
                 .iter()
-                .any(|candidate| candidate.metrics.rgb24().hex() == "#ffffff"),
+                .any(|candidate| candidate.metrics.rgb24() == Rgb24::WHITE),
             "transform tables must contain the white endpoint"
         );
 
@@ -1255,6 +1503,111 @@ impl Search {
         self.fit_color_bounded(seed, backgrounds, target, avoid, FitBounds::default())
     }
 
+    fn prepare_pair_candidate_inputs(
+        &mut self,
+        seed: &str,
+        backgrounds: &[String],
+    ) -> Result<PairCandidateInputs> {
+        Ok(PairCandidateInputs {
+            backgrounds: backgrounds
+                .iter()
+                .map(|background| ColorMetrics::from_hex(background))
+                .collect::<Result<Vec<_>>>()?,
+            table: self.transform_table(seed)?,
+        })
+    }
+
+    fn collect_pair_candidates(
+        inputs: &PairCandidateInputs,
+        readable_foregrounds: &[(ColorMetrics, f64)],
+        constraints: PairConstraints,
+        mode: PairCandidateMode,
+    ) -> Vec<PairCandidate> {
+        let mut candidates = Vec::new();
+
+        for (source_index, candidate) in inputs.table.candidates.iter().enumerate() {
+            let metrics = candidate.metrics;
+            if mode == PairCandidateMode::Feasible
+                && (shortfall(lab_chroma(metrics.lab), constraints.minimum_chroma) > 1e-12
+                    || inputs.backgrounds.iter().any(|background| {
+                        shortfall(
+                            metrics.contrast(*background),
+                            constraints.foreground_contrast,
+                        ) > 1e-12
+                    })
+                    || readable_foregrounds.iter().any(|(foreground, target)| {
+                        shortfall(metrics.contrast(*foreground), *target) > 1e-12
+                    }))
+            {
+                continue;
+            }
+
+            let constraint_deficit = shortfall(lab_chroma(metrics.lab), constraints.minimum_chroma)
+                + inputs
+                    .backgrounds
+                    .iter()
+                    .map(|background| {
+                        shortfall(
+                            metrics.contrast(*background),
+                            constraints.foreground_contrast,
+                        )
+                    })
+                    .sum::<f64>()
+                + readable_foregrounds
+                    .iter()
+                    .map(|(foreground, target)| shortfall(metrics.contrast(*foreground), *target))
+                    .sum::<f64>();
+            if mode == PairCandidateMode::Feasible && constraint_deficit > 1e-12 {
+                continue;
+            }
+            let background_distance = if constraints.prefer_background {
+                inputs
+                    .backgrounds
+                    .iter()
+                    .map(|background| metrics.delta_e(*background))
+                    .sum()
+            } else {
+                0.0
+            };
+            candidates.push(PairCandidate {
+                source_index,
+                background_distance,
+                constraint_deficit,
+            });
+        }
+
+        candidates.sort_by(|left, right| {
+            let left_facts = &inputs.table.candidates[left.source_index];
+            let right_facts = &inputs.table.candidates[right.source_index];
+            let left_primary = if constraints.prefer_background {
+                left.background_distance
+            } else {
+                left_facts.distance
+            };
+            let right_primary = if constraints.prefer_background {
+                right.background_distance
+            } else {
+                right_facts.distance
+            };
+            left.constraint_deficit
+                .total_cmp(&right.constraint_deficit)
+                .then_with(|| left_primary.total_cmp(&right_primary))
+                .then_with(|| left_facts.distance.total_cmp(&right_facts.distance))
+                .then_with(|| right_facts.retention.total_cmp(&left_facts.retention))
+                .then_with(|| left_facts.metrics.rgb24().cmp(&right_facts.metrics.rgb24()))
+        });
+
+        if mode == PairCandidateMode::BestEffort {
+            let minimum_deficit = candidates
+                .first()
+                .expect("transform table must contain pair candidates")
+                .constraint_deficit;
+            candidates.retain(|candidate| candidate.constraint_deficit <= minimum_deficit + 1e-12);
+        }
+
+        candidates
+    }
+
     pub fn fit_pair(
         &mut self,
         first_seed: &str,
@@ -1302,99 +1655,33 @@ impl Search {
         if first_backgrounds.is_empty() || second_backgrounds.is_empty() {
             return Err(Error::invalid("fit_pair requires at least one background"));
         }
-        for (index, (foreground, target)) in readable_foregrounds.iter().enumerate() {
-            ColorMetrics::from_hex(foreground).map_err(|error| {
-                error.context(format!("readable_foregrounds[{index}].foreground"))
-            })?;
-            valid_contrast(&format!("readable_foregrounds[{index}].contrast"), *target)?;
-        }
-
-        let collect = |search: &mut Self,
-                       seed: &str,
-                       backgrounds: &[String]|
-         -> Result<(Vec<PairCandidate>, Vec<PairCandidate>, TransformTable)> {
-            let background_metrics = backgrounds
-                .iter()
-                .map(|background| ColorMetrics::from_hex(background))
-                .collect::<Result<Vec<_>>>()?;
-            let readable_metrics = readable_foregrounds
-                .iter()
-                .map(|(foreground, target)| Ok((ColorMetrics::from_hex(foreground)?, *target)))
-                .collect::<Result<Vec<_>>>()?;
-            let mut values = Vec::new();
-            let table = search.transform_table(seed)?;
-            for (index, candidate) in table.candidates.iter().enumerate() {
-                let metrics = candidate.metrics;
-                let constraint_deficit =
-                    shortfall(lab_chroma(metrics.lab), constraints.minimum_chroma)
-                        + background_metrics
-                            .iter()
-                            .map(|background| {
-                                shortfall(
-                                    metrics.contrast(*background),
-                                    constraints.foreground_contrast,
-                                )
-                            })
-                            .sum::<f64>()
-                        + readable_metrics
-                            .iter()
-                            .map(|(foreground, target)| {
-                                shortfall(metrics.contrast(*foreground), *target)
-                            })
-                            .sum::<f64>();
-                let background_distance = if constraints.prefer_background {
-                    background_metrics
-                        .iter()
-                        .map(|background| metrics.delta_e(*background))
-                        .sum()
-                } else {
-                    0.0
-                };
-                values.push(PairCandidate {
-                    source_index: index,
-                    background_distance,
-                    constraint_deficit,
-                });
-            }
-
-            values.sort_by(|left, right| {
-                let left_facts = &table.candidates[left.source_index];
-                let right_facts = &table.candidates[right.source_index];
-                let left_primary = if constraints.prefer_background {
-                    left.background_distance
-                } else {
-                    left_facts.distance
-                };
-                let right_primary = if constraints.prefer_background {
-                    right.background_distance
-                } else {
-                    right_facts.distance
-                };
-                left.constraint_deficit
-                    .total_cmp(&right.constraint_deficit)
-                    .then_with(|| left_primary.total_cmp(&right_primary))
-                    .then_with(|| left_facts.distance.total_cmp(&right_facts.distance))
-                    .then_with(|| right_facts.retention.total_cmp(&left_facts.retention))
-                    .then_with(|| left_facts.metrics.rgb24().cmp(&right_facts.metrics.rgb24()))
-            });
-            let minimum_deficit = values
-                .first()
-                .expect("transform table must contain pair candidates")
-                .constraint_deficit;
-            let passing = values
-                .iter()
-                .filter(|candidate| candidate.constraint_deficit <= 1e-12)
-                .cloned()
-                .collect();
-            let best_effort = values
-                .into_iter()
-                .filter(|candidate| candidate.constraint_deficit <= minimum_deficit + 1e-12)
-                .collect();
-            Ok((passing, best_effort, table))
-        };
-
-        let (first, first_effort, first_table) = collect(self, first_seed, first_backgrounds)?;
-        let (second, second_effort, second_table) = collect(self, second_seed, second_backgrounds)?;
+        let readable_metrics = readable_foregrounds
+            .iter()
+            .enumerate()
+            .map(|(index, (foreground, target))| {
+                let foreground = ColorMetrics::from_hex(foreground).map_err(|error| {
+                    error.context(format!("readable_foregrounds[{index}].foreground"))
+                })?;
+                valid_contrast(&format!("readable_foregrounds[{index}].contrast"), *target)?;
+                Ok((foreground, *target))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let first_inputs = self.prepare_pair_candidate_inputs(first_seed, first_backgrounds)?;
+        let second_inputs = self.prepare_pair_candidate_inputs(second_seed, second_backgrounds)?;
+        let first = Self::collect_pair_candidates(
+            &first_inputs,
+            &readable_metrics,
+            constraints,
+            PairCandidateMode::Feasible,
+        );
+        let second = Self::collect_pair_candidates(
+            &second_inputs,
+            &readable_metrics,
+            constraints,
+            PairCandidateMode::Feasible,
+        );
+        let first_table = &first_inputs.table;
+        let second_table = &second_inputs.table;
 
         let mut best: Option<([Rgb24; 2], [f64; 4])> = None;
         let minimum_second_primary = second
@@ -1447,9 +1734,9 @@ impl Search {
                 }
                 let cvd_delta = cvd_distance_precomputed(
                     first_candidate,
-                    &first_table,
+                    first_table,
                     second_candidate,
-                    &second_table,
+                    second_table,
                     normal_delta,
                 );
                 let lightness_delta =
@@ -1493,8 +1780,20 @@ impl Search {
 
         // Preserve the most source-faithful candidates, then cover the remaining
         // normal- and color-vision space before evaluating the combined deficit.
-        let first_effort = pair_best_effort_frontier(&first_effort, &first_table);
-        let second_effort = pair_best_effort_frontier(&second_effort, &second_table);
+        let first_effort = Self::collect_pair_candidates(
+            &first_inputs,
+            &readable_metrics,
+            constraints,
+            PairCandidateMode::BestEffort,
+        );
+        let second_effort = Self::collect_pair_candidates(
+            &second_inputs,
+            &readable_metrics,
+            constraints,
+            PairCandidateMode::BestEffort,
+        );
+        let first_effort = pair_best_effort_frontier(&first_effort, first_table);
+        let second_effort = pair_best_effort_frontier(&second_effort, second_table);
         let mut best_effort: Option<([Rgb24; 2], [f64; 5])> = None;
         for first_candidate in &first_effort {
             let first_facts = &first_table.candidates[first_candidate.source_index];
@@ -1504,9 +1803,9 @@ impl Search {
                 let normal_delta = first_facts.metrics.delta_e(second_facts.metrics);
                 let cvd_delta = cvd_distance_precomputed(
                     first_candidate,
-                    &first_table,
+                    first_table,
                     second_candidate,
-                    &second_table,
+                    second_table,
                     normal_delta,
                 );
                 let lightness_delta =
@@ -1655,7 +1954,7 @@ impl Search {
             }
             if background_metrics
                 .iter()
-                .any(|background| candidate.contrast(*background) < target - 1e-12)
+                .any(|background| !candidate.contrast_at_least(*background, target - 1e-12))
             {
                 return false;
             }
@@ -1839,27 +2138,28 @@ impl Search {
         self.fit_readable_overlay_alpha_range(seed, request, 1, maximum_alpha)
     }
 
-    pub fn fit_readable_overlay_alpha_range(
-        &mut self,
-        seed: &str,
-        request: OverlayFitRequest<'_>,
-        minimum_alpha: u8,
-        maximum_alpha: u8,
-    ) -> Result<String> {
+    fn validate_alpha_range(minimum_alpha: u8, maximum_alpha: u8) -> Result<()> {
         if minimum_alpha > maximum_alpha {
             return Err(Error::invalid(
                 "overlay minimum alpha cannot exceed maximum alpha",
             ));
         }
-        let prepared = PreparedFill::new(request)?;
-        let alpha_values = PreparedFill::alpha_values(minimum_alpha, maximum_alpha);
-        let source = ColorMetrics::from_hex(seed)?;
-        if let Some(source_candidate) = prepared.best_for(source, 0.0, 1.0, &alpha_values) {
-            return Ok(source_candidate.emitted.hex());
+        Ok(())
+    }
+
+    fn find_feasible_overlay(
+        &mut self,
+        seed: &str,
+        prepared: &PreparedFill,
+        source: ColorMetrics,
+        alpha_values: &[u8],
+    ) -> Result<Option<FillCandidate>> {
+        if let Some(candidate) = prepared.best_for(source, 0.0, 1.0, alpha_values) {
+            return Ok(Some(candidate));
         }
 
         let table = self.transform_table(seed)?;
-        if let Some(candidate) = table
+        Ok(table
             .candidates
             .par_iter()
             .map(|opaque| {
@@ -1867,7 +2167,7 @@ impl Search {
                     opaque.metrics,
                     opaque.distance,
                     opaque.retention,
-                    &alpha_values,
+                    alpha_values,
                 )
             })
             .reduce(
@@ -1875,8 +2175,7 @@ impl Search {
                 |left, right| match (left, right) {
                     (None, other) | (other, None) => other,
                     (Some(left), Some(right)) => {
-                        let order = rank_cmp(&left.rank, &right.rank)
-                            .then_with(|| left.emitted.hex_cmp(right.emitted));
+                        let order = fill_candidate_cmp(&left, &right);
                         Some(if order == Ordering::Greater {
                             right
                         } else {
@@ -1884,12 +2183,18 @@ impl Search {
                         })
                     }
                 },
-            )
-        {
-            return Ok(candidate.emitted.hex());
-        }
+            ))
+    }
 
-        let source_candidate = prepared.best_effort_for(source, 0.0, 1.0, &alpha_values);
+    fn find_best_effort_overlay(
+        &mut self,
+        seed: &str,
+        prepared: &PreparedFill,
+        source: ColorMetrics,
+        alpha_values: &[u8],
+    ) -> Result<FillCandidate> {
+        let source_candidate = prepared.best_effort_for(source, 0.0, 1.0, alpha_values);
+        let table = self.transform_table(seed)?;
         let best = table
             .candidates
             .par_iter()
@@ -1898,26 +2203,115 @@ impl Search {
                     opaque.metrics,
                     opaque.distance,
                     opaque.retention,
-                    &alpha_values,
+                    alpha_values,
                 )
             })
             .reduce_with(|left, right| {
-                let order = rank_cmp(&left.rank, &right.rank)
-                    .then_with(|| left.emitted.hex_cmp(right.emitted));
+                let order = fill_candidate_cmp(&left, &right);
                 if order == Ordering::Greater {
                     right
                 } else {
                     left
                 }
             });
-        let candidate = best
-            .filter(|candidate| {
-                rank_cmp(&candidate.rank, &source_candidate.rank)
-                    .then_with(|| candidate.emitted.hex_cmp(source_candidate.emitted))
-                    == Ordering::Less
-            })
-            .unwrap_or(source_candidate);
-        Ok(candidate.emitted.hex())
+        Ok(best
+            .filter(|candidate| fill_candidate_cmp(candidate, &source_candidate) == Ordering::Less)
+            .unwrap_or(source_candidate))
+    }
+
+    fn find_feasible_overlay_in_tiers(
+        &mut self,
+        seed: &str,
+        prepared: &PreparedFill,
+        source: ColorMetrics,
+        preferred_maximum_alpha: u8,
+        maximum_alpha: u8,
+    ) -> Result<Option<FillCandidate>> {
+        Self::validate_alpha_range(1, preferred_maximum_alpha)?;
+        Self::validate_alpha_range(preferred_maximum_alpha, maximum_alpha)?;
+        let preferred_alphas = PreparedFill::alpha_values(1, preferred_maximum_alpha);
+        if let Some(candidate) =
+            self.find_feasible_overlay(seed, prepared, source, &preferred_alphas)?
+        {
+            return Ok(Some(candidate));
+        }
+        if preferred_maximum_alpha == maximum_alpha {
+            return Ok(None);
+        }
+
+        let remaining_alphas = PreparedFill::alpha_values(1, maximum_alpha)
+            .into_iter()
+            .filter(|alpha| *alpha > preferred_maximum_alpha)
+            .collect::<Vec<_>>();
+        self.find_feasible_overlay(seed, prepared, source, &remaining_alphas)
+    }
+
+    pub(crate) fn try_fit_readable_overlay_preferred(
+        &mut self,
+        seed: &str,
+        request: OverlayFitRequest<'_>,
+        preferred_maximum_alpha: u8,
+        maximum_alpha: u8,
+    ) -> Result<Option<String>> {
+        let prepared = PreparedFill::new(request)?;
+        let source = ColorMetrics::from_hex(seed)?;
+        Ok(self
+            .find_feasible_overlay_in_tiers(
+                seed,
+                &prepared,
+                source,
+                preferred_maximum_alpha,
+                maximum_alpha,
+            )?
+            .map(|candidate| candidate.emitted.hex()))
+    }
+
+    pub(crate) fn fit_readable_overlay_preferred(
+        &mut self,
+        seed: &str,
+        request: OverlayFitRequest<'_>,
+        preferred_maximum_alpha: u8,
+        maximum_alpha: u8,
+    ) -> Result<String> {
+        let prepared = PreparedFill::new(request)?;
+        let source = ColorMetrics::from_hex(seed)?;
+        if let Some(candidate) = self.find_feasible_overlay_in_tiers(
+            seed,
+            &prepared,
+            source,
+            preferred_maximum_alpha,
+            maximum_alpha,
+        )? {
+            return Ok(candidate.emitted.hex());
+        }
+
+        let alpha_values = PreparedFill::alpha_values(1, maximum_alpha);
+        Ok(self
+            .find_best_effort_overlay(seed, &prepared, source, &alpha_values)?
+            .emitted
+            .hex())
+    }
+
+    pub fn fit_readable_overlay_alpha_range(
+        &mut self,
+        seed: &str,
+        request: OverlayFitRequest<'_>,
+        minimum_alpha: u8,
+        maximum_alpha: u8,
+    ) -> Result<String> {
+        Self::validate_alpha_range(minimum_alpha, maximum_alpha)?;
+        let prepared = PreparedFill::new(request)?;
+        let alpha_values = PreparedFill::alpha_values(minimum_alpha, maximum_alpha);
+        let source = ColorMetrics::from_hex(seed)?;
+        if let Some(candidate) =
+            self.find_feasible_overlay(seed, &prepared, source, &alpha_values)?
+        {
+            return Ok(candidate.emitted.hex());
+        }
+        Ok(self
+            .find_best_effort_overlay(seed, &prepared, source, &alpha_values)?
+            .emitted
+            .hex())
     }
 
     fn prepare_overlay_pair(
@@ -1981,9 +2375,7 @@ impl Search {
                     &alpha_values,
                 ));
             }
-            candidates.sort_by(|left, right| {
-                rank_cmp(&left.rank, &right.rank).then_with(|| left.emitted.hex_cmp(right.emitted))
-            });
+            candidates.sort_by(fill_candidate_cmp);
             candidates.dedup_by_key(|candidate| candidate.emitted);
             Ok(candidates)
         };
@@ -2306,52 +2698,26 @@ impl Search {
         let reference_metrics = references
             .iter()
             .map(|(reference, target, delta)| {
-                Ok((ColorMetrics::from_hex(reference)?, *target, *delta))
+                Ok(StateReference {
+                    color: ColorMetrics::from_hex(reference)?,
+                    minimum_contrast: *target,
+                    minimum_delta_e: *delta,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
+        let context = StateCandidateContext {
+            backgrounds: &background_metrics,
+            references: &reference_metrics,
+            target,
+            minimum_delta_e,
+        };
         let mut best: Option<(Rgb24, [f64; 4])> = None;
-        let mut best_effort: Option<(Rgb24, [f64; 4])> = None;
         let table = self.transform_table(seed)?;
 
         for candidate in table.candidates.iter() {
-            let mut final_distance = 0.0;
-            let mut overshoot = 0.0;
-            let mut deficit = 0.0;
-
-            for background in &background_metrics {
-                let ratio = candidate.metrics.contrast(*background);
-                let distance = candidate.metrics.delta_e(*background);
-                deficit += shortfall(ratio, target) + shortfall(distance, minimum_delta_e);
-                overshoot += (ratio - target).max(0.0);
-                final_distance += distance;
-            }
-
-            for (reference, reference_target, reference_delta) in &reference_metrics {
-                let ratio = candidate.metrics.contrast(*reference);
-                deficit += shortfall(ratio, *reference_target)
-                    + shortfall(candidate.metrics.delta_e(*reference), *reference_delta);
-                overshoot += (ratio - *reference_target).max(0.0);
-            }
-
-            let effort_rank = [deficit, candidate.distance, overshoot, -candidate.retention];
-            if best_effort.as_ref().is_none_or(|(best_color, best_rank)| {
-                rank_cmp(&effort_rank, best_rank)
-                    .then_with(|| candidate.metrics.rgb24().cmp(best_color))
-                    == Ordering::Less
-            }) {
-                best_effort = Some((candidate.metrics.rgb24(), effort_rank));
-            }
-            if deficit > 1e-12 {
+            let Some(rank) = context.feasible_rank(candidate) else {
                 continue;
-            }
-
-            let rank = [
-                final_distance,
-                overshoot,
-                candidate.distance,
-                -candidate.retention,
-            ];
-
+            };
             if best.as_ref().is_none_or(|(best_color, best_rank)| {
                 rank_cmp(&rank, best_rank).then_with(|| candidate.metrics.rgb24().cmp(best_color))
                     == Ordering::Less
@@ -2360,8 +2726,22 @@ impl Search {
             }
         }
 
-        Ok(best
-            .or(best_effort)
+        if let Some((color, _)) = best {
+            return Ok(color.hex());
+        }
+
+        let mut best_effort: Option<(Rgb24, [f64; 4])> = None;
+        for candidate in table.candidates.iter() {
+            let rank = context.best_effort_rank(candidate);
+            if best_effort.as_ref().is_none_or(|(best_color, best_rank)| {
+                rank_cmp(&rank, best_rank).then_with(|| candidate.metrics.rgb24().cmp(best_color))
+                    == Ordering::Less
+            }) {
+                best_effort = Some((candidate.metrics.rgb24(), rank));
+            }
+        }
+
+        Ok(best_effort
             .expect("validated state search must have at least one candidate")
             .0
             .hex())
@@ -2473,10 +2853,14 @@ impl Search {
             ColorMetrics::from_hex(seed)
                 .map_err(|error| error.context(format!("distinct color seed[{index}]")))?;
         }
-        for (index, background) in backgrounds.iter().enumerate() {
-            ColorMetrics::from_hex(background)
-                .map_err(|error| error.context(format!("distinct color background[{index}]")))?;
-        }
+        let background_metrics = backgrounds
+            .iter()
+            .enumerate()
+            .map(|(index, background)| {
+                ColorMetrics::from_hex(background)
+                    .map_err(|error| error.context(format!("distinct color background[{index}]")))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut chosen: Vec<String> = Vec::new();
 
         for seed in seeds {
@@ -2488,10 +2872,6 @@ impl Search {
 
             let source_lab = lab(seed)?;
             let seed_chroma = oklab_to_oklch(source_lab)[1];
-            let background_metrics = backgrounds
-                .iter()
-                .map(|background| ColorMetrics::from_hex(background))
-                .collect::<Result<Vec<_>>>()?;
             let chosen_metrics = chosen
                 .iter()
                 .map(|color| {
@@ -2503,68 +2883,29 @@ impl Search {
                 .iter()
                 .map(|(metrics, _)| Rgb24::from_rgba(metrics.rgba.rgba()))
                 .collect::<Vec<_>>();
+            let context = DistinctCandidateContext {
+                backgrounds: &background_metrics,
+                chosen: &chosen_metrics,
+                target,
+                minimum_normal_delta_e: normal_delta_e,
+                minimum_cvd_delta_e: cvd_delta_e,
+            };
 
             let mut considered = BTreeSet::new();
             let mut passing: Option<(Rgb24, [f64; 3])> = None;
-            let mut fallback: Option<(Rgb24, [f64; 6])> = None;
-            let mut consider =
+            let mut consider_passing =
                 |candidate: Rgb24,
                  metrics: ColorMetrics,
                  transform: f64,
                  retention: f64,
-                 passing: &mut Option<(Rgb24, [f64; 3])>,
-                 fallback: &mut Option<(Rgb24, [f64; 6])>| {
+                 passing: &mut Option<(Rgb24, [f64; 3])>| {
                     if !considered.insert(candidate) || chosen_rgb.contains(&candidate) {
                         return;
                     }
-
-                    let mut overshoot = 0.0;
-                    let mut contrast_deficit = 0.0;
-                    for background in &background_metrics {
-                        let ratio = metrics.contrast(*background);
-                        contrast_deficit += shortfall(ratio, target);
-                        overshoot += (ratio - target).max(0.0);
-                    }
-
-                    let candidate_cvd = cvd_labs(metrics.rgba.rgba());
-                    let normal = chosen_metrics
-                        .iter()
-                        .map(|(reference, _)| metrics.delta_e(*reference))
-                        .fold(f64::INFINITY, f64::min);
-                    let cvd = chosen_metrics
-                        .iter()
-                        .map(|(reference, reference_cvd)| {
-                            cvd_distance_facts(
-                                &candidate_cvd,
-                                reference_cvd,
-                                metrics.delta_e(*reference),
-                            )
-                        })
-                        .fold(f64::INFINITY, f64::min);
-
-                    let fallback_rank = [
-                        contrast_deficit,
-                        -normal.min(normal_delta_e),
-                        -cvd.min(cvd_delta_e),
-                        transform,
-                        overshoot,
-                        -retention,
-                    ];
-                    if fallback.as_ref().is_none_or(|(best_color, best_rank)| {
-                        rank_cmp(&fallback_rank, best_rank).then_with(|| candidate.cmp(best_color))
-                            == Ordering::Less
-                    }) {
-                        *fallback = Some((candidate, fallback_rank));
-                    }
-
-                    if contrast_deficit > 1e-12
-                        || normal < normal_delta_e - 1e-12
-                        || cvd < cvd_delta_e - 1e-12
-                    {
+                    let Some(passing_rank) = context.feasible_rank(metrics, transform, retention)
+                    else {
                         return;
-                    }
-
-                    let passing_rank = [transform, overshoot, -retention];
+                    };
                     if passing.as_ref().is_none_or(|(best_color, best_rank)| {
                         rank_cmp(&passing_rank, best_rank).then_with(|| candidate.cmp(best_color))
                             == Ordering::Less
@@ -2577,13 +2918,12 @@ impl Search {
             let fitted_rgb = Rgb24::from_rgba(fitted_metrics.rgba.rgba());
             let fitted_transform = lab_distance(fitted_metrics.lab, source_lab);
             let fitted_retention = lab_chroma(fitted_metrics.lab) / seed_chroma.max(1e-12);
-            consider(
+            consider_passing(
                 fitted_rgb,
                 fitted_metrics,
                 fitted_transform,
                 fitted_retention,
                 &mut passing,
-                &mut fallback,
             );
 
             let table = self.transform_table(seed)?;
@@ -2593,21 +2933,51 @@ impl Search {
                 }) {
                     break;
                 }
-                consider(
+                consider_passing(
                     candidate.metrics.rgb24(),
                     candidate.metrics,
                     candidate.distance,
                     candidate.retention,
                     &mut passing,
-                    &mut fallback,
                 );
             }
 
-            let output = passing
-                .map(|(color, _)| color)
-                .or_else(|| fallback.map(|(color, _)| color))
-                .unwrap_or(fitted_rgb)
-                .hex();
+            let output = if let Some((color, _)) = passing {
+                color
+            } else {
+                let mut considered = BTreeSet::new();
+                let mut fallback: Option<(Rgb24, [f64; 6])> = None;
+                let mut consider_fallback =
+                    |candidate: Rgb24, metrics: ColorMetrics, transform: f64, retention: f64| {
+                        if !considered.insert(candidate) || chosen_rgb.contains(&candidate) {
+                            return;
+                        }
+                        let rank = context.best_effort_rank(metrics, transform, retention);
+                        if fallback.as_ref().is_none_or(|(best_color, best_rank)| {
+                            rank_cmp(&rank, best_rank).then_with(|| candidate.cmp(best_color))
+                                == Ordering::Less
+                        }) {
+                            fallback = Some((candidate, rank));
+                        }
+                    };
+
+                consider_fallback(
+                    fitted_rgb,
+                    fitted_metrics,
+                    fitted_transform,
+                    fitted_retention,
+                );
+                for candidate in table.candidates.iter() {
+                    consider_fallback(
+                        candidate.metrics.rgb24(),
+                        candidate.metrics,
+                        candidate.distance,
+                        candidate.retention,
+                    );
+                }
+                fallback.map_or(fitted_rgb, |(color, _)| color)
+            }
+            .hex();
 
             chosen.push(output);
         }
@@ -2966,6 +3336,16 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(overlay_error.kind(), crate::ErrorKind::InvalidInput);
+
+        let preferred_alpha_error = search
+            .try_fit_readable_overlay_preferred(
+                "#ffffff",
+                OverlayFitRequest::new(&backgrounds, 1.2, 0.01),
+                0,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(preferred_alpha_error.kind(), crate::ErrorKind::InvalidInput);
 
         let frontier_error = search
             .fit_overlay_pair(

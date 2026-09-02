@@ -79,6 +79,24 @@ fn quality_shortfall(actual: f64, target: f64) -> f64 {
     ((target - actual) / target.max(1e-12)).max(0.0)
 }
 
+const PREFERRED_HIGHLIGHT_MAX_ALPHA: u8 = 166;
+
+fn fit_highlight_strict(
+    search: &mut Search,
+    role: &str,
+    seed: &str,
+    request: OverlayFitRequest<'_>,
+) -> Result<Option<String>> {
+    search
+        .try_fit_readable_overlay_preferred(
+            seed,
+            request,
+            PREFERRED_HIGHLIGHT_MAX_ALPHA,
+            OVERLAY_MAX_ALPHA,
+        )
+        .map_err(|error| error.context(role))
+}
+
 fn fit_highlight(
     search: &mut Search,
     role: &str,
@@ -86,7 +104,12 @@ fn fit_highlight(
     request: OverlayFitRequest<'_>,
 ) -> Result<String> {
     search
-        .fit_readable_overlay_bounded(seed, request, OVERLAY_MAX_ALPHA)
+        .fit_readable_overlay_preferred(
+            seed,
+            request,
+            PREFERRED_HIGHLIGHT_MAX_ALPHA,
+            OVERLAY_MAX_ALPHA,
+        )
         .map_err(|error| error.context(role))
 }
 
@@ -1043,21 +1066,46 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         STATE_SELECTED_DELTA_E,
     )
     .with_readable_foregrounds(&readable_editor_overlay_text);
-    let [search_match, search_active] = search.fit_overlay_pair(
+    let sequential_search = match fit_highlight_strict(
+        &mut search,
+        "search.match_background",
         &semantic.yellow,
-        &semantic.accent,
-        OverlayPairRequest::new(
-            search_match_request,
-            search_active_request,
-            PairConstraints::new(
-                SEARCH_MATCH_CONTRAST,
+        search_match_request,
+    )? {
+        Some(search_match) => {
+            let references = [(
+                search_match.clone(),
                 STATE_CONSECUTIVE_CONTRAST,
                 STATE_CONSECUTIVE_DELTA_E,
-                0.0,
-            ),
-        )
-        .with_limits(OVERLAY_MAX_ALPHA, 512),
-    )?;
+            )];
+            fit_highlight_strict(
+                &mut search,
+                "search.active_match_background",
+                &semantic.accent,
+                search_active_request.with_rendered_references(&references),
+            )?
+            .map(|search_active| [search_match, search_active])
+        }
+        None => None,
+    };
+    let [search_match, search_active] = match sequential_search {
+        Some(search) => search,
+        None => search.fit_overlay_pair(
+            &semantic.yellow,
+            &semantic.accent,
+            OverlayPairRequest::new(
+                search_match_request,
+                search_active_request,
+                PairConstraints::new(
+                    SEARCH_MATCH_CONTRAST,
+                    STATE_CONSECUTIVE_CONTRAST,
+                    STATE_CONSECUTIVE_DELTA_E,
+                    0.0,
+                ),
+            )
+            .with_limits(OVERLAY_MAX_ALPHA, 512),
+        )?,
+    };
 
     let document_read = fit_highlight(
         &mut search,

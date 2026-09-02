@@ -57,10 +57,18 @@ fn color_cbrt(value: f64) -> f64 {
     root * exponent_scale * CBRT_EXPONENT_REMAINDERS[exponent_remainder]
 }
 
+#[inline]
+fn luminance_contrast_at_least(left: f64, right: f64, target: f64) -> bool {
+    left.max(right) + 0.05 >= target * (left.min(right) + 0.05)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Rgb24(u32);
 
 impl Rgb24 {
+    pub(crate) const BLACK: Self = Self(0x000000);
+    pub(crate) const WHITE: Self = Self(0xffffff);
+
     pub(crate) fn from_rgba(value: Rgba) -> Self {
         Self(
             (u32::from(byte(value.r)) << 16)
@@ -204,6 +212,11 @@ impl PreparedColor {
         (self.luminance.max(other.luminance) + 0.05) / (self.luminance.min(other.luminance) + 0.05)
     }
 
+    #[inline]
+    pub(crate) fn contrast_at_least(self, other: ColorMetrics, target: f64) -> bool {
+        luminance_contrast_at_least(self.luminance, other.luminance, target)
+    }
+
     pub fn metrics(self) -> ColorMetrics {
         ColorMetrics {
             rgba: self.rgba,
@@ -276,6 +289,11 @@ impl ColorMetrics {
 
     pub fn contrast(self, other: Self) -> f64 {
         (self.luminance.max(other.luminance) + 0.05) / (self.luminance.min(other.luminance) + 0.05)
+    }
+
+    #[inline]
+    pub(crate) fn contrast_at_least(self, other: Self, target: f64) -> bool {
+        luminance_contrast_at_least(self.luminance, other.luminance, target)
     }
 
     pub fn delta_e(self, other: Self) -> f64 {
@@ -806,6 +824,23 @@ mod tests {
             for bits in threshold.to_bits() - 1..=threshold.to_bits() + 1 {
                 let channel = f64::from_bits(bits);
                 assert_eq!(linear_byte(channel), byte(linear_to_srgb(channel)));
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_threshold_check_matches_ratio_comparison() {
+        let targets = [1.0, 1.001, 1.01, 1.08, 1.12, 1.5, 3.0, 4.5, 7.0, 21.0];
+        for &left in linear_channel_table() {
+            for &right in linear_channel_table() {
+                let ratio = (left.max(right) + 0.05) / (left.min(right) + 0.05);
+                for target in targets {
+                    assert_eq!(
+                        luminance_contrast_at_least(left, right, target),
+                        ratio >= target,
+                        "left={left} right={right} target={target} ratio={ratio}",
+                    );
+                }
             }
         }
     }
