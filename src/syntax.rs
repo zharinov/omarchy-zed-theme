@@ -218,6 +218,7 @@ fn allocate_family(search: &mut Search, request: FamilyFitRequest<'_>) -> Result
             0.0,
         )
     };
+
     let fit = fit_tone(
         search,
         ToneFitRequest {
@@ -241,6 +242,7 @@ fn allocate_family(search: &mut Search, request: FamilyFitRequest<'_>) -> Result
         "bounded syntax family {} escaped its chroma envelope: {output_chroma:.6} > {chroma_cap:.6}",
         request.family
     );
+
     Ok(FamilyAllocation {
         family: request.family,
         roles: Vec::new(),
@@ -300,24 +302,25 @@ fn semantic_score(
             continue;
         }
 
-        if semantic.parent.is_none() {
-            score.trunk_count += 1;
-            let allocation = allocations
-                .iter()
-                .find(|allocation| allocation.family == family)
-                .expect("active syntax trunk must have an allocation");
-            if let Some(source) = allocation.source {
-                score.authored_trunk_count += 1;
-                if let Some(cluster) = source_cluster(profile, source) {
-                    clusters.insert(cluster);
-                }
-                let evidence = &profile.evidence[source];
-                score.source_preference +=
-                    source_preference_value(semantic.source_preference, evidence);
-            }
-        } else {
+        if semantic.parent.is_some() {
             score.branch_count += 1;
+            continue;
         }
+
+        score.trunk_count += 1;
+        let allocation = allocations
+            .iter()
+            .find(|allocation| allocation.family == family)
+            .expect("active syntax trunk must have an allocation");
+        let Some(source) = allocation.source else {
+            continue;
+        };
+        score.authored_trunk_count += 1;
+        if let Some(cluster) = source_cluster(profile, source) {
+            clusters.insert(cluster);
+        }
+        let evidence = &profile.evidence[source];
+        score.source_preference += source_preference_value(semantic.source_preference, evidence);
     }
 
     score.hue_cluster_count = clusters.len();
@@ -492,6 +495,7 @@ fn search_semantic_forest(
         search_semantic_forest(search, request, family + 1, allocations, best, prune)?;
         allocations.pop();
     }
+
     Ok(())
 }
 
@@ -531,6 +535,7 @@ fn select_semantic_plan_with_pruning(
         let family = &plan.families[family];
         allocation.roles = family.roles.clone();
     }
+
     Ok(SemanticPlan { plan, allocations })
 }
 
@@ -623,6 +628,7 @@ pub fn build_syntax(
             "syntax generation requires ordinary and rendered contexts",
         ));
     }
+
     for (name, value) in [
         ("saliency reference", saliency_reference),
         ("predictive", predictive),
@@ -632,6 +638,7 @@ pub fn build_syntax(
     for (index, source) in diff_sources.iter().enumerate() {
         validate_opaque_hex(source, format_args!("diff source {index}"))?;
     }
+
     for (kind, values) in [
         ("ordinary syntax context", preference_contexts),
         ("rendered syntax context", required_contexts),
@@ -640,6 +647,7 @@ pub fn build_syntax(
             validate_opaque_hex(value, format_args!("{kind} {index}"))?;
         }
     }
+
     match build_syntax_from_validated_inputs(
         search,
         palette,
@@ -698,6 +706,7 @@ fn build_syntax_from_validated_inputs(
             role_colors.insert(*role, allocation.output.clone());
         }
     }
+
     for role in plan::ORDINARY_ROLES {
         if semantic_plan.family_for(role).is_some() {
             continue;
@@ -766,6 +775,7 @@ fn capture_style(capture: &str) -> (Option<&'static str>, Option<u16>) {
             | "link_uri"
     )
     .then_some("italic");
+
     let weight = if capture == "emphasis.strong" || capture == "title" {
         Some(700)
     } else if matches!(
@@ -811,6 +821,7 @@ mod tests {
             colors.insert(key.to_owned(), "#777777".to_owned());
             provenance.insert(key.to_owned(), Provenance::Derived);
         }
+
         for (index, key) in SOURCE_KEY_ORDER[..5].iter().enumerate() {
             colors.insert(
                 (*key).to_owned(),
@@ -838,6 +849,7 @@ mod tests {
             colors.insert(key.to_owned(), "#777777".to_owned());
             provenance.insert(key.to_owned(), Provenance::Derived);
         }
+
         for (index, key) in SOURCE_KEY_ORDER[..source_count].iter().enumerate() {
             let source = usize::from(source_aliases[index]) % source_count;
             let hue = f64::from(hue_degrees[source]).to_radians();
@@ -949,6 +961,7 @@ mod tests {
     fn root_sources_never_truncates_authored_candidates() {
         let profile = five_source_profile();
         let sources = root_sources(&profile, SemanticRole::Callable);
+
         assert_eq!(sources.len(), 6);
         assert_eq!(
             sources.into_iter().collect::<BTreeSet<_>>(),
@@ -982,6 +995,7 @@ mod tests {
             false,
         )
         .unwrap();
+
         assert_eq!(pruned.plan, exhaustive.plan);
         assert_eq!(pruned.allocations, exhaustive.allocations);
     }

@@ -119,6 +119,7 @@ impl MergePlan {
                 parent_saliency_delta: -0.22,
             },
         ];
+
         Self { families }
     }
 
@@ -128,13 +129,15 @@ impl MergePlan {
             "active syntax family indices must belong to the hierarchy"
         );
         for index in active {
-            if let Some(parent) = self.families[*index].parent {
-                assert!(
-                    active.contains(&parent),
-                    "active syntax branches must retain their parent family"
-                );
-            }
+            let Some(parent) = self.families[*index].parent else {
+                continue;
+            };
+            assert!(
+                active.contains(&parent),
+                "active syntax branches must retain their parent family"
+            );
         }
+
         let value_active =
             self.families.iter().enumerate().any(|(index, family)| {
                 active.contains(&index) && family.anchor == SemanticRole::Value
@@ -185,6 +188,7 @@ impl MergePlan {
                 family
             })
             .collect::<Vec<_>>();
+
         Self { families }
     }
 
@@ -216,6 +220,7 @@ mod tests {
             .iter()
             .flat_map(|family| family.roles.iter().copied())
             .collect::<Vec<_>>();
+
         assert_eq!(
             roles.iter().copied().collect::<BTreeSet<_>>().len(),
             roles.len()
@@ -230,6 +235,7 @@ mod tests {
     #[test]
     fn inactive_branches_merge_into_their_semantic_roots() {
         let plan = MergePlan::hierarchy().activate(&BTreeSet::from([0, 1, 2]));
+
         assert_eq!(plan.family_for(SemanticRole::Control), Some(2));
         assert_eq!(plan.family_for(SemanticRole::Link), Some(0));
         assert_eq!(
@@ -247,6 +253,7 @@ mod tests {
     fn one_failed_branch_does_not_remove_other_trunks_or_branches() {
         let hierarchy = MergePlan::hierarchy();
         let plan = hierarchy.activate(&BTreeSet::from([0, 1, 2, 4]));
+
         assert_eq!(plan.family_for(SemanticRole::Control), Some(2));
         assert_eq!(plan.family_for(SemanticRole::Value), Some(0));
         assert_ne!(
@@ -262,6 +269,7 @@ mod tests {
     #[test]
     fn activation_rejects_invalid_family_sets() {
         let hierarchy = MergePlan::hierarchy();
+
         for active in [BTreeSet::from([3]), BTreeSet::from([usize::MAX])] {
             assert!(std::panic::catch_unwind(|| hierarchy.activate(&active)).is_err());
         }

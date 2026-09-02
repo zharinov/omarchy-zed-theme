@@ -35,6 +35,7 @@ struct TransformTableData {
     // Tables that never participate in a color-vision pair allocate no CVD cache.
     cvd: OnceLock<Box<[OnceLock<Box<CvdLabs>>]>>,
 }
+
 type TransformTable = Arc<TransformTableData>;
 
 #[derive(Hash, PartialEq, Eq)]
@@ -187,6 +188,7 @@ impl MetricBand {
                 )));
             }
         }
+
         Ok(())
     }
 }
@@ -222,6 +224,7 @@ impl FitBounds {
                 "lower lightness cannot exceed upper lightness",
             ));
         }
+
         finite_at_least("lower chroma", self.lower_chroma, 0.0)?;
         if self.upper_chroma.is_nan() || self.upper_chroma < 0.0 {
             return Err(Error::invalid(
@@ -231,6 +234,7 @@ impl FitBounds {
         if self.lower_chroma > self.upper_chroma {
             return Err(Error::invalid("lower chroma cannot exceed upper chroma"));
         }
+
         Ok(())
     }
 }
@@ -279,6 +283,7 @@ impl<'a> StateFitRequest<'a> {
             valid_contrast("state reference contrast", *reference_target)?;
             finite_at_least("state reference delta E", *reference_delta, 0.0)?;
         }
+
         Ok(())
     }
 }
@@ -360,11 +365,13 @@ impl PairConstraints {
         finite_at_least("CVD delta E", self.cvd_delta, 0.0)?;
         finite_at_least("lightness delta", self.lightness_delta, 0.0)?;
         finite_at_least("minimum chroma", self.minimum_chroma, 0.0)?;
+
         if let Some((contrast, normal, cvd)) = self.separation_alternative {
             valid_contrast("alternative pair contrast", contrast)?;
             finite_at_least("alternative normal delta E", normal, 0.0)?;
             finite_at_least("alternative CVD delta E", cvd, 0.0)?;
         }
+
         Ok(())
     }
 }
@@ -449,18 +456,22 @@ impl<'a> OverlayFitRequest<'a> {
             valid_contrast("runtime target contrast", contrast)?;
             finite_at_least("runtime minimum delta E", delta, 0.0)?;
         }
+
         for (_, target) in self.readable_foregrounds {
             valid_contrast("readable foreground contrast", *target)?;
         }
+
         for (_, target, delta) in self.rendered_references {
             valid_contrast("rendered reference contrast", *target)?;
             finite_at_least("rendered reference delta E", *delta, 0.0)?;
         }
+
         for (_, target, delta, base_step) in self.runtime_rendered_references {
             valid_contrast("runtime reference contrast", *target)?;
             finite_at_least("runtime reference delta E", *delta, 0.0)?;
             finite_at_least("runtime reference base step", *base_step, 0.0)?;
         }
+
         Ok(())
     }
 }
@@ -522,6 +533,7 @@ impl<'a> OverlayPairRequest<'a> {
                 "overlay frontier limit must be at least 128",
             ));
         }
+
         Ok(())
     }
 }
@@ -532,6 +544,7 @@ fn finite_at_least(name: &str, value: f64, minimum: f64) -> Result<()> {
             "{name} must be finite and at least {minimum}, got {value:?}"
         )));
     }
+
     Ok(())
 }
 
@@ -541,6 +554,7 @@ fn finite_in_range(name: &str, value: f64, minimum: f64, maximum: f64) -> Result
             "{name} must be finite and in {minimum}..={maximum}, got {value:?}"
         )));
     }
+
     Ok(())
 }
 
@@ -577,14 +591,17 @@ fn select_alpha_candidates<const KEEP_HIGHEST: bool>(
         let replace = best
             .as_ref()
             .is_none_or(|best| fill_candidate_cmp(&candidate, best) == Ordering::Less);
-        if KEEP_HIGHEST {
+        if !KEEP_HIGHEST {
             if replace {
-                best = Some(candidate.clone());
+                best = Some(candidate);
             }
-            highest = Some(candidate);
-        } else if replace {
-            best = Some(candidate);
+            continue;
         }
+
+        if replace {
+            best = Some(candidate.clone());
+        }
+        highest = Some(candidate);
     }
 
     (best, highest)
@@ -683,6 +700,7 @@ fn overlay_frontier(candidates: &[FillCandidate], limit: usize) -> Vec<FillCandi
         .take(limit / 2)
         .cloned()
         .collect::<Vec<_>>();
+
     let mut alpha_order = candidates.iter().collect::<Vec<_>>();
     alpha_order.sort_by(|left, right| {
         right
@@ -692,6 +710,7 @@ fn overlay_frontier(candidates: &[FillCandidate], limit: usize) -> Vec<FillCandi
             .then_with(|| fill_candidate_cmp(left, right))
     });
     selected.extend(alpha_order.into_iter().take(limit / 2).cloned());
+
     selected.sort_by_key(|candidate| candidate.emitted);
     selected.dedup_by_key(|candidate| candidate.emitted);
     selected
@@ -705,6 +724,7 @@ fn overlay_fallback_frontier(candidates: &[FillCandidate], limit: usize) -> Vec<
         .take(ranked_count)
         .cloned()
         .collect::<Vec<_>>();
+
     let mut salient = candidates.iter().collect::<Vec<_>>();
     salient.sort_by(|left, right| {
         left.rank[0]
@@ -715,6 +735,7 @@ fn overlay_fallback_frontier(candidates: &[FillCandidate], limit: usize) -> Vec<
             .then_with(|| left.emitted.hex_cmp(right.emitted))
     });
     selected.extend(salient.into_iter().take(salient_count).cloned());
+
     selected.sort_by_key(|candidate| candidate.emitted);
     selected.dedup_by_key(|candidate| candidate.emitted);
     selected
@@ -732,6 +753,7 @@ impl PreparedFill {
         if maximum_alpha > 0 {
             values.push(maximum_alpha);
         }
+
         values.sort_unstable();
         values.dedup();
         values
@@ -755,11 +777,13 @@ impl PreparedFill {
             .iter()
             .map(|background| ColorMetrics::from_hex(background))
             .collect::<Result<Vec<_>>>()?;
+
         let readable_foregrounds = request
             .readable_foregrounds
             .iter()
             .map(|(foreground, target)| Ok((ColorMetrics::from_hex(foreground)?, *target)))
             .collect::<Result<Vec<_>>>()?;
+
         let rendered_reference_specs = request
             .rendered_references
             .iter()
@@ -771,6 +795,7 @@ impl PreparedFill {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+
         let rendered_references = backgrounds
             .iter()
             .map(|background| {
@@ -786,6 +811,7 @@ impl PreparedFill {
                     .collect()
             })
             .collect();
+
         let runtime_reference_specs = request
             .runtime_rendered_references
             .iter()
@@ -800,6 +826,7 @@ impl PreparedFill {
                 },
             )
             .collect::<Result<Vec<_>>>()?;
+
         let runtime_rendered_references = backgrounds
             .iter()
             .map(|background| {
@@ -825,6 +852,7 @@ impl PreparedFill {
                     .collect()
             })
             .collect();
+
         Ok(Self {
             backgrounds,
             readability_backgrounds,
@@ -944,6 +972,7 @@ impl PreparedFill {
             {
                 return None;
             }
+
             let ratio = rendered_prepared.contrast(*background);
             if self
                 .contrast
@@ -987,6 +1016,7 @@ impl PreparedFill {
                 }
                 None => None,
             };
+
             let rendered = rendered_prepared.metrics();
             let rendered_distance = rendered.delta_e(*background);
             if rendered_distance < self.delta_e.minimum() - 1e-12
@@ -1002,6 +1032,7 @@ impl PreparedFill {
             {
                 return None;
             }
+
             minimum_ratio = minimum_ratio.min(ratio);
             overshoot += (ratio - self.contrast.minimum()).max(0.0);
             final_distance += rendered_distance;
@@ -1029,6 +1060,7 @@ impl PreparedFill {
                 final_distance += runtime_distance;
             }
         }
+
         for background in &self.readability_backgrounds {
             let rendered = ColorMetrics::blend_rgb24(*background, opaque_rgb, alpha);
             if self
@@ -1054,9 +1086,11 @@ impl PreparedFill {
                 }
             }
         }
+
         if minimum_ratio < self.contrast.minimum() - 1e-12 {
             return None;
         }
+
         let candidate = Rgba32::from_rgb_alpha(opaque_rgb, alpha);
         let presentation_distance =
             if self.contrast.preferred().is_some() || self.delta_e.preferred().is_some() {
@@ -1329,6 +1363,7 @@ impl DistinctCandidateContext<'_> {
             contrast_deficit += shortfall(ratio, self.target);
             overshoot += (ratio - self.target).max(0.0);
         }
+
         let candidate_cvd = cvd_labs(metrics.rgba.rgba());
         let normal = self
             .chosen
@@ -1565,6 +1600,7 @@ fn pair_best_effort_frontier(
             &mut frontier,
         );
     }
+
     frontier
 }
 
@@ -1654,6 +1690,7 @@ fn color_contrasts_satisfy(
             }
         }
     }
+
     true
 }
 
@@ -1707,6 +1744,7 @@ impl Search {
                 ));
             }
         }
+
         unique.sort_unstable();
         unique.dedup();
         Ok(unique)
@@ -1971,6 +2009,7 @@ impl Search {
             if mode == PairCandidateMode::Feasible && constraint_deficit > 1e-12 {
                 continue;
             }
+
             let background_distance = if constraints.prefer_background {
                 inputs
                     .backgrounds
@@ -2066,6 +2105,7 @@ impl Search {
         if first_backgrounds.is_empty() || second_backgrounds.is_empty() {
             return Err(Error::invalid("fit_pair requires at least one background"));
         }
+
         let readable_metrics = readable_foregrounds
             .iter()
             .enumerate()
@@ -2077,6 +2117,7 @@ impl Search {
                 Ok((foreground, *target))
             })
             .collect::<Result<Vec<_>>>()?;
+
         let first_inputs = self.prepare_pair_candidate_inputs(first_seed, first_backgrounds)?;
         let second_inputs = self.prepare_pair_candidate_inputs(second_seed, second_backgrounds)?;
         let first = Self::collect_pair_candidates(
@@ -2260,6 +2301,7 @@ impl Search {
         let colors = best_effort
             .expect("validated pair search must have candidate colors")
             .0;
+
         Ok([colors[0].hex(), colors[1].hex()])
     }
 
@@ -2362,6 +2404,7 @@ impl Search {
             PerBackgroundContrast::Floors(values) => validate_values(values, "floor"),
             PerBackgroundContrast::Ceilings(values) => validate_values(values, "ceiling"),
         }?;
+
         let query = ColorQuery {
             seed: seed.to_owned(),
             backgrounds: backgrounds.to_vec(),
@@ -2378,6 +2421,7 @@ impl Search {
         if let Some(result) = self.color_results.get(&query) {
             return result.clone();
         }
+
         let result = self.fit_color_bounded_uncached(
             seed,
             backgrounds,
@@ -2387,6 +2431,7 @@ impl Search {
             bounds,
         );
         self.color_results.insert(query, result.clone());
+
         result
     }
 
@@ -2402,6 +2447,7 @@ impl Search {
         if backgrounds.is_empty() || preference_backgrounds.is_empty() {
             return Err(Error::invalid("fit_color requires at least one background"));
         }
+
         let source_metrics = opaque_color_metrics(seed, "fit_color seed")?;
         let source_chroma = lab_chroma(source_metrics.lab);
         let source_retention = source_chroma / source_chroma.max(1e-12);
@@ -2428,12 +2474,14 @@ impl Search {
             {
                 return false;
             }
+
             if bounds.lower_chroma > 0.0 || bounds.upper_chroma.is_finite() {
                 let chroma = lab_chroma(candidate.lab);
                 if chroma < bounds.lower_chroma - 1e-12 || chroma > bounds.upper_chroma + 1e-12 {
                     return false;
                 }
             }
+
             for other in &avoid_metrics {
                 if (candidate.lab[0] - other.lab[0]).abs() < 0.05 - 1e-12
                     || candidate.delta_e(*other) < 0.10 - 1e-12
@@ -2666,6 +2714,7 @@ impl Search {
                 "overlay minimum alpha cannot exceed maximum alpha",
             ));
         }
+
         Ok(())
     }
 
@@ -2797,6 +2846,7 @@ impl Search {
     ) -> Result<String> {
         let prepared = PreparedFill::new(request)?;
         let source = ColorMetrics::from_hex(seed)?;
+
         if let Some(candidate) = self.find_feasible_overlay_in_tiers(
             seed,
             &prepared,
@@ -2825,6 +2875,7 @@ impl Search {
         let prepared = PreparedFill::new(request)?;
         let alpha_values = PreparedFill::alpha_values(minimum_alpha, maximum_alpha);
         let source = ColorMetrics::from_hex(seed)?;
+
         if let Some(candidate) =
             self.find_feasible_overlay(seed, &prepared, source, &alpha_values)?
         {
@@ -2878,6 +2929,7 @@ impl Search {
             {
                 candidates.push(source);
             }
+
             if include_best_effort || candidates.is_empty() {
                 candidates.extend(
                     table
@@ -2903,6 +2955,7 @@ impl Search {
             }
             candidates.sort_by(fill_candidate_cmp);
             candidates.dedup_by_key(|candidate| candidate.emitted);
+
             Ok(candidates)
         };
 
@@ -2930,6 +2983,7 @@ impl Search {
                 )
             },
         );
+
         Ok(PreparedOverlayPair {
             first,
             second,
@@ -3150,6 +3204,7 @@ impl Search {
         let colors = best_effort
             .expect("validated overlay pair search must have candidate colors")
             .0;
+
         Ok(Some([colors[0].hex(), colors[1].hex()]))
     }
 
@@ -3212,8 +3267,10 @@ impl Search {
         if let Some(result) = self.state_results.get(&query) {
             return result.clone();
         }
+
         let result = self.fit_state_uncached(seed, request);
         self.state_results.insert(query, result.clone());
+
         result
     }
 
@@ -3312,10 +3369,12 @@ impl Search {
                 "fit_distinct_colors requires at least one background",
             ));
         }
+
         for (index, seed) in seeds.iter().enumerate() {
             ColorMetrics::from_hex(seed)
                 .map_err(|error| error.context(format!("distinct color seed[{index}]")))?;
         }
+
         let background_metrics = backgrounds
             .iter()
             .enumerate()
@@ -3582,6 +3641,7 @@ fn cvd_distance_precomputed(
 ) -> f64 {
     let first_metrics = first_table.candidates[first.source_index].metrics;
     let second_metrics = second_table.candidates[second.source_index].metrics;
+
     let first_cache = first_table.cvd.get_or_init(|| {
         std::iter::repeat_with(OnceLock::new)
             .take(first_table.candidates.len())
@@ -3596,6 +3656,7 @@ fn cvd_distance_precomputed(
         .get_or_init(|| Box::new(cvd_labs(first_metrics.rgba.rgba())));
     let second_cvd = &**second_cache[second.source_index]
         .get_or_init(|| Box::new(cvd_labs(second_metrics.rgba.rgba())));
+
     cvd_distance_facts(first_cvd, second_cvd, normal_delta)
 }
 

@@ -112,6 +112,7 @@ fn malformed_resolved_palettes_are_rejected() {
 
     let mut missing_provenance = synthetic_palette();
     missing_provenance.provenance.remove("green");
+
     let profile_error = measure(&missing_provenance).unwrap_err();
     assert_eq!(profile_error.kind(), ErrorKind::InvalidInput);
     assert!(profile_error.to_string().contains("provenance: green"));
@@ -119,6 +120,7 @@ fn malformed_resolved_palettes_are_rejected() {
     let mut missing_syntax_color = synthetic_palette();
     missing_syntax_color.colors.remove("muted");
     let mut search = Search::default();
+
     let syntax_error = build_syntax(
         &mut search,
         &missing_syntax_color,
@@ -205,6 +207,7 @@ fn syntax_inputs_must_be_opaque_colors() {
 fn missing_palette_file_is_an_external_failure() {
     let missing = temporary("missing-palette");
     let error = resolve_palette(&missing, None).unwrap_err();
+
     assert_eq!(error.kind(), ErrorKind::External);
     assert!(error.to_string().contains(&missing.display().to_string()));
 }
@@ -338,6 +341,7 @@ fn strong_two_cluster_profile_assigns_distinct_semantic_roots() {
 
     let document = build_theme(&palette).unwrap();
     let syntax = style(&document)["syntax"].as_object().unwrap();
+
     assert_ne!(syntax["string"]["color"], syntax["type"]["color"]);
 }
 
@@ -378,6 +382,7 @@ fn narrow_multicluster_palette_uses_a_fixed_semantic_forest() {
 fn palette_native_syntax_preserves_branch_sources() {
     let document = build_theme(&synthetic_palette()).unwrap();
     let syntax = style(&document)["syntax"].as_object().unwrap();
+
     assert_ne!(syntax["string"]["color"], syntax["type"]["color"]);
     assert_ne!(syntax["type"]["color"], syntax["function"]["color"]);
 }
@@ -414,6 +419,7 @@ fn a_scarce_but_perceptible_authored_hue_is_not_discarded() {
 
     let document = build_theme(&palette).unwrap();
     let style = style(&document);
+
     assert_ne!(
         style["syntax"]["string"]["color"],
         style["editor.foreground"]
@@ -457,6 +463,7 @@ fn syntax_profile_does_not_reassign_diff_source_families() {
         let hue_distance = (source[2] - output[2])
             .abs()
             .min(std::f64::consts::TAU - (source[2] - output[2]).abs());
+
         assert!(
             hue_distance < 0.03,
             "{capture} left the {source_key} hue family"

@@ -16,6 +16,7 @@ const fn cbrt_reference(value: f64) -> f64 {
         estimate = (2.0 * estimate + value / (estimate * estimate)) / 3.0;
         iteration += 1;
     }
+
     estimate
 }
 
@@ -26,6 +27,7 @@ const fn cbrt_table() -> [f64; CBRT_TABLE_SIZE + 1] {
         table[index] = cbrt_reference(1.0 + index as f64 / CBRT_TABLE_SIZE as f64);
         index += 1;
     }
+
     table
 }
 
@@ -98,6 +100,7 @@ impl Rgb24 {
             // exact rounded output without repeated float conversions.
             (base * (255 - alpha) + overlay * alpha + 127) / 255
         };
+
         Self((blend_channel(16) << 16) | (blend_channel(8) << 8) | blend_channel(0))
     }
 
@@ -371,6 +374,7 @@ pub fn parse_hex(value: &str) -> Result<Rgba> {
             .map(|part| part as f64 / 255.0)
             .map_err(|_| Error::invalid(format!("invalid hex color: {value:?}")))
     };
+
     Ok(Rgba {
         r: parse(1..3)?,
         g: parse(3..5)?,
@@ -388,6 +392,7 @@ pub(crate) fn validate_opaque_hex(value: &str, label: impl std::fmt::Display) ->
             "{label} must be a six-digit hex color, got {value:?}"
         )));
     }
+
     Ok(())
 }
 
@@ -459,6 +464,7 @@ pub(crate) fn oklab_to_rgb(lab: [f64; 3], alpha: f64) -> Rgba {
         alpha.is_finite() && (0.0..=1.0).contains(&alpha),
         "internal alpha must be finite and in 0..=1"
     );
+
     let [r, g, b] = oklab_to_linear_rgb(lab);
     Rgba {
         r: linear_to_srgb(r),
@@ -492,6 +498,7 @@ fn smoothstep(edge0: f64, edge1: f64, value: f64) -> f64 {
     if edge0 == edge1 {
         return 0.0;
     }
+
     let position = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     position * position * (3.0 - 2.0 * position)
 }
@@ -512,6 +519,7 @@ pub fn gamut_map_oklch(lightness: f64, chroma: f64, hue: f64) -> Result<Rgba> {
             "OKLCH hue must be finite, got {hue:?}"
         )));
     }
+
     Ok(gamut_map_oklch_unchecked(lightness, chroma, hue))
 }
 
@@ -525,10 +533,12 @@ pub(crate) fn gamut_map_oklch_unchecked(lightness: f64, chroma: f64, hue: f64) -
         "internal OKLCH chroma must be finite and non-negative"
     );
     assert!(hue.is_finite(), "internal OKLCH hue must be finite");
+
     let candidate = oklch_to_oklab([lightness, chroma, hue]);
     if in_gamut(candidate) {
         return oklab_to_rgb(candidate, 1.0);
     }
+
     gamut_map_oklch_with_limit(lightness, chroma, hue, gamut_chroma_limit(lightness, hue))
 }
 
@@ -594,6 +604,7 @@ pub(crate) fn gamut_map_oklch_with_limit(
         !chroma_limit.is_nan() && chroma_limit >= 0.0,
         "internal gamut chroma limit must be non-negative and not NaN"
     );
+
     gamut_map_oklch_with_components(lightness, chroma, hue.cos(), hue.sin(), chroma_limit)
 }
 
@@ -620,6 +631,7 @@ pub(crate) fn gamut_map_oklch_with_components(
         !chroma_limit.is_nan() && chroma_limit >= 0.0,
         "internal gamut chroma limit must be non-negative and not NaN"
     );
+
     oklab_to_rgb(
         [
             lightness,
@@ -682,6 +694,7 @@ pub(crate) fn geometric_contrast(color: &str, backgrounds: &[String]) -> Result<
             "geometric contrast requires at least one background",
         ));
     }
+
     let mean_log = backgrounds
         .iter()
         .map(|background| contrast_ratio(color, background).map(f64::ln))
@@ -745,6 +758,7 @@ pub fn tone(value: &str, target_lightness: f64, chroma_scale: f64) -> Result<Str
             "chroma scale must be finite and non-negative, got {chroma_scale:?}"
         )));
     }
+
     let [_, chroma, hue] = oklab_to_oklch(lab(value)?);
     Ok(gamut_map_oklch_unchecked(
         target_lightness,
@@ -760,6 +774,7 @@ fn finite_unit_interval(name: &str, value: f64) -> Result<()> {
             "{name} must be finite and in 0..=1, got {value:?}"
         )));
     }
+
     Ok(())
 }
 

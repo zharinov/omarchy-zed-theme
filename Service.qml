@@ -59,6 +59,7 @@ Item {
       fail("invalid plugin version")
       return
     }
+
     if (pluginDirectory.charAt(0) !== "/") {
       fail("cannot locate its plugin directory")
       return
@@ -181,6 +182,7 @@ Item {
         root.fail("unsupported CPU architecture: " + architecture)
         return
       }
+
       root.asset = "omarchy-zed-theme-" + root.target
       binaryExistsProcess.command = ["test", "-x", root.binaryPath]
       binaryExistsProcess.running = true
@@ -190,13 +192,14 @@ Item {
   Process {
     id: binaryExistsProcess
     onExited: function(exitCode) {
-      if (exitCode === 0) {
-        installedVersionProcess.command = [root.binaryPath, "--version"]
-        installedVersionProcess.running = true
-      } else {
+      if (exitCode !== 0) {
         createRuntimeProcess.command = ["mkdir", "-p", root.runtimeDirectory]
         createRuntimeProcess.running = true
+        return
       }
+
+      installedVersionProcess.command = [root.binaryPath, "--version"]
+      installedVersionProcess.running = true
     }
   }
 
@@ -228,9 +231,10 @@ Item {
         const detail = String(activationErrorOutput.text || "").trim()
         root.fail("cannot select the Omarchy theme in Zed"
           + (detail ? ": " + detail : ""))
-      } else {
-        root.activationPending = false
+        return
       }
+
+      root.activationPending = false
     }
   }
 

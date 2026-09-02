@@ -377,6 +377,7 @@ fn assign_semantic_families(
     ] {
         palette.colors.insert(key.into(), value.clone());
     }
+
     for (key, index) in [
         ("color1", 0),
         ("color2", 4),
@@ -387,6 +388,7 @@ fn assign_semantic_families(
     ] {
         palette.colors.insert(key.into(), normal[index].clone());
     }
+
     for (key, index) in [
         ("color9", 0),
         ("color10", 4),
@@ -403,6 +405,7 @@ pub fn apply_color_mutation(palette: &mut ResolvedPalette, mutation: &PaletteMut
     let set = |palette: &mut ResolvedPalette, key: &str, value: String| {
         palette.colors.insert(key.to_owned(), value);
     };
+
     match mutation {
         PaletteMutation::Random(values) => {
             for (index, value) in values {
@@ -468,6 +471,7 @@ pub fn apply_color_mutation(palette: &mut ResolvedPalette, mutation: &PaletteMut
             } else {
                 (0.46, 0.36)
             };
+
             let normal = std::array::from_fn(|index| {
                 let offset = (index as f64 / 7.0 - 0.5) * spread;
                 color(normal_lightness, chroma, hue + offset)
@@ -476,6 +480,7 @@ pub fn apply_color_mutation(palette: &mut ResolvedPalette, mutation: &PaletteMut
                 let offset = (index as f64 / 7.0 - 0.5) * spread;
                 color(bright_lightness, chroma * 0.9, hue + offset)
             });
+
             assign_semantic_families(palette, normal, bright);
         }
         PaletteMutation::NeutralSemantics { lightness_step } => {
@@ -484,6 +489,7 @@ pub fn apply_color_mutation(palette: &mut ResolvedPalette, mutation: &PaletteMut
             } else {
                 105_u8.saturating_sub(*lightness_step)
             };
+
             let normal = std::array::from_fn(|index| {
                 let value = center.saturating_add(index as u8 * 3);
                 hex([value, value, value])
@@ -496,6 +502,7 @@ pub fn apply_color_mutation(palette: &mut ResolvedPalette, mutation: &PaletteMut
                 };
                 hex([value, value, value])
             });
+
             assign_semantic_families(palette, normal, bright);
         }
     }

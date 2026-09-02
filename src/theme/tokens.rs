@@ -241,6 +241,7 @@ impl ThemeTokens {
             &["editor.foreground"],
             &self.content.editor_primary,
         );
+
         push_overlay(
             &mut roles,
             &["element.hover"],

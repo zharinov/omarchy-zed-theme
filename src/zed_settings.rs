@@ -53,6 +53,7 @@ fn theme_property(object: &CstObject) -> Result<Option<CstObjectProp>> {
 
         found = Some(property);
     }
+
     Ok(found)
 }
 
@@ -161,6 +162,7 @@ fn remove_compact_theme(
     } else if source[..start].ends_with(", ") {
         start -= 2;
     }
+
     let mut output = source.to_owned();
     output.replace_range(start..end, "");
     Ok(output)
@@ -195,6 +197,7 @@ fn state_content(state: &ActivationState) -> Result<Vec<u8>> {
     if let Some(theme) = &state.previous_theme {
         object.insert("previous_theme".into(), theme.clone());
     }
+
     let mut content = serde_json::to_string_pretty(&Value::Object(object))?;
     content.push('\n');
     Ok(content.into_bytes())
@@ -209,6 +212,7 @@ fn parse_state(content: &[u8]) -> Result<ActivationState> {
     if object.get("version").and_then(Value::as_u64) != Some(STATE_VERSION) {
         return Err(Error::invalid("unsupported saved Zed theme state version"));
     }
+
     let active = object
         .get("active")
         .and_then(Value::as_bool)
@@ -241,10 +245,12 @@ fn activate_settings(
         let source = settings_source(original.as_deref())?;
         let current = current_theme(source)?;
         state.active = false;
+
         if needs_initial_snapshot || current.as_ref() != Some(&managed) {
             state.previous_theme = current;
             needs_initial_snapshot = false;
         }
+
         atomic_write_file(state_path, &state_content(state)?)?;
         if !claim_matches(claim_path, owner)? {
             return Ok(false);
@@ -376,6 +382,7 @@ fn activate_paths(
     if !claim_matches(claim_path, owner)? {
         return Ok(());
     }
+
     let (mut state, needs_initial_snapshot) = match read_regular_nofollow(state_path)? {
         Some(content) => (parse_state(&content)?, false),
         None => (
@@ -390,6 +397,7 @@ fn activate_paths(
     if state.active {
         return Ok(());
     }
+
     if !activate_settings(
         settings_path,
         state_path,
@@ -400,6 +408,7 @@ fn activate_paths(
     )? {
         return Ok(());
     }
+
     if !claim_matches(claim_path, owner)? {
         return Ok(());
     }
@@ -422,6 +431,7 @@ fn restore_paths(
     if !claim_matches(claim_path, owner)? {
         return Ok(());
     }
+
     let Some(content) = read_regular_nofollow(state_path)? else {
         return Ok(());
     };
@@ -430,6 +440,7 @@ fn restore_paths(
     if !claim_matches(claim_path, owner)? {
         return Ok(());
     }
+
     let Some(restored) = restore_settings(
         settings_path,
         claim_path,
@@ -454,6 +465,7 @@ fn restore_paths(
             state_path.display()
         ))
     })?;
+
     if let Some(parent) = state_path.parent() {
         let _ = fs::remove_dir(parent);
     }
@@ -515,6 +527,7 @@ mod tests {
     fn replaces_only_theme_in_jsonc() {
         let source = "{\n  // keep this\n  \"theme\": { \"mode\": \"system\", },\n  \"buffer_font_size\": 15,\n}\n";
         let changed = set_theme(source, Some(&Value::String(MANAGED_THEME.into()))).unwrap();
+
         assert_eq!(
             changed,
             "{\n  // keep this\n  \"theme\": \"Omarchy\",\n  \"buffer_font_size\": 15,\n}\n"
@@ -525,6 +538,7 @@ mod tests {
     fn adds_and_removes_theme_without_rewriting_other_settings() {
         let source = "{\n  // font\n  \"buffer_font_size\": 15\n}\n";
         let added = set_theme(source, Some(&Value::String(MANAGED_THEME.into()))).unwrap();
+
         assert_eq!(
             added,
             "{\n  // font\n  \"buffer_font_size\": 15,\n  \"theme\": \"Omarchy\"\n}\n"
@@ -536,6 +550,7 @@ mod tests {
     fn adds_theme_after_an_existing_trailing_comma() {
         let source = "{\n  \"buffer_font_size\": 15, // keep\n}\n";
         let added = set_theme(source, Some(&Value::String(MANAGED_THEME.into()))).unwrap();
+
         assert_eq!(
             added,
             "{\n  \"buffer_font_size\": 15, // keep\n  \"theme\": \"Omarchy\",\n}\n"
@@ -546,6 +561,7 @@ mod tests {
     fn inserted_theme_uses_the_existing_line_endings() {
         let source = "{\r\n  \"buffer_font_size\": 15\r\n}\r\n";
         let added = set_theme(source, Some(&Value::String(MANAGED_THEME.into()))).unwrap();
+
         assert_eq!(
             added,
             "{\r\n  \"buffer_font_size\": 15,\r\n  \"theme\": \"Omarchy\"\r\n}\r\n"
@@ -556,6 +572,7 @@ mod tests {
     fn single_line_insertion_and_removal_preserve_spacing() {
         let source = "{\"buffer_font_size\":14}";
         let added = set_theme(source, Some(&Value::String(MANAGED_THEME.into()))).unwrap();
+
         assert_eq!(set_theme(&added, None).unwrap(), source);
     }
 
@@ -598,6 +615,7 @@ mod tests {
             })),
         };
         let value: Value = serde_json::from_slice(&state_content(&state).unwrap()).unwrap();
+
         assert!(value["previous_theme"].is_object());
     }
 
@@ -609,6 +627,7 @@ mod tests {
         };
         let missing_value: Value =
             serde_json::from_slice(&state_content(&missing).unwrap()).unwrap();
+
         assert!(
             !missing_value
                 .as_object()
@@ -621,6 +640,7 @@ mod tests {
             previous_theme: Some(Value::Null),
         };
         let null_value: Value = serde_json::from_slice(&state_content(&null).unwrap()).unwrap();
+
         assert!(
             null_value
                 .as_object()

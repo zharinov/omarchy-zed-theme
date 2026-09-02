@@ -46,6 +46,7 @@ pub fn assert_document_contract(label: &str, palette: &ResolvedPalette, document
     let themes = root["themes"]
         .as_array()
         .expect("generated themes must be an array");
+
     assert_eq!(themes.len(), 1, "{label}: expected one generated theme");
     assert_eq!(root["$schema"].as_str(), Some(SCHEMA_URL));
     assert_eq!(root["name"].as_str(), Some(THEME_NAME));
@@ -53,6 +54,7 @@ pub fn assert_document_contract(label: &str, palette: &ResolvedPalette, document
     let theme = themes[0]
         .as_object()
         .expect("generated theme must be an object");
+
     assert_eq!(
         theme.keys().map(String::as_str).collect::<BTreeSet<_>>(),
         BTreeSet::from(["appearance", "name", "style"]),
@@ -83,6 +85,7 @@ pub fn assert_document_contract(label: &str, palette: &ResolvedPalette, document
         }))
         .chain(["background.appearance", "accents", "players", "syntax"].map(str::to_owned))
         .collect::<BTreeSet<_>>();
+
     assert_eq!(
         style.keys().cloned().collect::<BTreeSet<_>>(),
         expected_roles,
@@ -240,8 +243,10 @@ fn assert_diff_contract(label: &str, palette: &ResolvedPalette, document: &Value
 
     let vcs_added = role(style, "version_control.added");
     let vcs_deleted = role(style, "version_control.deleted");
+
     assert!(delta_e(vcs_added, vcs_deleted).unwrap() >= SEMANTIC_PAIR_CONTRACT.normal_delta_e);
     assert!(cvd_distance(vcs_added, vcs_deleted).unwrap() >= SEMANTIC_PAIR_CONTRACT.cvd_delta_e);
+
     let syntax_added = style["syntax"]["diff.plus"]["color"].as_str().unwrap();
     let syntax_deleted = style["syntax"]["diff.minus"]["color"].as_str().unwrap();
     assert!(delta_e(syntax_added, syntax_deleted).unwrap() >= SYNTAX_DIFF_CONTRACT.normal_delta_e);
@@ -340,6 +345,7 @@ fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) 
         .map(|state| render_layers(base, &[role(style, state)]).unwrap());
         let contrasts: [f64; 3] =
             std::array::from_fn(|index| contrast_ratio(&rendered[index], base).unwrap());
+
         for (index, (minimum, maximum)) in [(1.10, 1.50), (1.18, 1.75), (1.18, 1.90)]
             .into_iter()
             .enumerate()
@@ -421,6 +427,7 @@ fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) 
         let background = role(style, background_role);
         let border = contrast_ratio(role(style, "border"), background).unwrap();
         let variant = contrast_ratio(role(style, "border.variant"), background).unwrap();
+
         assert_metric_between(
             &format!("{label} border on {background_role}"),
             border,
@@ -442,6 +449,7 @@ fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) 
     let background = role(style, "background");
     let border = contrast_ratio(role(style, "border"), background).unwrap();
     let focused = contrast_ratio(role(style, "border.focused"), background).unwrap();
+
     assert_metric_between(&format!("{label} focused border"), focused, 3.00, 4.60);
     assert!(focused > border);
 
@@ -483,6 +491,7 @@ fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) 
         "panel.indent_guide_active",
     ]
     .map(|name| contrast_ratio(role(style, name), panel).unwrap());
+
     assert!(panel_guides[0] < panel_guides[1] && panel_guides[1] < panel_guides[2]);
 
     let active_tab = role(style, "tab.active_background");
@@ -505,6 +514,7 @@ fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) 
             .map(|name| render_layers(base, &[role(style, &name)]).unwrap());
             let contrasts: [f64; 3] =
                 std::array::from_fn(|index| contrast_ratio(&rendered[index], base).unwrap());
+
             assert!(contrasts[0] + 1e-9 < contrasts[1]);
             assert!(contrasts[1] + 1e-9 < contrasts[2]);
             assert_metric_between(
@@ -521,6 +531,7 @@ fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) 
     let canvas = role(style, "editor.background");
     let guide = contrast_ratio(role(style, "editor.indent_guide"), canvas).unwrap();
     let active_guide = contrast_ratio(role(style, "editor.indent_guide_active"), canvas).unwrap();
+
     assert!(active_guide > guide);
 
     for status in [

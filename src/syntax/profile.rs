@@ -111,6 +111,7 @@ fn complete_link_clusters(evidence: &[EvidenceColor]) -> Vec<HueCluster> {
                 if maximum > HUE_CLUSTER_LIMIT + 1e-12 {
                     continue;
                 }
+
                 let mut members = clusters[left].clone();
                 members.extend(&clusters[right]);
                 members.sort_unstable();
@@ -167,6 +168,7 @@ fn complete_link_clusters(evidence: &[EvidenceColor]) -> Vec<HueCluster> {
 
 pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
     palette.validate_keys(&EVIDENCE_KEYS)?;
+
     let mut deduplicated: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
     for key in EVIDENCE_KEYS {
         let value = normalize_hex(
@@ -311,6 +313,7 @@ mod tests {
             palette_colors.insert(key.to_owned(), rgb_hex(value));
             palette_provenance.insert(key.to_owned(), source_kind);
         }
+
         ResolvedPalette {
             mode: "dark".into(),
             colors: palette_colors,
@@ -417,6 +420,7 @@ mod tests {
                     }
                 }
             }
+
             for left in 0..original.clusters.len() {
                 for right in left + 1..original.clusters.len() {
                     let cannot_merge = original.clusters[left].members.iter().any(|left_index| {
@@ -456,6 +460,7 @@ mod tests {
             );
             provenance.insert((*key).to_owned(), *source);
         }
+
         ResolvedPalette {
             mode: "dark".into(),
             colors,
@@ -473,6 +478,7 @@ mod tests {
         palette.colors.insert("blue".into(), "#ff0000".into());
 
         let profile = measure(&palette).unwrap();
+
         assert_eq!(profile.evidence.len(), 1);
         assert_eq!(profile.evidence[0].value, "#ff0000");
         assert_eq!(profile.evidence[0].keys, ["blue", "red"]);
@@ -488,6 +494,7 @@ mod tests {
         duplicate
             .colors
             .insert("blue".into(), duplicate.colors["accent"].clone());
+
         assert_eq!(measure(&duplicate).unwrap().evidence.len(), 1);
     }
 
@@ -498,6 +505,7 @@ mod tests {
             ("blue", 0.18, 3.5, Provenance::Derived),
         ]))
         .unwrap();
+
         assert!(profile.evidence.is_empty());
         assert!(profile.clusters.is_empty());
     }
@@ -514,6 +522,7 @@ mod tests {
             ("blue", CHROMA_EVIDENCE + 0.0002, 3.5, Provenance::Direct),
         ]))
         .unwrap();
+
         assert!(
             (above.chroma_envelope.target_median - below.chroma_envelope.target_median).abs()
                 < 0.01
@@ -551,6 +560,7 @@ mod tests {
             ("blue", 0.12, 4.0, Provenance::Direct),
         ]))
         .unwrap();
+
         assert_eq!(native.clusters.len(), 3);
 
         let dominant_cluster = measure(&palette(&[
@@ -560,6 +570,7 @@ mod tests {
             ("blue", 0.03, 4.0, Provenance::Direct),
         ]))
         .unwrap();
+
         assert_eq!(dominant_cluster.clusters.len(), 3);
 
         let two_clusters = measure(&palette(&[
@@ -569,12 +580,14 @@ mod tests {
             ("cyan", 0.12, 214.0 * PI / 180.0, Provenance::Direct),
         ]))
         .unwrap();
+
         assert_eq!(two_clusters.clusters.len(), 2);
     }
 
     #[test]
     fn authored_neutral_colors_are_tone_evidence_not_hue_clusters() {
         let profile = measure(&palette(&[("accent", 0.0, 0.0, Provenance::Direct)])).unwrap();
+
         assert_eq!(profile.evidence.len(), 1);
         assert!(profile.clusters.is_empty());
     }
@@ -587,6 +600,7 @@ mod tests {
             ("yellow", 0.10, 60.0 * PI / 180.0, Provenance::Direct),
         ]))
         .unwrap();
+
         assert_eq!(profile.clusters.len(), 2);
         assert!(profile.clusters.iter().all(|cluster| {
             cluster.members.iter().all(|left| {

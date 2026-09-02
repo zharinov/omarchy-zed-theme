@@ -31,8 +31,10 @@ proptest! {
     #[test]
     fn every_complete_palette_builds_a_stable_document(palette in arbitrary_resolved_palettes()) {
         prop_assert!(palette.validate().is_ok());
+
         let document = build_theme(&palette)
             .map_err(|error| TestCaseError::fail(format!("generated {palette:?}: {error}")))?;
+
         assert_document_contract("arbitrary complete palette", &palette, &document);
         prop_assert_eq!(
             serde_json::to_vec(&document).unwrap(),
@@ -49,6 +51,7 @@ proptest! {
     #[test]
     fn generated_palette_strategy_preserves_alias_groups(spec in generated_palette_specs()) {
         let palette = spec.resolve();
+
         for (alias, source) in [
             ("accent", "blue"),
             ("cursor", "magenta"),
@@ -93,9 +96,11 @@ proptest! {
             let mut palette = spec.resolve();
             apply_color_mutation(&mut palette, &mutation);
             prop_assert!(palette.validate().is_ok());
+
             let document = build_theme(&palette).map_err(|error| TestCaseError::fail(format!(
                 "generated palette {spec:?}, mutation {mutation:?}: {error}"
             )))?;
+
             assert_document_contract("pathological palette", &palette, &document);
             prop_assert_eq!(
                 serde_json::to_vec(&document).unwrap(),
@@ -114,8 +119,10 @@ proptest! {
     fn generated_feasible_palettes_satisfy_the_visual_contract(spec in generated_palette_specs()) {
         let palette = spec.resolve();
         prop_assert!(palette.validate().is_ok());
+
         let document = build_theme(&palette)
             .map_err(|error| TestCaseError::fail(format!("generated palette {spec:?}: {error}")))?;
+
         assert_feasible_theme_contract("generated feasible palette", &palette, &document);
         prop_assert_eq!(serde_json::to_vec(&document).unwrap(), serialized_theme(&palette));
     }
@@ -127,6 +134,7 @@ proptest! {
     #[test]
     fn theme_bytes_are_thread_count_independent(spec in generated_palette_specs()) {
         let palette = spec.resolve();
+
         let build = |threads| {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -134,6 +142,7 @@ proptest! {
                 .unwrap()
                 .install(|| serialized_theme(&palette))
         };
+
         prop_assert_eq!(build(1), build(8));
     }
 }
@@ -149,13 +158,16 @@ proptest! {
         for provenance in palette.provenance.values_mut() {
             *provenance = Provenance::Derived;
         }
+
         let document = build_theme(&palette).unwrap();
         assert_document_contract("all-derived palette", &palette, &document);
+
         let syntax = document["themes"][0]["style"]["syntax"].as_object().unwrap();
         let roots = ["string", "type", "keyword"]
             .map(|capture| syntax[capture]["color"].as_str().unwrap())
             .into_iter()
             .collect::<BTreeSet<_>>();
+
         prop_assert_eq!(roots.len(), 3);
     }
 }
@@ -179,11 +191,14 @@ proptest! {
                 chroma_step,
             },
         );
+
         for provenance in palette.provenance.values_mut() {
             *provenance = Provenance::Direct;
         }
+
         let document = build_theme(&palette).unwrap();
         let syntax = document["themes"][0]["style"]["syntax"].as_object().unwrap();
+
         let source_hues = [
             "foreground", "green", "blue", "magenta", "yellow", "red", "cyan", "orange",
             "accent", "brown", "bright_green", "bright_blue", "bright_magenta",
@@ -194,6 +209,7 @@ proptest! {
         .filter(|source| source[1] >= 0.025)
         .map(|source| source[2])
         .collect::<Vec<_>>();
+
         for capture in [
             "string", "constant", "type", "function", "property", "keyword", "link_text",
         ] {
@@ -201,6 +217,7 @@ proptest! {
             if output[1] < 0.025 {
                 continue;
             }
+
             let nearest = source_hues
                 .iter()
                 .map(|hue| (output[2] - hue).abs().min(TAU - (output[2] - hue).abs()))
@@ -223,11 +240,14 @@ proptest! {
             &mut palette,
             &PaletteMutation::NeutralSemantics { lightness_step },
         );
+
         for provenance in palette.provenance.values_mut() {
             *provenance = Provenance::Direct;
         }
+
         let document = build_theme(&palette).unwrap();
         let syntax = document["themes"][0]["style"]["syntax"].as_object().unwrap();
+
         for capture in [
             "comment", "string", "constant", "type", "function", "property", "keyword",
         ] {

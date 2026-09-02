@@ -71,6 +71,7 @@ fn render_with_bounded_generic_highlights(
     for first in highlights {
         scenes.extend(render_on_bases(bases, &[*first])?);
     }
+
     Ok(scenes)
 }
 
@@ -179,6 +180,7 @@ impl StyleBuilder {
         for (role, color) in roles {
             self.insert_opaque(role, color)?;
         }
+
         Ok(())
     }
 
@@ -370,6 +372,7 @@ fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result
             normal_maximum,
         )),
     )?;
+
     let normal_l = lightness(&normal)?;
     let normal_contrasts = backgrounds
         .iter()
@@ -384,6 +387,7 @@ fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result
     } else {
         (normal_l, 1.0, 0.0, normal_l)
     };
+
     let dim_preferred = (normal_contrast.ln() * request.policy.dim_saliency)
         .exp()
         .max(HARD_TEXT_CONTRAST);
@@ -421,6 +425,7 @@ fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result
             dim = normal.clone();
         }
     }
+
     let bright_preferred = (normal_contrast.ln() * request.policy.bright_saliency)
         .exp()
         .max(normal_contrast)
@@ -460,6 +465,7 @@ fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result
             bright = normal.clone();
         }
     }
+
     Ok([dim, normal, bright])
 }
 
@@ -787,6 +793,7 @@ fn derive_semantics(
         .expect("UI structure bands are bounded")
         .max(geometric_contrast(&passive, structure_backgrounds)? + 0.08)
         .min(normal_maximum);
+
     // Distinct preferred ratios can still quantize to the same byte color, so
     // make the structural hierarchy a per-surface constraint as well.
     let normal_contrast_floors = structure_backgrounds
@@ -810,6 +817,7 @@ fn derive_semantics(
             normal_maximum,
         )),
     )?;
+
     let [green, red] = search
         .fit_pair(
             color(palette, "green"),
@@ -825,6 +833,7 @@ fn derive_semantics(
         TEXT_CONTRAST,
         std::slice::from_ref(&blue),
     )?;
+
     Ok(SemanticColors {
         primary,
         secondary,
@@ -1345,12 +1354,13 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         let candidate = DiffLayers::from_pigments(added, deleted, presentation)?;
         let penalty =
             candidate.rendered_semantic_penalty(&editor_bases, &editor_primary, presentation)?;
-        if diff_layers
+        let improves_best = diff_layers
             .as_ref()
-            .is_none_or(|(_, best_penalty)| penalty.total_cmp(best_penalty).is_lt())
-        {
-            diff_layers = Some((candidate, penalty));
+            .is_none_or(|(_, best_penalty)| penalty.total_cmp(best_penalty).is_lt());
+        if !improves_best {
+            continue;
         }
+        diff_layers = Some((candidate, penalty));
     }
     let diff_layers = diff_layers
         .expect("editor diff fitting always evaluates authored pigments")
@@ -2218,6 +2228,7 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
             "generated theme document manifest does not match its schema",
         ));
     }
+
     if root.get("$schema").and_then(Value::as_str) != Some(SCHEMA_URL)
         || root.get("name").and_then(Value::as_str) != Some(THEME_NAME)
         || root.get("author").and_then(Value::as_str) != Some("APS")
@@ -2226,6 +2237,7 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
             "generated theme document metadata does not match its schema",
         ));
     }
+
     let themes = root
         .get("themes")
         .and_then(Value::as_array)
@@ -2235,6 +2247,7 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
             "generated theme document must contain exactly one theme",
         ));
     }
+
     let theme = themes[0]
         .as_object()
         .ok_or_else(|| Error::invalid("generated theme entry must be an object"))?;
@@ -2248,6 +2261,7 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
             "generated theme entry manifest does not match its schema",
         ));
     }
+
     let appearance = theme
         .get("appearance")
         .and_then(Value::as_str)
@@ -2257,6 +2271,7 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
             "generated theme appearance must be dark or light, got {appearance:?}"
         )));
     }
+
     let style = theme
         .get("style")
         .and_then(Value::as_object)
@@ -2292,6 +2307,7 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
             "generated style manifest does not match its schema",
         ));
     }
+
     for name in fixed_expected.iter().chain(&status_expected) {
         let color = style
             .get(name)
@@ -2299,11 +2315,13 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
             .ok_or_else(|| Error::invalid(format!("generated theme role {name} is not a color")))?;
         parse_hex(color)?;
     }
+
     if style.get("background.appearance").and_then(Value::as_str) != Some("opaque") {
         return Err(Error::invalid(
             "generated background appearance must be opaque",
         ));
     }
+
     let accents = style
         .get("accents")
         .and_then(Value::as_array)
@@ -2318,6 +2336,7 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
             })?,
         )?;
     }
+
     let players = style
         .get("players")
         .and_then(Value::as_array)
@@ -2340,6 +2359,7 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
             })?)?;
         }
     }
+
     let syntax = style
         .get("syntax")
         .and_then(Value::as_object)
@@ -2361,6 +2381,7 @@ fn validate_theme_structure(document: &Value) -> Result<()> {
                 .ok_or_else(|| Error::invalid(format!("generated syntax.{name} has no color")))?,
         )?;
     }
+
     Ok(())
 }
 

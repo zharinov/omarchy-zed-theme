@@ -115,12 +115,14 @@ impl UiPolicy {
             source_surface_contrast =
                 source_surface_contrast.max(contrast_ratio(source, background)?);
         }
+
         if lower_depth <= 1e-6 {
             lower_depth = (upper_depth * 0.65).max(0.010);
         }
         if upper_depth <= 1e-6 {
             upper_depth = (lower_depth * 0.65).max(0.008);
         }
+
         let surfaces = SurfacePolicy {
             lower_depth: lower_depth.clamp(0.010, 0.085),
             upper_depth: upper_depth.clamp(0.008, 0.075),

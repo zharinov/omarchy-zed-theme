@@ -115,13 +115,13 @@ pub fn fit_relative(
         )
     };
     let violates_hierarchy_bounds = |color: &str| -> Result<bool> {
-        backgrounds.iter().zip(&contrast_ceilings).try_fold(
-            false,
-            |exceeded, (background, ceiling)| {
-                let contrast = contrast_ratio(color, background)?;
-                Ok(exceeded || contrast < hard_floor - 1e-12 || contrast > *ceiling + 1e-12)
-            },
-        )
+        for (background, ceiling) in backgrounds.iter().zip(&contrast_ceilings) {
+            let contrast = contrast_ratio(color, background)?;
+            if contrast < hard_floor - 1e-12 || contrast > *ceiling + 1e-12 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     };
 
     let mut output = fit(search, seed)?;
@@ -132,6 +132,7 @@ pub fn fit_relative(
         // both bounds. The parent hue makes hierarchy-safe candidates reachable
         // without abandoning the requested saliency first.
         output = fit(search, reference)?;
+
         let reference_meets_floor = backgrounds.iter().try_fold(true, |passes, background| {
             Ok::<bool, Error>(
                 passes && contrast_ratio(reference, background)? >= hard_floor - 1e-12,
@@ -141,6 +142,7 @@ pub fn fit_relative(
             output = reference.to_owned();
         }
     }
+
     let actual_contrast = geometric_contrast(&output, backgrounds)?;
     let actual_saliency = actual_contrast.ln() / reference_contrast.ln().max(1e-12);
 

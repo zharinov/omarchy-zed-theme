@@ -173,6 +173,7 @@ fn atomic_write_file_inner(
                 temporary.display()
             ))
         })?;
+
         replaceable_target(target)?;
         if let ExpectedContent::Exact(expected) = expected
             && read_regular_nofollow(target)?.as_deref() != expected
@@ -419,6 +420,7 @@ pub fn generate_and_publish(
         else {
             continue;
         };
+
         if cache_target_is_usable(&cache_path)? {
             match atomic_write_file(&cache_path, &cache_record(&cache_key, &content)) {
                 Ok(_) => {}
@@ -477,6 +479,7 @@ mod tests {
     fn identical_atomic_output_is_not_rewritten() {
         let root = temporary("identical-output");
         let target = root.join("themes/omarchy.json");
+
         assert!(atomic_write_file(&target, b"same").unwrap());
         assert!(!atomic_write_file(&target, b"same").unwrap());
         fs::remove_dir_all(root).unwrap();
