@@ -1,4 +1,6 @@
-use omarchy_zed_theme::color::{contrast_ratio, delta_e, parse_hex, render_layers};
+use omarchy_zed_theme::color::{
+    apply_opacity, contrast_ratio, delta_e, lab, oklab_to_oklch, parse_hex, render_layers,
+};
 use omarchy_zed_theme::constants::{
     CHROME_FIELDS, DARK_DIFF_BORDER_OPACITY, DARK_DIFF_HOLLOW_OPACITY, DARK_DIFF_LINE_OPACITY,
     DARK_DIFF_WORD_OPACITY, DIFF_NORMAL_FLOOR_DELTA_E, EDITOR_FIELDS, FOUNDATION_FIELDS,
@@ -164,7 +166,7 @@ pub fn assert_document_contract(label: &str, palette: &ResolvedPalette, document
 
 pub fn assert_feasible_theme_contract(label: &str, palette: &ResolvedPalette, document: &Value) {
     assert_document_contract(label, palette, document);
-    assert_ui_contract(label, document);
+    assert_ui_contract(label, palette, document);
     assert_diff_contract(label, palette, document);
     assert_overlay_roles_are_translucent(label, document);
 }
@@ -289,7 +291,7 @@ fn assert_overlay_roles_are_translucent(label: &str, document: &Value) {
     );
 }
 
-fn assert_ui_contract(label: &str, document: &Value) {
+fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) {
     let style = style(document);
     let element_base = role(style, "element.background");
     let rendered_element = |state| render_layers(element_base, &[role(style, state)]).unwrap();
@@ -318,6 +320,7 @@ fn assert_ui_contract(label: &str, document: &Value) {
         "elevated_surface.background",
         "title_bar.background",
         "panel.overlay_background",
+        "tab.inactive_background",
     ];
     for base_role in interaction_background_roles {
         let base = role(style, base_role);
@@ -408,15 +411,54 @@ fn assert_ui_contract(label: &str, document: &Value) {
         );
     }
 
-    let background = role(style, "background");
+    let structure_background_roles = [
+        "background",
+        "surface.background",
+        "elevated_surface.background",
+        "title_bar.background",
+    ];
+    for background_role in structure_background_roles {
+        let background = role(style, background_role);
+        let border = contrast_ratio(role(style, "border"), background).unwrap();
+        let variant = contrast_ratio(role(style, "border.variant"), background).unwrap();
+        assert_metric_between(
+            &format!("{label} border on {background_role}"),
+            border,
+            1.15,
+            2.00,
+        );
+        assert_metric_between(
+            &format!("{label} border variant on {background_role}"),
+            variant,
+            1.09,
+            1.70,
+        );
+        assert!(
+            border >= variant + 0.005 - 1e-9,
+            "{label}: border hierarchy collapsed on {background_role}: border {border:.4}, variant {variant:.4}"
+        );
+    }
 
+    let background = role(style, "background");
     let border = contrast_ratio(role(style, "border"), background).unwrap();
-    let variant = contrast_ratio(role(style, "border.variant"), background).unwrap();
     let focused = contrast_ratio(role(style, "border.focused"), background).unwrap();
-    assert_metric_between(&format!("{label} border"), border, 1.05, 1.80);
-    assert_metric_between(&format!("{label} border variant"), variant, 1.03, 1.40);
     assert_metric_between(&format!("{label} focused border"), focused, 3.00, 4.60);
     assert!(focused > border);
+
+    let accent_lch = oklab_to_oklch(lab(&palette.colors["accent"]).unwrap());
+    if accent_lch[1] >= 0.035 {
+        let info_lch = oklab_to_oklch(lab(role(style, "info.background")).unwrap());
+        let hue_difference = (accent_lch[2] - info_lch[2]).abs();
+        let hue_distance = hue_difference.min(std::f64::consts::TAU - hue_difference);
+        assert!(
+            info_lch[1] >= 0.030 - 1e-9,
+            "{label}: accent status background lost its tint"
+        );
+        assert!(
+            hue_distance <= 0.08 + 1e-9,
+            "{label}: accent status background changed hue"
+        );
+    }
 
     let panel = role(style, "panel.background");
     let panel_overlay = role(style, "panel.overlay_background");
@@ -506,6 +548,13 @@ fn assert_ui_contract(label: &str, document: &Value) {
     }
 
     let terminal_background = role(style, "terminal.background");
+    let selection = role(style, "element.selection_background");
+    let unfocused_selection = apply_opacity(selection, 0.5).unwrap();
+    let terminal_backgrounds = [
+        terminal_background.to_owned(),
+        render_layers(terminal_background, &[selection]).unwrap(),
+        render_layers(terminal_background, &[&unfocused_selection]).unwrap(),
+    ];
     for family in std::iter::once(None).chain(
         [
             "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
@@ -525,11 +574,13 @@ fn assert_ui_contract(label: &str, document: &Value) {
                 format!("terminal.ansi.bright_{family}"),
             ],
         };
-        let contrasts: [f64; 3] = std::array::from_fn(|index| {
-            contrast_ratio(role(style, &triplet[index]), terminal_background).unwrap()
-        });
-        assert!(contrasts[0] <= contrasts[1] + 1e-9);
-        assert!(contrasts[1] <= contrasts[2] + 1e-9);
-        assert!(contrasts[0] >= HARD_TEXT_CONTRAST - 1e-9);
+        for terminal_background in &terminal_backgrounds {
+            let contrasts: [f64; 3] = std::array::from_fn(|index| {
+                contrast_ratio(role(style, &triplet[index]), terminal_background).unwrap()
+            });
+            assert!(contrasts[0] <= contrasts[1] + 1e-9);
+            assert!(contrasts[1] <= contrasts[2] + 1e-9);
+            assert!(contrasts[0] >= HARD_TEXT_CONTRAST - 1e-9);
+        }
     }
 }

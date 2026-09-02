@@ -8,8 +8,8 @@ use self::tokens::{
     StatusChannel, StatusTokens, SurfaceTokens, ThemeTokens,
 };
 use crate::color::{
-    apply_opacity, contrast_ratio, delta_e, gamut_map_oklch_unchecked, gpui_blend, lab, lightness,
-    oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
+    apply_opacity, contrast_ratio, delta_e, gamut_map_oklch_unchecked, geometric_contrast,
+    gpui_blend, lab, lightness, oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
 };
 use crate::constants::*;
 use crate::palette::ResolvedPalette;
@@ -92,6 +92,17 @@ fn fit_bounded_color(
     band: MetricBand,
 ) -> Result<String> {
     search.fit_color_bounded(seed, backgrounds, &[], FitBounds::new(band))
+}
+
+fn retained_tint_chroma(seed: &str) -> Result<f64> {
+    let chroma = oklab_to_oklch(lab(seed)?)[1];
+    // Requiring tiny incidental chroma jumps neutral sources to the first
+    // chromatic lattice step, so only authored-looking tints retain a floor.
+    Ok(if chroma >= 0.035 {
+        chroma.min(0.040)
+    } else {
+        0.0
+    })
 }
 
 fn quality_shortfall(actual: f64, target: f64) -> f64 {
@@ -287,6 +298,21 @@ fn minimum_contrast(foreground: &str, backgrounds: &[String]) -> Result<f64> {
         })
 }
 
+fn contrasts_satisfy(
+    foreground: &str,
+    backgrounds: &[String],
+    references: &[f64],
+    predicate: impl Fn(f64, f64) -> bool,
+) -> Result<bool> {
+    assert_eq!(backgrounds.len(), references.len());
+    backgrounds
+        .iter()
+        .zip(references)
+        .try_fold(true, |passes, (background, reference)| {
+            Ok(passes && predicate(contrast_ratio(foreground, background)?, *reference))
+        })
+}
+
 fn minimum_pairwise(
     first: &[String],
     second: &[String],
@@ -345,7 +371,14 @@ fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result
         )),
     )?;
     let normal_l = lightness(&normal)?;
-    let normal_contrast = minimum_contrast(&normal, backgrounds)?;
+    let normal_contrasts = backgrounds
+        .iter()
+        .map(|background| contrast_ratio(&normal, background))
+        .collect::<Result<Vec<_>>>()?;
+    let normal_contrast = normal_contrasts
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
     let (dim_lower, dim_upper, bright_lower, bright_upper) = if is_dark_mode(request.mode) {
         (0.0, normal_l, normal_l, 1.0)
     } else {
@@ -357,20 +390,37 @@ fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result
     let dim_maximum = (normal_contrast.ln() * (request.policy.dim_saliency + 0.08).min(0.90))
         .exp()
         .max(dim_preferred);
-    let dim = search.fit_color_bounded(
-        dim_seed,
-        backgrounds,
-        &[],
-        FitBounds {
-            lower_lightness: dim_lower,
-            upper_lightness: dim_upper,
-            ..FitBounds::new(MetricBand::bounded(
-                HARD_TEXT_CONTRAST,
-                dim_preferred,
-                dim_maximum,
-            ))
-        },
-    )?;
+    let dim_bounds = FitBounds {
+        lower_lightness: dim_lower,
+        upper_lightness: dim_upper,
+        ..FitBounds::new(MetricBand::bounded(
+            HARD_TEXT_CONTRAST,
+            dim_preferred,
+            dim_maximum,
+        ))
+    };
+    let fit_dim = |search: &mut Search, seed: &str| {
+        search.fit_color_bounded_with_contrast_ceilings(
+            seed,
+            backgrounds,
+            backgrounds,
+            &normal_contrasts,
+            &[],
+            dim_bounds,
+        )
+    };
+    let mut dim = fit_dim(search, dim_seed)?;
+    let dim_respects_normal = |color: &str| {
+        contrasts_satisfy(color, backgrounds, &normal_contrasts, |actual, normal| {
+            actual <= normal + 1e-12
+        })
+    };
+    if !dim_respects_normal(&dim)? {
+        dim = fit_dim(search, &normal)?;
+        if !dim_respects_normal(&dim)? {
+            dim = normal.clone();
+        }
+    }
     let bright_preferred = (normal_contrast.ln() * request.policy.bright_saliency)
         .exp()
         .max(normal_contrast)
@@ -379,20 +429,37 @@ fn terminal_triplet(search: &mut Search, request: TerminalRequest<'_>) -> Result
         .exp()
         .max(bright_preferred)
         .min(21.0);
-    let bright = search.fit_color_bounded(
-        bright_seed,
-        backgrounds,
-        &[],
-        FitBounds {
-            lower_lightness: bright_lower,
-            upper_lightness: bright_upper,
-            ..FitBounds::new(MetricBand::bounded(
-                normal_contrast,
-                bright_preferred,
-                bright_maximum,
-            ))
-        },
-    )?;
+    let bright_bounds = FitBounds {
+        lower_lightness: bright_lower,
+        upper_lightness: bright_upper,
+        ..FitBounds::new(MetricBand::bounded(
+            normal_contrast,
+            bright_preferred,
+            bright_maximum,
+        ))
+    };
+    let fit_bright = |search: &mut Search, seed: &str| {
+        search.fit_color_bounded_with_contrast_floors(
+            seed,
+            backgrounds,
+            backgrounds,
+            &normal_contrasts,
+            &[],
+            bright_bounds,
+        )
+    };
+    let mut bright = fit_bright(search, bright_seed)?;
+    let bright_respects_normal = |color: &str| {
+        contrasts_satisfy(color, backgrounds, &normal_contrasts, |actual, normal| {
+            actual >= normal - 1e-12
+        })
+    };
+    if !bright_respects_normal(&bright)? {
+        bright = fit_bright(search, &normal)?;
+        if !bright_respects_normal(&bright)? {
+            bright = normal.clone();
+        }
+    }
     Ok([dim, normal, bright])
 }
 
@@ -598,12 +665,8 @@ fn derive_content(
     palette: &ResolvedPalette,
     policy: &UiPolicy,
     backgrounds: &[String],
+    primary: String,
 ) -> Result<ContentColors> {
-    let primary = search.fit_color(
-        color(palette, "foreground"),
-        backgrounds,
-        TEXT_CONTRAST * 1.25,
-    )?;
     let secondary = fit_relative(
         search,
         color(palette, "muted"),
@@ -706,17 +769,46 @@ fn derive_semantics(
         icon_disabled,
     } = content;
     let accent = search.fit_color(color(palette, "accent"), ui_backgrounds, CONTROL_CONTRAST)?;
-    let structural = fit_bounded_color(
-        search,
-        color(palette, "muted"),
-        structure_backgrounds,
-        policy.structure.normal,
-    )?;
     let passive = fit_bounded_color(
         search,
         color(palette, "muted"),
         structure_backgrounds,
         policy.structure.passive,
+    )?;
+    let normal_maximum = policy
+        .structure
+        .normal
+        .maximum()
+        .expect("UI structure bands are bounded");
+    let normal_preferred = policy
+        .structure
+        .normal
+        .preferred()
+        .expect("UI structure bands are bounded")
+        .max(geometric_contrast(&passive, structure_backgrounds)? + 0.08)
+        .min(normal_maximum);
+    // Distinct preferred ratios can still quantize to the same byte color, so
+    // make the structural hierarchy a per-surface constraint as well.
+    let normal_contrast_floors = structure_backgrounds
+        .iter()
+        .map(|background| {
+            contrast_ratio(&passive, background).map(|contrast| {
+                (contrast + policy.structure.minimum_hierarchy_step)
+                    .max(policy.structure.normal.minimum())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let structural = search.fit_color_bounded_with_contrast_floors(
+        color(palette, "muted"),
+        structure_backgrounds,
+        structure_backgrounds,
+        &normal_contrast_floors,
+        &[],
+        FitBounds::new(MetricBand::bounded(
+            policy.structure.normal.minimum(),
+            normal_preferred,
+            normal_maximum,
+        )),
     )?;
     let [green, red] = search
         .fit_pair(
@@ -788,9 +880,13 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         elevated.clone(),
         chrome.clone(),
     ]);
-    let content = derive_content(&mut search, palette, &ui_policy, &base_ui_backgrounds)?;
+    let provisional_primary = search.fit_color(
+        color(palette, "foreground"),
+        &base_ui_backgrounds,
+        TEXT_CONTRAST * 1.25,
+    )?;
     let readable_ui_state = [(
-        content.primary.clone(),
+        provisional_primary.clone(),
         TEXT_CONTRAST,
         STATE_CONSECUTIVE_DELTA_E,
     )];
@@ -864,7 +960,7 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             .cloned()
             .chain([panel_overlay.clone(), canvas.clone()]),
     );
-    let readable_interaction_foreground = [(content.primary.clone(), TEXT_CONTRAST)];
+    let readable_interaction_foreground = [(provisional_primary.clone(), TEXT_CONTRAST)];
     let element_hover = search
         .fit_readable_overlay(
             &surface,
@@ -983,8 +1079,14 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         .map_err(|error| error.context("active panel guide"))?;
     let panel_guide_ladder = [panel_guide_passive, panel_guide_hover, panel_guide_active];
 
+    let rendered_ui_bases = unique(
+        interaction_bases
+            .iter()
+            .cloned()
+            .chain(std::iter::once(tab_inactive.clone())),
+    );
     let mut rendered_ui_state_backgrounds = Vec::new();
-    for base in &interaction_bases {
+    for base in &rendered_ui_bases {
         for layer in [
             &element_hover,
             &element_active,
@@ -1001,12 +1103,28 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             .push(gpui_blend(base, &apply_opacity(&element_active, 0.5)?)?.opaque_hex());
     }
     let ui_backgrounds = unique(
-        interaction_bases
+        rendered_ui_bases
             .iter()
             .cloned()
             .chain([panel_overlay_hover.clone()])
             .chain(rendered_ui_state_backgrounds),
     );
+
+    // Interaction paints depend on the provisional text color. Validate the
+    // composed scenes once they exist, then repair only palettes that need it.
+    let primary =
+        if minimum_contrast(&provisional_primary, &ui_backgrounds)? >= TEXT_CONTRAST - 1e-12 {
+            provisional_primary
+        } else {
+            search.fit_color(color(palette, "foreground"), &ui_backgrounds, TEXT_CONTRAST)?
+        };
+    let content = derive_content(
+        &mut search,
+        palette,
+        &ui_policy,
+        &base_ui_backgrounds,
+        primary,
+    )?;
 
     // A canvas-fitted fallback tab is an isolated state surface, not a base for
     // semantic fills.
@@ -1553,19 +1671,22 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             .chain(local_unfocused),
     );
 
+    // Zed's tinted default buttons consume the info channel, so they should
+    // carry the palette's accent identity rather than its generic blue role.
     let status_seeds: BTreeMap<&str, &String> = BTreeMap::from([
         ("created", &change_identity.added),
         ("deleted", &change_identity.deleted),
         ("hidden", &semantic.disabled),
         ("hint", &semantic.cyan),
         ("ignored", &semantic.secondary),
-        ("info", &semantic.blue),
+        ("info", &semantic.accent),
         ("predictive", &semantic.secondary),
         ("unreachable", &semantic.secondary),
         ("warning", &diff_yellow_seed),
     ]);
     let mut status_backgrounds = BTreeMap::new();
     for name in status_seeds.keys() {
+        let minimum_chroma = retained_tint_chroma(status_seeds[name])?;
         let status_background_contexts = [surface.clone()];
         let status_references = [
             (
@@ -1588,6 +1709,7 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
                     ui_policy.interactions.selected.contrast,
                     ui_policy.interactions.selected.delta_e,
                 )
+                .with_minimum_chroma(minimum_chroma)
                 .with_references(&status_references),
             )?,
         );
@@ -1657,11 +1779,14 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     let mut statuses = BTreeMap::new();
     for name in status_seeds.keys() {
         let background = status_backgrounds[name].clone();
-        let border = fit_bounded_color(
-            &mut search,
+        let border = search.fit_color_bounded(
             status_seeds[name],
             &[surface.clone(), background.clone()],
-            ui_policy.structure.status_border,
+            &[],
+            FitBounds {
+                lower_chroma: retained_tint_chroma(status_seeds[name])?,
+                ..FitBounds::new(ui_policy.structure.status_border)
+            },
         )?;
         statuses.insert((*name).to_owned(), status_foregrounds[name].clone());
         statuses.insert(format!("{name}.background"), background);

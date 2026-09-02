@@ -42,6 +42,7 @@ pub(crate) struct InteractionPolicy {
 pub(crate) struct StructurePolicy {
     pub(crate) passive: MetricBand,
     pub(crate) normal: MetricBand,
+    pub(crate) minimum_hierarchy_step: f64,
     pub(crate) active_guide: MetricBand,
     pub(crate) focus: MetricBand,
     pub(crate) status_border: MetricBand,
@@ -163,12 +164,13 @@ impl UiPolicy {
             adjacent_delta_e: 0.015,
         };
 
-        let normal_structure = projected_contrast(source_surface_contrast, 0.58).clamp(1.16, 1.42);
-        let passive_structure = projected_contrast(source_surface_contrast, 0.34).clamp(1.08, 1.20);
+        let normal_structure = projected_contrast(source_surface_contrast, 0.70).clamp(1.26, 1.50);
+        let passive_structure = projected_contrast(source_surface_contrast, 0.48).clamp(1.14, 1.28);
         let focus = projected_contrast(foreground_contrast, 0.55).clamp(3.02, 4.00);
         let structure = StructurePolicy {
-            passive: MetricBand::bounded(1.05, passive_structure, 1.30),
-            normal: MetricBand::bounded(1.10, normal_structure, 1.80),
+            passive: MetricBand::bounded(1.10, passive_structure, 1.45),
+            normal: MetricBand::bounded(1.16, normal_structure, 1.95),
+            minimum_hierarchy_step: 0.01,
             active_guide: MetricBand::bounded(
                 1.30,
                 projected_contrast(source_surface_contrast, 0.90).clamp(1.40, 1.90),

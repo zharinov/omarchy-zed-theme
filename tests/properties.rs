@@ -108,7 +108,7 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(property_config(12, "tests/feasible-palettes.proptest-regressions"))]
+    #![proptest_config(property_config(24, "tests/feasible-palettes.proptest-regressions"))]
 
     #[test]
     fn generated_feasible_palettes_satisfy_the_visual_contract(spec in generated_palette_specs()) {

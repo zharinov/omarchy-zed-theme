@@ -42,7 +42,7 @@ struct ColorQuery {
     seed: String,
     backgrounds: Vec<String>,
     preference_backgrounds: Vec<String>,
-    contrast_ceilings: Vec<u64>,
+    per_background_contrast: PerBackgroundContrast<Vec<u64>>,
     contrast: MetricBandQuery,
     avoid: Vec<String>,
     lower_lightness: u64,
@@ -52,12 +52,47 @@ struct ColorQuery {
     prefer_background: bool,
 }
 
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum PerBackgroundContrast<T> {
+    None,
+    Floors(T),
+    Ceilings(T),
+}
+
+impl<'a> PerBackgroundContrast<&'a [f64]> {
+    const fn floors(floors: &'a [f64]) -> Self {
+        if floors.is_empty() {
+            Self::None
+        } else {
+            Self::Floors(floors)
+        }
+    }
+
+    const fn ceilings(ceilings: &'a [f64]) -> Self {
+        if ceilings.is_empty() {
+            Self::None
+        } else {
+            Self::Ceilings(ceilings)
+        }
+    }
+
+    fn cache_key(self) -> PerBackgroundContrast<Vec<u64>> {
+        let bits = |values: &[f64]| values.iter().map(|value| value.to_bits()).collect();
+        match self {
+            Self::None => PerBackgroundContrast::None,
+            Self::Floors(values) => PerBackgroundContrast::Floors(bits(values)),
+            Self::Ceilings(values) => PerBackgroundContrast::Ceilings(bits(values)),
+        }
+    }
+}
+
 #[derive(Hash, PartialEq, Eq)]
 struct StateQuery {
     seed: String,
     backgrounds: Vec<String>,
     contrast: MetricBandQuery,
     delta_e: MetricBandQuery,
+    minimum_chroma: u64,
     references: Vec<(String, u64, u64)>,
 }
 
@@ -205,6 +240,7 @@ pub(crate) struct StateFitRequest<'a> {
     pub(crate) backgrounds: &'a [String],
     pub(crate) contrast: MetricBand,
     pub(crate) delta_e: MetricBand,
+    pub(crate) minimum_chroma: f64,
     pub(crate) references: &'a [(String, f64, f64)],
 }
 
@@ -218,8 +254,14 @@ impl<'a> StateFitRequest<'a> {
             backgrounds,
             contrast,
             delta_e,
+            minimum_chroma: 0.0,
             references: &[],
         }
+    }
+
+    pub(crate) const fn with_minimum_chroma(mut self, minimum_chroma: f64) -> Self {
+        self.minimum_chroma = minimum_chroma;
+        self
     }
 
     pub(crate) const fn with_references(mut self, references: &'a [(String, f64, f64)]) -> Self {
@@ -232,6 +274,7 @@ impl<'a> StateFitRequest<'a> {
         self.delta_e.validate("state delta E", |name, value| {
             finite_at_least(name, value, 0.0)
         })?;
+        finite_at_least("state minimum chroma", self.minimum_chroma, 0.0)?;
         for (_, reference_target, reference_delta) in self.references {
             valid_contrast("state reference contrast", *reference_target)?;
             finite_at_least("state reference delta E", *reference_delta, 0.0)?;
@@ -1321,10 +1364,17 @@ struct StateCandidateContext<'a> {
     references: &'a [StateReference],
     contrast: MetricBand,
     delta_e: MetricBand,
+    minimum_chroma: f64,
 }
 
 impl StateCandidateContext<'_> {
     fn feasible_rank(&self, candidate: &TransformCandidate) -> Option<[f64; 6]> {
+        if self.minimum_chroma > 0.0
+            && lab_chroma(candidate.metrics.lab) < self.minimum_chroma - 1e-12
+        {
+            return None;
+        }
+
         let mut final_distance = 0.0;
         let mut overshoot = 0.0;
         let mut deficit = 0.0;
@@ -1390,7 +1440,11 @@ impl StateCandidateContext<'_> {
 
     fn best_effort_rank(&self, candidate: &TransformCandidate) -> [f64; 6] {
         let mut overshoot = 0.0;
-        let mut hard_deficit = 0.0;
+        let mut hard_deficit = if self.minimum_chroma > 0.0 {
+            shortfall(lab_chroma(candidate.metrics.lab), self.minimum_chroma)
+        } else {
+            0.0
+        };
         let mut ceiling_excess = 0.0;
         let mut preference_distance = 0.0;
 
@@ -1551,6 +1605,58 @@ fn excess(actual: f64, maximum: f64) -> f64 {
     ((actual - maximum) / actual.max(1e-12)).max(0.0)
 }
 
+#[inline]
+fn color_contrasts_satisfy(
+    candidate: ColorMetrics,
+    backgrounds: &[ColorMetrics],
+    per_background: PerBackgroundContrast<&[f64]>,
+    band: MetricBand,
+    mut observe: impl FnMut(f64, f64),
+) -> bool {
+    let minimum = band.minimum();
+    let maximum = band.maximum();
+    // Most fits have no per-background override. Specialized loops avoid an
+    // optional lookup for every candidate in this cold-generation hot path.
+    match per_background {
+        PerBackgroundContrast::None => {
+            for background in backgrounds {
+                let contrast = candidate.contrast(*background);
+                if !candidate.contrast_at_least(*background, minimum - 1e-12)
+                    || maximum.is_some_and(|maximum| contrast > maximum + 1e-12)
+                {
+                    return false;
+                }
+                observe(contrast, minimum);
+            }
+        }
+        PerBackgroundContrast::Ceilings(ceilings) => {
+            for (background, ceiling) in backgrounds.iter().zip(ceilings) {
+                let contrast = candidate.contrast(*background);
+                if !candidate.contrast_at_least(*background, minimum - 1e-12)
+                    || maximum.is_some_and(|maximum| contrast > maximum + 1e-12)
+                    || contrast > *ceiling + 1e-12
+                {
+                    return false;
+                }
+                observe(contrast, minimum);
+            }
+        }
+        PerBackgroundContrast::Floors(floors) => {
+            for (background, floor) in backgrounds.iter().zip(floors) {
+                let floor = floor.max(minimum);
+                let contrast = candidate.contrast(*background);
+                if !candidate.contrast_at_least(*background, floor - 1e-12)
+                    || maximum.is_some_and(|maximum| contrast > maximum + 1e-12)
+                {
+                    return false;
+                }
+                observe(contrast, floor);
+            }
+        }
+    }
+    true
+}
+
 fn opaque_color_metrics(value: &str, label: &str) -> Result<ColorMetrics> {
     normalize_hex(value, label)?;
     ColorMetrics::from_hex(value)
@@ -1683,7 +1789,7 @@ impl Search {
         seed: &str,
         backgrounds: &[ColorMetrics],
         preference_backgrounds: &[ColorMetrics],
-        contrast_ceilings: &[f64],
+        per_background: PerBackgroundContrast<&[f64]>,
         avoid: &[ColorMetrics],
         bounds: FitBounds,
     ) -> Result<String> {
@@ -1697,19 +1803,40 @@ impl Search {
             / preference_backgrounds.len() as f64;
         let mut best: Option<(Rgb24, [f64; 5])> = None;
         let mut consider = |metrics: ColorMetrics, distance: f64, retention: f64| {
-            let chroma = lab_chroma(metrics.lab);
             let mut hard_deficit = shortfall(metrics.lab[0], bounds.lower_lightness)
-                + shortfall(bounds.upper_lightness, metrics.lab[0])
-                + shortfall(chroma, bounds.lower_chroma);
-            if bounds.upper_chroma.is_finite() {
-                hard_deficit += shortfall(bounds.upper_chroma, chroma);
+                + shortfall(bounds.upper_lightness, metrics.lab[0]);
+            if bounds.lower_chroma > 0.0 || bounds.upper_chroma.is_finite() {
+                let chroma = lab_chroma(metrics.lab);
+                hard_deficit += shortfall(chroma, bounds.lower_chroma);
+                if bounds.upper_chroma.is_finite() {
+                    hard_deficit += shortfall(bounds.upper_chroma, chroma);
+                }
             }
-            hard_deficit += backgrounds
-                .iter()
-                .map(|background| {
-                    shortfall(metrics.contrast(*background), bounds.contrast.minimum())
-                })
-                .sum::<f64>();
+            hard_deficit += match per_background {
+                PerBackgroundContrast::Floors(floors) => backgrounds
+                    .iter()
+                    .zip(floors)
+                    .map(|(background, floor)| {
+                        shortfall(
+                            metrics.contrast(*background),
+                            floor.max(bounds.contrast.minimum()),
+                        )
+                    })
+                    .sum::<f64>(),
+                PerBackgroundContrast::None | PerBackgroundContrast::Ceilings(_) => backgrounds
+                    .iter()
+                    .map(|background| {
+                        shortfall(metrics.contrast(*background), bounds.contrast.minimum())
+                    })
+                    .sum::<f64>(),
+            };
+            if let PerBackgroundContrast::Ceilings(ceilings) = per_background {
+                hard_deficit += backgrounds
+                    .iter()
+                    .zip(ceilings)
+                    .map(|(background, maximum)| excess(metrics.contrast(*background), *maximum))
+                    .sum::<f64>();
+            }
             hard_deficit += avoid
                 .iter()
                 .map(|other| {
@@ -1717,17 +1844,12 @@ impl Search {
                         + shortfall(metrics.delta_e(*other), 0.10)
                 })
                 .sum::<f64>();
-            let mut ceiling_excess = bounds.contrast.maximum().map_or(0.0, |maximum| {
+            let ceiling_excess = bounds.contrast.maximum().map_or(0.0, |maximum| {
                 backgrounds
                     .iter()
                     .map(|background| excess(metrics.contrast(*background), maximum))
                     .sum::<f64>()
             });
-            ceiling_excess += backgrounds
-                .iter()
-                .zip(contrast_ceilings)
-                .map(|(background, maximum)| excess(metrics.contrast(*background), *maximum))
-                .sum::<f64>();
             let preference = if let Some(preferred_log) = preferred_log {
                 let mean_log_contrast = preference_backgrounds
                     .iter()
@@ -2165,11 +2287,11 @@ impl Search {
         avoid: &[String],
         bounds: FitBounds,
     ) -> Result<String> {
-        self.fit_color_bounded_with_contrast_ceilings(
+        self.fit_color_bounded_with_per_background_contrast(
             seed,
             backgrounds,
             preference_backgrounds,
-            &[],
+            PerBackgroundContrast::None,
             avoid,
             bounds,
         )
@@ -2184,23 +2306,67 @@ impl Search {
         avoid: &[String],
         bounds: FitBounds,
     ) -> Result<String> {
+        self.fit_color_bounded_with_per_background_contrast(
+            seed,
+            backgrounds,
+            preference_backgrounds,
+            PerBackgroundContrast::ceilings(contrast_ceilings),
+            avoid,
+            bounds,
+        )
+    }
+
+    pub(crate) fn fit_color_bounded_with_contrast_floors(
+        &mut self,
+        seed: &str,
+        backgrounds: &[String],
+        preference_backgrounds: &[String],
+        contrast_floors: &[f64],
+        avoid: &[String],
+        bounds: FitBounds,
+    ) -> Result<String> {
+        self.fit_color_bounded_with_per_background_contrast(
+            seed,
+            backgrounds,
+            preference_backgrounds,
+            PerBackgroundContrast::floors(contrast_floors),
+            avoid,
+            bounds,
+        )
+    }
+
+    fn fit_color_bounded_with_per_background_contrast(
+        &mut self,
+        seed: &str,
+        backgrounds: &[String],
+        preference_backgrounds: &[String],
+        per_background: PerBackgroundContrast<&[f64]>,
+        avoid: &[String],
+        bounds: FitBounds,
+    ) -> Result<String> {
         bounds.validate()?;
-        if !contrast_ceilings.is_empty() && contrast_ceilings.len() != backgrounds.len() {
-            return Err(Error::invalid(
-                "contrast ceilings must match the background count",
-            ));
-        }
-        for ceiling in contrast_ceilings {
-            valid_contrast("color contrast ceiling", *ceiling)?;
-        }
+        let validate_values = |values: &[f64], kind: &str| -> Result<()> {
+            if values.len() != backgrounds.len() {
+                return Err(Error::invalid(format!(
+                    "contrast {kind}s must match the background count"
+                )));
+            }
+            let label = format!("color contrast {kind}");
+            for value in values {
+                valid_contrast(&label, *value)?;
+            }
+            Ok(())
+        };
+        match per_background {
+            PerBackgroundContrast::None => Ok(()),
+            PerBackgroundContrast::Floors(values) => validate_values(values, "floor"),
+            PerBackgroundContrast::Ceilings(values) => validate_values(values, "ceiling"),
+        }?;
         let query = ColorQuery {
             seed: seed.to_owned(),
             backgrounds: backgrounds.to_vec(),
             preference_backgrounds: preference_backgrounds.to_vec(),
-            contrast_ceilings: contrast_ceilings
-                .iter()
-                .map(|value| value.to_bits())
-                .collect(),
+            per_background_contrast: per_background.cache_key(),
             contrast: bounds.contrast.into(),
             avoid: avoid.to_vec(),
             lower_lightness: bounds.lower_lightness.to_bits(),
@@ -2216,7 +2382,7 @@ impl Search {
             seed,
             backgrounds,
             preference_backgrounds,
-            contrast_ceilings,
+            per_background,
             avoid,
             bounds,
         );
@@ -2229,14 +2395,13 @@ impl Search {
         seed: &str,
         backgrounds: &[String],
         preference_backgrounds: &[String],
-        contrast_ceilings: &[f64],
+        per_background: PerBackgroundContrast<&[f64]>,
         avoid: &[String],
         bounds: FitBounds,
     ) -> Result<String> {
         if backgrounds.is_empty() || preference_backgrounds.is_empty() {
             return Err(Error::invalid("fit_color requires at least one background"));
         }
-
         let source_metrics = opaque_color_metrics(seed, "fit_color seed")?;
         let source_chroma = lab_chroma(source_metrics.lab);
         let source_retention = source_chroma / source_chroma.max(1e-12);
@@ -2257,32 +2422,17 @@ impl Search {
             .map(|metrics| metrics.lab[0])
             .sum::<f64>()
             / preference_background_metrics.len() as f64;
-        let passes = |candidate: ColorMetrics| {
+        let passes_noncontrast = |candidate: ColorMetrics| {
             if candidate.lab[0] < bounds.lower_lightness - 1e-12
                 || candidate.lab[0] > bounds.upper_lightness + 1e-12
             {
                 return false;
             }
-            let chroma = lab_chroma(candidate.lab);
-            if chroma < bounds.lower_chroma - 1e-12 || chroma > bounds.upper_chroma + 1e-12 {
-                return false;
-            }
-            if background_metrics
-                .iter()
-                .enumerate()
-                .any(|(index, background)| {
-                    let contrast = candidate.contrast(*background);
-                    !candidate.contrast_at_least(*background, bounds.contrast.minimum() - 1e-12)
-                        || bounds
-                            .contrast
-                            .maximum()
-                            .is_some_and(|maximum| contrast > maximum + 1e-12)
-                        || contrast_ceilings
-                            .get(index)
-                            .is_some_and(|maximum| contrast > *maximum + 1e-12)
-                })
-            {
-                return false;
+            if bounds.lower_chroma > 0.0 || bounds.upper_chroma.is_finite() {
+                let chroma = lab_chroma(candidate.lab);
+                if chroma < bounds.lower_chroma - 1e-12 || chroma > bounds.upper_chroma + 1e-12 {
+                    return false;
+                }
             }
             for other in &avoid_metrics {
                 if (candidate.lab[0] - other.lab[0]).abs() < 0.05 - 1e-12
@@ -2292,6 +2442,16 @@ impl Search {
                 }
             }
             true
+        };
+        let passes = |candidate: ColorMetrics| {
+            passes_noncontrast(candidate)
+                && color_contrasts_satisfy(
+                    candidate,
+                    &background_metrics,
+                    per_background,
+                    bounds.contrast,
+                    |_, _| {},
+                )
         };
 
         if passes(source_metrics)
@@ -2309,16 +2469,19 @@ impl Search {
                 }) {
                     break;
                 }
-                if !passes(candidate.metrics) {
+                if !passes_noncontrast(candidate.metrics) {
                     continue;
                 }
-                let overshoot = background_metrics
-                    .iter()
-                    .map(|background| {
-                        (candidate.metrics.contrast(*background) - bounds.contrast.minimum())
-                            .max(0.0)
-                    })
-                    .sum();
+                let mut overshoot = 0.0;
+                if !color_contrasts_satisfy(
+                    candidate.metrics,
+                    &background_metrics,
+                    per_background,
+                    bounds.contrast,
+                    |contrast, floor| overshoot += (contrast - floor).max(0.0),
+                ) {
+                    continue;
+                }
                 let rank = [candidate.distance, overshoot, -candidate.retention];
                 if best.as_ref().is_none_or(|(best_color, best_rank)| {
                     rank_cmp(&rank, best_rank)
@@ -2335,7 +2498,7 @@ impl Search {
                 seed,
                 &background_metrics,
                 &preference_background_metrics,
-                contrast_ceilings,
+                per_background,
                 &avoid_metrics,
                 bounds,
             );
@@ -2344,16 +2507,40 @@ impl Search {
         if let Some(preferred_contrast) = bounds.contrast.preferred() {
             let mut best: Option<(Rgb24, [f64; 3])> = None;
             let preferred_log = preferred_contrast.ln();
+            let shared_preference_backgrounds = backgrounds == preference_backgrounds;
             let mut consider =
                 |candidate: Rgb24, metrics: ColorMetrics, distance: f64, retention: f64| {
-                    if !passes(metrics) {
+                    if !passes_noncontrast(metrics) {
                         return;
                     }
-                    let mean_log_contrast = preference_background_metrics
-                        .iter()
-                        .map(|background| metrics.contrast(*background).ln())
-                        .sum::<f64>()
-                        / preference_background_metrics.len() as f64;
+                    let mean_log_contrast = if shared_preference_backgrounds {
+                        let mut sum = 0.0;
+                        if !color_contrasts_satisfy(
+                            metrics,
+                            &background_metrics,
+                            per_background,
+                            bounds.contrast,
+                            |contrast, _| sum += contrast.ln(),
+                        ) {
+                            return;
+                        }
+                        sum / background_metrics.len() as f64
+                    } else {
+                        if !color_contrasts_satisfy(
+                            metrics,
+                            &background_metrics,
+                            per_background,
+                            bounds.contrast,
+                            |_, _| {},
+                        ) {
+                            return;
+                        }
+                        preference_background_metrics
+                            .iter()
+                            .map(|background| metrics.contrast(*background).ln())
+                            .sum::<f64>()
+                            / preference_background_metrics.len() as f64
+                    };
                     let primary = (mean_log_contrast - preferred_log).abs();
                     let secondary = if bounds.prefer_background {
                         (metrics.lab[0] - background_lightness).abs()
@@ -2389,7 +2576,7 @@ impl Search {
                 seed,
                 &background_metrics,
                 &preference_background_metrics,
-                contrast_ceilings,
+                per_background,
                 &avoid_metrics,
                 bounds,
             );
@@ -2401,15 +2588,19 @@ impl Search {
                         distance: f64,
                         retention: f64,
                         best: &mut Option<(Rgb24, [f64; 4])>| {
-            if !passes(metrics) {
+            if !passes_noncontrast(metrics) {
                 return;
             }
-            let overshoot = background_metrics
-                .iter()
-                .map(|background| {
-                    (metrics.contrast(*background) - bounds.contrast.minimum()).max(0.0)
-                })
-                .sum();
+            let mut overshoot = 0.0;
+            if !color_contrasts_satisfy(
+                metrics,
+                &background_metrics,
+                per_background,
+                bounds.contrast,
+                |contrast, floor| overshoot += (contrast - floor).max(0.0),
+            ) {
+                return;
+            }
             let rank = [
                 (metrics.lab[0] - background_lightness).abs(),
                 overshoot,
@@ -2446,7 +2637,7 @@ impl Search {
             seed,
             &background_metrics,
             &preference_background_metrics,
-            contrast_ceilings,
+            per_background,
             &avoid_metrics,
             bounds,
         )
@@ -3011,6 +3202,7 @@ impl Search {
             backgrounds: request.backgrounds.to_vec(),
             contrast: request.contrast.into(),
             delta_e: request.delta_e.into(),
+            minimum_chroma: request.minimum_chroma.to_bits(),
             references: request
                 .references
                 .iter()
@@ -3051,6 +3243,7 @@ impl Search {
             references: &reference_metrics,
             contrast: request.contrast,
             delta_e: request.delta_e,
+            minimum_chroma: request.minimum_chroma,
         };
         let mut best: Option<(Rgb24, [f64; 6])> = None;
         let table = self.transform_table(seed)?;
@@ -3990,6 +4183,73 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn per_background_contrast_floors_are_enforced_and_cached_separately() {
+        let backgrounds = vec!["#121212".to_owned(), "#303030".to_owned()];
+        let bounds = FitBounds::new(MetricBand::floor(1.10));
+        let mut search = Search::default();
+        let first_floors = [4.00, 2.50];
+        let first = search
+            .fit_color_bounded_with_contrast_floors(
+                "#777777",
+                &backgrounds,
+                &backgrounds,
+                &first_floors,
+                &[],
+                bounds,
+            )
+            .unwrap();
+        let second_floors = [5.00, 3.50];
+        let second = search
+            .fit_color_bounded_with_contrast_floors(
+                "#777777",
+                &backgrounds,
+                &backgrounds,
+                &second_floors,
+                &[],
+                bounds,
+            )
+            .unwrap();
+
+        for (output, floors) in [(&first, first_floors), (&second, second_floors)] {
+            for (background, floor) in backgrounds.iter().zip(floors) {
+                assert!(contrast_ratio(output, background).unwrap() >= floor - 1e-9);
+            }
+        }
+        assert_eq!(search.color_results.len(), 2);
+
+        let error = search
+            .fit_color_bounded_with_contrast_floors(
+                "#777777",
+                &backgrounds,
+                &backgrounds,
+                &[2.0],
+                &[],
+                bounds,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn state_minimum_chroma_is_enforced_and_cached_separately() {
+        let backgrounds = vec!["#f5f5f5".to_owned()];
+        let mut search = Search::default();
+        let band = StateFitRequest::new(
+            &backgrounds,
+            MetricBand::bounded(1.20, 1.40, 1.65),
+            MetricBand::bounded(0.030, 0.080, 0.250),
+        );
+        let neutral_allowed = search.fit_state_request("#3264eb", band).unwrap();
+        let tinted = search
+            .fit_state_request("#3264eb", band.with_minimum_chroma(0.040))
+            .unwrap();
+
+        assert!(lab_chroma(ColorMetrics::from_hex(&tinted).unwrap().lab) >= 0.040 - 1e-9);
+        assert_eq!(search.state_results.len(), 2);
+        assert_ne!(neutral_allowed, tinted);
     }
 
     #[test]

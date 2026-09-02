@@ -11,7 +11,7 @@ pub mod profile;
 
 use crate::Result;
 use crate::color::{
-    contrast_ratio, gamut_map_oklch_unchecked, lab, oklab_to_oklch, validate_opaque_hex,
+    gamut_map_oklch_unchecked, geometric_contrast, lab, oklab_to_oklch, validate_opaque_hex,
 };
 use crate::constants::SYNTAX_DIFF_CONTRACT;
 use crate::palette::ResolvedPalette;
@@ -70,20 +70,6 @@ struct FamilyFitRequest<'a> {
 pub struct SyntaxContexts<'a> {
     pub ordinary: &'a [String],
     pub rendered: &'a [String],
-}
-
-fn geometric_contrast(color: &str, contexts: &[String]) -> Result<f64> {
-    if contexts.is_empty() {
-        return Err(crate::Error::invalid(
-            "syntax tone fitting requires at least one preference context",
-        ));
-    }
-    let mean_log = contexts
-        .iter()
-        .map(|context| contrast_ratio(color, context).map(f64::ln))
-        .sum::<Result<f64>>()?
-        / contexts.len() as f64;
-    Ok(mean_log.exp())
 }
 
 fn role_source_preferences(role: SemanticRole) -> &'static [&'static str] {

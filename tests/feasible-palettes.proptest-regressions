@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc edf12ff8443044a8737b0149cdc932456421324529881834e5ab26161e689fcc # shrinks to spec = PaletteSpec { dark: false, background_step: 1, foreground_step: 6, hue_degrees: 109, chroma_step: 0, semantic_variation: [[0, 0, 0], [0, 0, 0], [8, 124, -89], [50, -88, -5], [125, 50, -59], [-2, -47, -124], [-98, -38, 5], [75, -76, -67]], provenance_mask: 12104832592286157069 }
+cc 4c042ac8e9f4938794d249a9593a9fd3d2c10628558a88dccf767c44975d5438 # shrinks to spec = PaletteSpec { dark: false, background_step: 17, foreground_step: 0, hue_degrees: 95, chroma_step: 0, semantic_variation: [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 24], [-17, 68, -75], [-36, -81, 110], [66, -92, -122]], provenance_mask: 18446744073709551615 }

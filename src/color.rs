@@ -676,6 +676,20 @@ pub fn contrast_ratio(first: &str, second: &str) -> Result<f64> {
     Ok((first.max(second) + 0.05) / (first.min(second) + 0.05))
 }
 
+pub(crate) fn geometric_contrast(color: &str, backgrounds: &[String]) -> Result<f64> {
+    if backgrounds.is_empty() {
+        return Err(Error::invalid(
+            "geometric contrast requires at least one background",
+        ));
+    }
+    let mean_log = backgrounds
+        .iter()
+        .map(|background| contrast_ratio(color, background).map(f64::ln))
+        .sum::<Result<f64>>()?
+        / backgrounds.len() as f64;
+    Ok(mean_log.exp())
+}
+
 pub fn gpui_blend(base: &str, overlay: &str) -> Result<Rgba> {
     let (base, overlay) = (parse_hex(base)?, parse_hex(overlay)?);
     if overlay.a >= 1.0 {

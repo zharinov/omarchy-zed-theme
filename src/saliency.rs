@@ -1,6 +1,6 @@
 //! Shared contrast-relative saliency policy for editor foreground roles.
 
-use crate::color::contrast_ratio;
+use crate::color::{contrast_ratio, geometric_contrast};
 use crate::search::{FitBounds, MetricBand, Search};
 use crate::{Error, Result};
 
@@ -44,21 +44,6 @@ impl<'a> SaliencyRequest<'a> {
     }
 }
 
-fn geometric_contrast(color: &str, backgrounds: &[String]) -> Result<f64> {
-    if backgrounds.is_empty() {
-        return Err(Error::invalid(
-            "relative saliency requires at least one background",
-        ));
-    }
-
-    let mean_log = backgrounds
-        .iter()
-        .map(|background| contrast_ratio(color, background).map(f64::ln))
-        .sum::<Result<f64>>()?
-        / backgrounds.len() as f64;
-    Ok(mean_log.exp())
-}
-
 pub fn fit_relative(
     search: &mut Search,
     seed: &str,
@@ -90,6 +75,11 @@ pub fn fit_relative(
             "saliency maximum must be finite and in {preferred_saliency}..=1, got {maximum:?}"
         )));
     }
+    if backgrounds.is_empty() {
+        return Err(Error::invalid(
+            "relative saliency requires at least one background",
+        ));
+    }
 
     let reference_contrast = geometric_contrast(reference, backgrounds)?;
     let preferred_contrast = (reference_contrast.ln() * preferred_saliency)
@@ -114,14 +104,43 @@ pub fn fit_relative(
         .transpose()?
         .unwrap_or_default();
 
-    let output = search.fit_color_bounded_with_contrast_ceilings(
-        seed,
-        backgrounds,
-        backgrounds,
-        &contrast_ceilings,
-        &[],
-        bounds,
-    )?;
+    let fit = |search: &mut Search, seed: &str| {
+        search.fit_color_bounded_with_contrast_ceilings(
+            seed,
+            backgrounds,
+            backgrounds,
+            &contrast_ceilings,
+            &[],
+            bounds,
+        )
+    };
+    let violates_hierarchy_bounds = |color: &str| -> Result<bool> {
+        backgrounds.iter().zip(&contrast_ceilings).try_fold(
+            false,
+            |exceeded, (background, ceiling)| {
+                let contrast = contrast_ratio(color, background)?;
+                Ok(exceeded || contrast < hard_floor - 1e-12 || contrast > *ceiling + 1e-12)
+            },
+        )
+    };
+
+    let mut output = fit(search, seed)?;
+    if let Some(reference) = contrast_ceiling
+        && violates_hierarchy_bounds(&output)?
+    {
+        // A fixed-hue best-effort search may have no candidate that satisfies
+        // both bounds. The parent hue makes hierarchy-safe candidates reachable
+        // without abandoning the requested saliency first.
+        output = fit(search, reference)?;
+        let reference_meets_floor = backgrounds.iter().try_fold(true, |passes, background| {
+            Ok::<bool, Error>(
+                passes && contrast_ratio(reference, background)? >= hard_floor - 1e-12,
+            )
+        })?;
+        if violates_hierarchy_bounds(&output)? && reference_meets_floor {
+            output = reference.to_owned();
+        }
+    }
     let actual_contrast = geometric_contrast(&output, backgrounds)?;
     let actual_saliency = actual_contrast.ln() / reference_contrast.ln().max(1e-12);
 
@@ -147,5 +166,31 @@ mod tests {
         )
         .unwrap();
         assert!((fit.actual_saliency - INACTIVE_LINE_NUMBER_SALIENCY).abs() < 0.03);
+    }
+
+    #[test]
+    fn relative_fit_preserves_the_hard_floor_and_parent_hierarchy() {
+        let backgrounds = vec![
+            "#17171e".to_owned(),
+            "#25252e".to_owned(),
+            "#223249".to_owned(),
+        ];
+        let parent = "#98989a";
+        let fit = fit_relative(
+            &mut Search::default(),
+            "#727169",
+            "#dcd7ba",
+            SaliencyRequest::new(&backgrounds, 4.50, 0.38)
+                .with_maximum_saliency(0.42)
+                .with_contrast_ceiling(parent),
+        )
+        .unwrap();
+
+        for background in &backgrounds {
+            let contrast = contrast_ratio(&fit.output, background).unwrap();
+            let parent_contrast = contrast_ratio(parent, background).unwrap();
+            assert!(contrast >= 4.50 - 1e-9);
+            assert!(contrast <= parent_contrast + 1e-9);
+        }
     }
 }
