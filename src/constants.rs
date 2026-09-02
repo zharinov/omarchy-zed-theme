@@ -1,19 +1,15 @@
 pub const SCHEMA_URL: &str = "https://zed.dev/schema/themes/v0.2.0.json";
 pub const THEME_NAME: &str = "Omarchy";
 
-// This 384-step grid intentionally oversamples the 8-bit output: the tested
-// 256-step alternative skipped feasible boundary colors after gamut mapping.
+// This 384-step grid intentionally oversamples the 8-bit output: a tested
+// 256-step alternative skipped boundary colors after gamut mapping.
 pub const CANDIDATE_LIGHTNESS_STEPS: u16 = 384;
 pub const CANDIDATE_CHROMA_STEPS: u8 = 16;
 
-// Search targets leave quantization headroom above the corresponding hard floors.
-// Validation uses the hard floors and remains the final authority.
 pub const TEXT_CONTRAST: f64 = 4.52;
 pub const CONTROL_CONTRAST: f64 = 3.02;
 pub const PASSIVE_CONTRAST: f64 = 1.52;
 pub const HARD_TEXT_CONTRAST: f64 = 4.50;
-pub const HARD_CONTROL_CONTRAST: f64 = 3.00;
-pub const HARD_PASSIVE_CONTRAST: f64 = 1.50;
 pub const TERMINAL_NORMAL_PREFERRED: f64 = 5.52;
 pub const TERMINAL_BRIGHT_PREFERRED: f64 = 7.02;
 pub const STATE_HOVER_CONTRAST: f64 = 1.20;
@@ -28,7 +24,6 @@ pub const RUNTIME_STATE_CONSECUTIVE_DELTA_E: f64 = 0.005;
 pub const UI_STATE_TEXT_CONTRAST: f64 = TEXT_CONTRAST * 1.75 * 1.05;
 pub const LAYER_HOVER_CONTRAST: f64 = 1.35;
 pub const LAYER_ACTIVE_CONTRAST: f64 = 1.55;
-pub const LAYER_SELECTED_CONTRAST: f64 = 1.75;
 pub const TAB_STATE_CONTRAST: f64 = 1.08;
 pub const SEARCH_MATCH_CONTRAST: f64 = 1.20;
 pub const SEARCH_ACTIVE_CONTRAST: f64 = 1.40;
@@ -40,12 +35,11 @@ pub const EDITOR_CANVAS_TEXT_CONTRAST: f64 = EDITOR_BASE_TEXT_CONTRAST * STATE_S
 pub const FOCUSED_SELECTION_CONTRAST: f64 = 1.20;
 pub const FOCUSED_SELECTION_DELTA_E: f64 = 0.040;
 pub const PLAYER_SELECTION_DELTA_E: f64 = 0.001;
-// Cursor colors cross more editor composites than accents, so they have a
-// separate achievable contract that the solver and emitted-theme validator share.
+// Cursor colors cross more editor composites than accents, so they use a
+// separate achievable separation target.
 pub const PLAYER_CURSOR_NORMAL_DELTA_E: f64 = 0.025;
 pub const PLAYER_CURSOR_CVD_DELTA_E: f64 = 0.012;
 pub const OVERLAY_MAX_ALPHA: u8 = 250;
-pub const PREFERRED_HIGHLIGHT_MAX_ALPHA: u8 = 166;
 // Opacity and salience are presentation inputs established by rendered comparison.
 // They are deliberately not treated as proof that a diff looks good.
 pub const LIGHT_DIFF_LINE_OPACITY: f64 = 0.18;

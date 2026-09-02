@@ -19,6 +19,7 @@ pub struct PaletteSpec {
 #[derive(Clone, Debug)]
 pub enum PaletteMutation {
     Random(BTreeMap<usize, [u8; 3]>),
+    CollapseAll([u8; 3]),
     CollapseSurfaces([u8; 3]),
     ForegroundMatchesBackground,
     CollapseSemantics([u8; 3]),
@@ -62,33 +63,61 @@ pub fn production_palette_specs() -> impl Strategy<Value = PaletteSpec> {
         )
 }
 
-pub fn structurally_valid_palette_specs() -> impl Strategy<Value = (PaletteSpec, PaletteMutation)> {
-    let mutations = prop_oneof![
-        4 => prop::collection::btree_map(
-            0..CANONICAL_COLOR_KEYS.len(),
-            edge_rgb(),
-            1..=5,
-        ).prop_map(PaletteMutation::Random),
-        1 => edge_rgb().prop_map(PaletteMutation::CollapseSurfaces),
-        1 => Just(PaletteMutation::ForegroundMatchesBackground),
-        1 => edge_rgb().prop_map(PaletteMutation::CollapseSemantics),
-        1 => Just(PaletteMutation::SelectionMatchesBackground),
-        1 => Just(PaletteMutation::SwapEndpoints),
-    ];
-    (production_palette_specs(), mutations)
+pub fn arbitrary_resolved_palettes() -> impl Strategy<Value = ResolvedPalette> {
+    let length = CANONICAL_COLOR_KEYS.len();
+    (
+        any::<bool>(),
+        prop::collection::vec(edge_rgb(), length..=length),
+        prop::collection::vec(
+            prop_oneof![
+                Just(Provenance::Direct),
+                Just(Provenance::Alias),
+                Just(Provenance::Derived),
+            ],
+            length..=length,
+        ),
+    )
+        .prop_map(|(dark, values, provenance)| ResolvedPalette {
+            mode: if dark { "dark" } else { "light" }.into(),
+            colors: CANONICAL_COLOR_KEYS
+                .iter()
+                .copied()
+                .zip(values.into_iter().map(hex))
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+            provenance: CANONICAL_COLOR_KEYS
+                .iter()
+                .copied()
+                .zip(provenance)
+                .map(|(key, provenance)| (key.to_owned(), provenance))
+                .collect(),
+        })
 }
 
-pub fn light_high_chroma_boundary_palette() -> ResolvedPalette {
-    PaletteSpec {
-        dark: false,
-        background_step: 22,
-        foreground_step: 0,
-        hue_degrees: 346,
-        chroma_step: 8,
-        semantic_variation: [[0; 3]; 8],
-        provenance_mask: 0,
-    }
-    .resolve()
+pub fn pathological_palette_specs() -> impl Strategy<Value = (PaletteSpec, Vec<PaletteMutation>)> {
+    (
+        production_palette_specs(),
+        prop::collection::btree_map(
+            0..CANONICAL_COLOR_KEYS.len(),
+            edge_rgb(),
+            1..=CANONICAL_COLOR_KEYS.len(),
+        ),
+        prop::array::uniform3(edge_rgb()),
+    )
+        .prop_map(|(spec, random, [all, surfaces, semantics])| {
+            (
+                spec,
+                vec![
+                    PaletteMutation::Random(random),
+                    PaletteMutation::CollapseAll(all),
+                    PaletteMutation::CollapseSurfaces(surfaces),
+                    PaletteMutation::ForegroundMatchesBackground,
+                    PaletteMutation::CollapseSemantics(semantics),
+                    PaletteMutation::SelectionMatchesBackground,
+                    PaletteMutation::SwapEndpoints,
+                ],
+            )
+        })
 }
 
 impl PaletteSpec {
@@ -244,6 +273,11 @@ pub fn apply_color_mutation(palette: &mut ResolvedPalette, mutation: &PaletteMut
         PaletteMutation::Random(values) => {
             for (index, value) in values {
                 set(palette, CANONICAL_COLOR_KEYS[*index], hex(*value));
+            }
+        }
+        PaletteMutation::CollapseAll(value) => {
+            for key in CANONICAL_COLOR_KEYS {
+                set(palette, key, hex(*value));
             }
         }
         PaletteMutation::CollapseSurfaces(value) => {

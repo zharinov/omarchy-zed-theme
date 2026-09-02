@@ -3,7 +3,7 @@
 //! A fixed semantic hierarchy decides which syntax distinctions matter. Authored
 //! hues and neutral tones decide how those domains are rendered, while missing
 //! chromatic lineages fall back to the foreground's tone family. Contrast, diff
-//! separation, gamut, and validation remain hard constraints.
+//! separation, gamut, and saliency rank the available candidates.
 
 pub mod plan;
 pub mod policy;
@@ -11,16 +11,16 @@ pub mod profile;
 
 use crate::Result;
 use crate::color::{
-    contrast_ratio, delta_e, gamut_map_oklch_unchecked, lab, oklab_to_oklch, validate_opaque_hex,
+    contrast_ratio, gamut_map_oklch_unchecked, lab, oklab_to_oklch, validate_opaque_hex,
 };
 use crate::constants::SYNTAX_DIFF_CONTRACT;
 use crate::palette::ResolvedPalette;
 use crate::saliency::SaliencyFit;
-use crate::search::{FitBounds, PairConstraints, Search, cvd_distance};
+use crate::search::{FitBounds, PairConstraints, Search};
 use plan::{MergePlan, SemanticRole};
 use policy::{
-    CAPTURE_POLICIES, SYNTAX_ADAPTIVE_OVERLAY_FLOOR, SYNTAX_PRIMARY_FLOOR, SYNTAX_SEMANTIC_FLOOR,
-    SYNTAX_SUBDUED_FLOOR, SYNTAX_SUBDUED_OVERLAY_FLOOR,
+    CAPTURE_POLICIES, SYNTAX_ADAPTIVE_OVERLAY_FLOOR, SYNTAX_SEMANTIC_FLOOR, SYNTAX_SUBDUED_FLOOR,
+    SYNTAX_SUBDUED_OVERLAY_FLOOR,
 };
 use profile::{CHROMA_EVIDENCE, EVIDENCE_KEYS, EvidenceColor, SyntaxProfile};
 use serde_json::{Map, Value};
@@ -28,9 +28,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub use policy::{capture_policy, contrast_floor, overlay_contrast_floor};
 
-const ORDINARY_NORMAL_SEPARATION: f64 = 0.025;
-const ORDINARY_CVD_SEPARATION: f64 = 0.020;
-const MINIMUM_SEMANTIC_SALIENCY_GAP: f64 = 0.03;
 const MINIMUM_AUTHORED_CHROMA_RETENTION: f64 = 0.60;
 const SUBDUED_SALIENCY: f64 = 0.55;
 const SOURCE_KEY_ORDER: [&str; 15] = EVIDENCE_KEYS;
@@ -73,12 +70,6 @@ struct FamilyFitRequest<'a> {
 pub struct SyntaxContexts<'a> {
     pub ordinary: &'a [String],
     pub rendered: &'a [String],
-}
-
-fn minimum_contrast(color: &str, contexts: &[String]) -> Result<f64> {
-    contexts.iter().try_fold(f64::INFINITY, |minimum, context| {
-        Ok(minimum.min(contrast_ratio(color, context)?))
-    })
 }
 
 fn geometric_contrast(color: &str, contexts: &[String]) -> Result<f64> {
@@ -274,39 +265,16 @@ fn allocate_family(search: &mut Search, request: FamilyFitRequest<'_>) -> Result
     })
 }
 
-fn separated_from(
-    candidate: &str,
-    existing: impl IntoIterator<Item = impl AsRef<str>>,
-) -> Result<bool> {
-    for color in existing {
-        let color = color.as_ref();
-        if delta_e(candidate, color)? < ORDINARY_NORMAL_SEPARATION - 1e-12
-            || cvd_distance(candidate, color)? < ORDINARY_CVD_SEPARATION - 1e-12
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn semantic_above_subdued(allocations: &[FamilyAllocation], subdued_saliency: f64) -> bool {
-    allocations.iter().all(|allocation| {
-        allocation.measured_saliency >= subdued_saliency + MINIMUM_SEMANTIC_SALIENCY_GAP - 1e-12
-    })
-}
-
 struct SemanticSearchRequest<'a> {
     preference_contexts: &'a [String],
     required_contexts: &'a [String],
     reference: &'a str,
     profile: &'a SyntaxProfile,
-    fixed_outputs: [&'a str; 2],
     hierarchy: &'a MergePlan,
     subdued_saliency: f64,
 }
 
-// Derived ordering makes this field order the search objective, from strongest
-// feasibility requirement to weakest deterministic tie-break.
+// Derived ordering makes this field order the semantic coverage objective.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 struct SemanticScore {
     trunk_count: usize,
@@ -480,7 +448,7 @@ fn search_semantic_forest(
     }
 
     // The bound deliberately overestimates every remaining score component, so
-    // pruning cannot remove a feasible improvement.
+    // pruning cannot remove a better allocation.
     if prune
         && optimistic_semantic_score(request.hierarchy, request.profile, family, allocations)
             <= semantic_score(request.hierarchy, request.profile, best)
@@ -519,7 +487,7 @@ fn search_semantic_forest(
                     .clamp(request.subdued_saliency + 0.06, 0.96)
             })
             .unwrap_or(semantic.fallback_saliency);
-        let candidate = match allocate_family(
+        let candidate = allocate_family(
             search,
             FamilyFitRequest {
                 preference_contexts: request.preference_contexts,
@@ -530,37 +498,15 @@ fn search_semantic_forest(
                 source,
                 preferred_saliency,
             },
-        ) {
-            Ok(candidate) => candidate,
-            Err(error) if error.is_infeasible() => continue,
-            Err(error) => {
-                panic!("validated syntax family request failed unexpectedly: {error}")
-            }
-        };
+        )
+        .unwrap_or_else(|error| {
+            panic!("validated syntax family request failed unexpectedly: {error}")
+        });
 
         allocations.push(candidate);
-
-        if !semantic_above_subdued(allocations, request.subdued_saliency) {
-            allocations.pop();
-            continue;
-        }
-
-        let candidate = allocations
-            .last()
-            .expect("newly pushed syntax allocation must be present");
-        let existing = request.fixed_outputs.iter().copied().chain(
-            allocations[..allocations.len() - 1]
-                .iter()
-                .map(|allocation| allocation.output.as_str()),
-        );
-        if separated_from(&candidate.output, existing)? {
-            search_semantic_forest(search, request, family + 1, allocations, best, prune)?;
-        }
-
+        search_semantic_forest(search, request, family + 1, allocations, best, prune)?;
         allocations.pop();
     }
-
-    search_semantic_forest(search, request, family + 1, allocations, best, prune)?;
     Ok(())
 }
 
@@ -583,7 +529,6 @@ fn select_semantic_plan_with_pruning(
         required_contexts,
         reference,
         profile,
-        fixed_outputs,
         hierarchy: &hierarchy,
         subdued_saliency,
     };
@@ -674,12 +619,6 @@ fn fit_subdued(
             },
         },
     )?;
-    if fit.output == reference {
-        return Err(crate::Error::infeasible(
-            "base and subdued syntax roles collided exactly",
-        ));
-    }
-
     Ok(fit)
 }
 
@@ -743,13 +682,6 @@ fn build_syntax_from_validated_inputs(
 ) -> Result<Map<String, Value>> {
     let profile = profile::measure(palette)?;
     let base = saliency_reference.to_owned();
-
-    let primary_minimum = minimum_contrast(&base, required_contexts)?;
-    if primary_minimum < SYNTAX_PRIMARY_FLOOR - 1e-12 {
-        return Err(crate::Error::infeasible(format!(
-            "editor primary reaches only {primary_minimum:.3}:1 on a rendered syntax context"
-        )));
-    }
 
     let subdued_fit = fit_subdued(
         search,

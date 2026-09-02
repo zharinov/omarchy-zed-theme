@@ -45,12 +45,6 @@ fn geometric_contrast(color: &str, backgrounds: &[String]) -> Result<f64> {
     Ok(mean_log.exp())
 }
 
-pub fn relative_saliency(color: &str, reference: &str, backgrounds: &[String]) -> Result<f64> {
-    let reference_contrast = geometric_contrast(reference, backgrounds)?;
-    let actual_contrast = geometric_contrast(color, backgrounds)?;
-    Ok(actual_contrast.ln() / reference_contrast.ln().max(1e-12))
-}
-
 pub fn fit_relative(
     search: &mut Search,
     seed: &str,

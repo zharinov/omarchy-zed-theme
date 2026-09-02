@@ -13,7 +13,6 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorKind {
     InvalidInput,
-    Infeasible,
     External,
 }
 
@@ -31,13 +30,6 @@ impl Error {
         }
     }
 
-    pub fn infeasible(message: impl Into<String>) -> Self {
-        Self {
-            kind: ErrorKind::Infeasible,
-            message: message.into(),
-        }
-    }
-
     pub fn external(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::External,
@@ -47,10 +39,6 @@ impl Error {
 
     pub fn kind(&self) -> ErrorKind {
         self.kind
-    }
-
-    pub fn is_infeasible(&self) -> bool {
-        self.kind == ErrorKind::Infeasible
     }
 
     pub fn context(self, context: impl fmt::Display) -> Self {

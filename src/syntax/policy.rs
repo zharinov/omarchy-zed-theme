@@ -1,4 +1,4 @@
-//! Static capture policy shared by syntax construction and validation.
+//! Static capture policy for syntax construction and regression checks.
 
 use super::plan::SemanticRole;
 pub const SYNTAX_PRIMARY_FLOOR: f64 = 4.52;
