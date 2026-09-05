@@ -1,8 +1,7 @@
 //! Measures the authored Omarchy palette's syntax character.
 //!
-//! Breadth and intensity are independent continuous signals. Provenance decides
-//! which colors are evidence; normal and bright authored slots participate in the
-//! same perceptual budget.
+//! Hue clusters describe breadth; each authored color supplies its own intensity.
+//! Provenance decides which normal and bright slots are evidence.
 
 use crate::Result;
 use crate::color::{lab, normalize_hex, oklab_to_oklch};
@@ -12,9 +11,6 @@ use std::f64::consts::{PI, TAU};
 
 pub const CHROMA_EVIDENCE: f64 = 0.025;
 const HUE_CLUSTER_LIMIT: f64 = 35.0 * PI / 180.0;
-const HUE_SIMILARITY_FULL: f64 = 25.0 * PI / 180.0;
-const HUE_SIMILARITY_ZERO: f64 = 45.0 * PI / 180.0;
-const NEUTRAL_MEDIAN_CHROMA: f64 = 0.035;
 const NEUTRAL_MAXIMUM_CHROMA: f64 = 0.055;
 
 pub(crate) const EVIDENCE_KEYS: [&str; 15] = [
@@ -42,7 +38,6 @@ pub struct EvidenceColor {
     pub lightness: f64,
     pub chroma: f64,
     pub hue: f64,
-    weight: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +48,6 @@ pub struct HueCluster {
 
 #[derive(Clone, Debug)]
 pub struct ChromaEnvelope {
-    pub target_median: f64,
     pub ordinary_maximum: f64,
 }
 
@@ -67,25 +61,6 @@ pub struct SyntaxProfile {
 fn circular_distance(left: f64, right: f64) -> f64 {
     let difference = (left - right).abs();
     difference.min(TAU - difference)
-}
-
-fn quantile(sorted: &[f64], probability: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let position = probability * (sorted.len() - 1) as f64;
-    let lower = position.floor() as usize;
-    let upper = position.ceil() as usize;
-    sorted[lower] + (sorted[upper] - sorted[lower]) * position.fract()
-}
-
-fn smoothstep(lower: f64, upper: f64, value: f64) -> f64 {
-    let position = ((value - lower) / (upper - lower)).clamp(0.0, 1.0);
-    position * position * (3.0 - 2.0 * position)
-}
-
-fn hue_similarity(distance: f64) -> f64 {
-    1.0 - smoothstep(HUE_SIMILARITY_FULL, HUE_SIMILARITY_ZERO, distance)
 }
 
 fn complete_link_clusters(evidence: &[EvidenceColor]) -> Vec<HueCluster> {
@@ -210,7 +185,6 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
                 lightness,
                 chroma,
                 hue,
-                weight: (chroma - CHROMA_EVIDENCE).max(0.0),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -222,56 +196,15 @@ pub fn measure(palette: &ResolvedPalette) -> Result<SyntaxProfile> {
 
     let clusters = complete_link_clusters(&evidence);
 
-    let total_weight: f64 = evidence.iter().map(|color| color.weight).sum();
-    let effective_hue_families = if total_weight <= 1e-12 {
-        0.0
-    } else {
-        let concentration = evidence
-            .iter()
-            .map(|left| {
-                let left_weight = left.weight / total_weight;
-                evidence
-                    .iter()
-                    .map(|right| {
-                        left_weight
-                            * (right.weight / total_weight)
-                            * hue_similarity(circular_distance(left.hue, right.hue))
-                    })
-                    .sum::<f64>()
-            })
-            .sum::<f64>();
-        assert!(
-            concentration.is_finite() && concentration > 0.0 && concentration <= 1.0 + 1e-12,
-            "positive syntax evidence weights must produce a finite concentration"
-        );
-        1.0 / concentration
-    };
-
-    let mut chromas = evidence
+    // Hue clustering controls allocation, never the strength of authored colors.
+    let ordinary_maximum = evidence
         .iter()
-        .filter(|color| color.chroma >= CHROMA_EVIDENCE - 1e-12)
         .map(|color| color.chroma)
-        .collect::<Vec<_>>();
-    chromas.sort_by(f64::total_cmp);
-    let source_median_chroma = quantile(&chromas, 0.5);
-    let source_q90_chroma = quantile(&chromas, 0.9);
-
-    let native_median = source_median_chroma.clamp(0.045, 0.140);
-    let palette_native_weight = smoothstep(1.0, 2.5, effective_hue_families);
-    let target_median =
-        NEUTRAL_MEDIAN_CHROMA + palette_native_weight * (native_median - NEUTRAL_MEDIAN_CHROMA);
-    let native_maximum = source_q90_chroma.clamp(0.070, 0.180);
-    let peak_support = ((source_q90_chroma - CHROMA_EVIDENCE) / 0.045).clamp(0.0, 1.0);
-    let envelope_support = peak_support.max(palette_native_weight);
-    let ordinary_maximum = (NEUTRAL_MAXIMUM_CHROMA
-        + envelope_support * (native_maximum - NEUTRAL_MAXIMUM_CHROMA))
-        .max(target_median);
+        .max_by(f64::total_cmp)
+        .unwrap_or(NEUTRAL_MAXIMUM_CHROMA);
 
     Ok(SyntaxProfile {
-        chroma_envelope: ChromaEnvelope {
-            target_median,
-            ordinary_maximum,
-        },
+        chroma_envelope: ChromaEnvelope { ordinary_maximum },
         evidence,
         clusters,
     })
@@ -359,10 +292,6 @@ mod tests {
 
             prop_assert_eq!(profile_signature(&original), profile_signature(&replaced));
             prop_assert_eq!(
-                original.chroma_envelope.target_median.to_bits(),
-                replaced.chroma_envelope.target_median.to_bits()
-            );
-            prop_assert_eq!(
                 original.chroma_envelope.ordinary_maximum.to_bits(),
                 replaced.chroma_envelope.ordinary_maximum.to_bits()
             );
@@ -435,12 +364,7 @@ mod tests {
                 }
             }
 
-            prop_assert!(original.chroma_envelope.target_median.is_finite());
             prop_assert!(original.chroma_envelope.ordinary_maximum.is_finite());
-            prop_assert!(
-                original.chroma_envelope.target_median
-                    <= original.chroma_envelope.ordinary_maximum + 1e-12
-            );
         }
     }
 
@@ -523,10 +447,6 @@ mod tests {
         ]))
         .unwrap();
 
-        assert!(
-            (above.chroma_envelope.target_median - below.chroma_envelope.target_median).abs()
-                < 0.01
-        );
         assert!(
             (above.chroma_envelope.ordinary_maximum - below.chroma_envelope.ordinary_maximum).abs()
                 < 0.01
