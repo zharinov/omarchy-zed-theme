@@ -8,8 +8,8 @@ use self::tokens::{
     StatusChannel, StatusTokens, SurfaceTokens, ThemeTokens,
 };
 use crate::color::{
-    apply_opacity, contrast_ratio, delta_e, gamut_map_oklch_unchecked, geometric_contrast,
-    gpui_blend, lab, lightness, oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
+    apply_opacity, contrast_ratio, delta_e, gamut_map_oklch_unchecked, gpui_blend, lab, lightness,
+    oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
 };
 use crate::constants::*;
 use crate::palette::ResolvedPalette;
@@ -26,6 +26,7 @@ use crate::{Error, Result};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
+mod borders;
 mod tokens;
 mod ui_policy;
 
@@ -762,7 +763,7 @@ fn derive_semantics(
     policy: &UiPolicy,
     content: ContentColors,
     ui_backgrounds: &[String],
-    structure_backgrounds: &[String],
+    border_surfaces: borders::BorderSurfaces<'_>,
     semantic_backgrounds: &[String],
 ) -> Result<SemanticColors> {
     let ContentColors {
@@ -775,48 +776,7 @@ fn derive_semantics(
         icon_disabled,
     } = content;
     let accent = search.fit_color(color(palette, "accent"), ui_backgrounds, CONTROL_CONTRAST)?;
-    let passive = fit_bounded_color(
-        search,
-        color(palette, "muted"),
-        structure_backgrounds,
-        policy.structure.passive,
-    )?;
-    let normal_maximum = policy
-        .structure
-        .normal
-        .maximum()
-        .expect("UI structure bands are bounded");
-    let normal_preferred = policy
-        .structure
-        .normal
-        .preferred()
-        .expect("UI structure bands are bounded")
-        .max(geometric_contrast(&passive, structure_backgrounds)? + 0.08)
-        .min(normal_maximum);
-
-    // Distinct preferred ratios can still quantize to the same byte color, so
-    // make the structural hierarchy a per-surface constraint as well.
-    let normal_contrast_floors = structure_backgrounds
-        .iter()
-        .map(|background| {
-            contrast_ratio(&passive, background).map(|contrast| {
-                (contrast + policy.structure.minimum_hierarchy_step)
-                    .max(policy.structure.normal.minimum())
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let structural = search.fit_color_bounded_with_contrast_floors(
-        color(palette, "muted"),
-        structure_backgrounds,
-        structure_backgrounds,
-        &normal_contrast_floors,
-        &[],
-        FitBounds::new(MetricBand::bounded(
-            policy.structure.normal.minimum(),
-            normal_preferred,
-            normal_maximum,
-        )),
-    )?;
+    let (passive, structural) = borders::derive(border_surfaces, &primary, &policy.structure)?;
 
     let [green, red] = search
         .fit_pair(
@@ -1150,7 +1110,13 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         &ui_policy,
         content,
         &ui_backgrounds,
-        &base_ui_backgrounds,
+        borders::BorderSurfaces {
+            canvas: &canvas,
+            panel: &surface,
+            elevated: &elevated,
+            chrome: &chrome,
+            inactive_tab: &tab_inactive,
+        },
         &semantic_backgrounds,
     )?;
 

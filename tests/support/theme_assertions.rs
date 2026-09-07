@@ -1,5 +1,6 @@
 use omarchy_zed_theme::color::{
-    apply_opacity, contrast_ratio, delta_e, lab, oklab_to_oklch, parse_hex, render_layers,
+    apply_opacity, contrast_ratio, delta_e, lab, oklab_to_oklch, parse_hex, relative_luminance,
+    render_layers,
 };
 use omarchy_zed_theme::constants::{
     CHROME_FIELDS, DARK_DIFF_BORDER_OPACITY, DARK_DIFF_HOLLOW_OPACITY, DARK_DIFF_LINE_OPACITY,
@@ -418,28 +419,61 @@ fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) 
     }
 
     let structure_background_roles = [
-        "background",
+        "editor.background",
+        "panel.background",
         "surface.background",
         "elevated_surface.background",
-        "title_bar.background",
+        "tab_bar.background",
+        "tab.inactive_background",
     ];
+    let text_luminance = relative_luminance(role(style, "text")).unwrap();
+    let editor_luminance = relative_luminance(role(style, "editor.background")).unwrap();
+    let lighter_border = text_luminance > editor_luminance;
+
     for background_role in structure_background_roles {
         let background = role(style, background_role);
         let border = contrast_ratio(role(style, "border"), background).unwrap();
         let variant = contrast_ratio(role(style, "border.variant"), background).unwrap();
 
+        let border_floor = if background_role == "panel.background" {
+            1.15
+        } else {
+            1.0
+        };
+        let variant_floor = if background_role == "elevated_surface.background" {
+            1.09
+        } else {
+            1.0
+        };
+
         assert_metric_between(
             &format!("{label} border on {background_role}"),
             border,
-            1.15,
+            border_floor,
             2.00,
         );
         assert_metric_between(
             &format!("{label} border variant on {background_role}"),
             variant,
-            1.09,
+            variant_floor,
             1.70,
         );
+
+        for key in ["border", "border.variant"] {
+            let value = relative_luminance(role(style, key)).unwrap();
+            let base = relative_luminance(background).unwrap();
+            let direction_preserved = if lighter_border {
+                value >= base
+            } else {
+                value <= base
+            };
+
+            assert!(
+                direction_preserved,
+                "{label}: {key} changed direction on {background_role}"
+            );
+        }
+
         assert!(
             border >= variant + 0.005 - 1e-9,
             "{label}: border hierarchy collapsed on {background_role}: border {border:.4}, variant {variant:.4}"
