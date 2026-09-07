@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "omarchy-zed-theme"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "fs2",
  "jsonc-parser",

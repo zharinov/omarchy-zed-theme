@@ -115,8 +115,6 @@ pub(crate) struct StatusTokens {
 #[derive(Clone, Debug)]
 pub(crate) struct DerivedTokens {
     pub(crate) editor_active_line: OverlayColor,
-    pub(crate) wrap_guide: OverlayColor,
-    pub(crate) active_wrap_guide: OverlayColor,
     pub(crate) document_read: OverlayColor,
 }
 
@@ -286,12 +284,6 @@ impl ThemeTokens {
             &mut roles,
             &["editor.active_line.background"],
             &self.derived.editor_active_line,
-        );
-        push_overlay(&mut roles, &["editor.wrap_guide"], &self.derived.wrap_guide);
-        push_overlay(
-            &mut roles,
-            &["editor.active_wrap_guide"],
-            &self.derived.active_wrap_guide,
         );
         push_overlay(
             &mut roles,

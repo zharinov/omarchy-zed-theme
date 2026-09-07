@@ -9,7 +9,7 @@ use self::tokens::{
 };
 use crate::color::{
     apply_opacity, contrast_ratio, delta_e, gamut_map_oklch_unchecked, gpui_blend, lab, lightness,
-    oklab_to_oklch, parse_hex, render_layers, tone, with_alpha,
+    oklab_to_oklch, parse_hex, render_layers, tone,
 };
 use crate::constants::*;
 use crate::palette::ResolvedPalette;
@@ -27,6 +27,8 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 mod borders;
+mod boundary_scenes;
+mod control_fills;
 mod tokens;
 mod ui_policy;
 
@@ -489,8 +491,6 @@ struct SemanticColors {
     icon_placeholder: String,
     icon_disabled: String,
     accent: String,
-    structural: String,
-    passive: String,
     red: String,
     green: String,
     blue: String,
@@ -760,10 +760,8 @@ fn derive_content(
 fn derive_semantics(
     search: &mut Search,
     palette: &ResolvedPalette,
-    policy: &UiPolicy,
     content: ContentColors,
     ui_backgrounds: &[String],
-    border_surfaces: borders::BorderSurfaces<'_>,
     semantic_backgrounds: &[String],
 ) -> Result<SemanticColors> {
     let ContentColors {
@@ -776,7 +774,6 @@ fn derive_semantics(
         icon_disabled,
     } = content;
     let accent = search.fit_color(color(palette, "accent"), ui_backgrounds, CONTROL_CONTRAST)?;
-    let (passive, structural) = borders::derive(border_surfaces, &primary, &policy.structure)?;
 
     let [green, red] = search
         .fit_pair(
@@ -803,8 +800,6 @@ fn derive_semantics(
         icon_placeholder,
         icon_disabled,
         accent,
-        structural,
-        passive,
         red,
         green,
         blue,
@@ -1107,16 +1102,8 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     let semantic = derive_semantics(
         &mut search,
         palette,
-        &ui_policy,
         content,
         &ui_backgrounds,
-        borders::BorderSurfaces {
-            canvas: &canvas,
-            panel: &surface,
-            elevated: &elevated,
-            chrome: &chrome,
-            inactive_tab: &tab_inactive,
-        },
         &semantic_backgrounds,
     )?;
 
@@ -1127,19 +1114,13 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         elevated.clone(),
         chrome.clone(),
     ]);
-    let focus_references = [(
-        semantic.structural.clone(),
-        ui_policy.interactions.adjacent_contrast,
-        ui_policy.interactions.adjacent_delta_e,
-    )];
     let focus_border = search.fit_state_request(
         &semantic.accent,
         StateFitRequest::new(
             &focus_backgrounds,
             ui_policy.structure.focus,
             MetricBand::bounded(0.060, 0.120, 0.400),
-        )
-        .with_references(&focus_references),
+        ),
     )?;
     let element_selection = element_selected.clone();
 
@@ -1660,33 +1641,26 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         ("unreachable", &semantic.secondary),
         ("warning", &diff_yellow_seed),
     ]);
+    let control_fills = control_fills::ControlFills::new(
+        &canvas,
+        &[
+            canvas.clone(),
+            surface.clone(),
+            elevated.clone(),
+            chrome.clone(),
+        ],
+        &semantic.primary,
+        &ui_policy.structure,
+        is_dark_mode(&palette.mode),
+    )?;
     let mut status_backgrounds = BTreeMap::new();
-    for name in status_seeds.keys() {
-        let minimum_chroma = retained_tint_chroma(status_seeds[name])?;
-        let status_background_contexts = [surface.clone()];
-        let status_references = [
-            (
-                semantic.primary.clone(),
-                TEXT_CONTRAST,
-                STATE_CONSECUTIVE_DELTA_E,
-            ),
-            (
-                semantic.structural.clone(),
-                ui_policy.interactions.adjacent_contrast,
-                ui_policy.interactions.adjacent_delta_e,
-            ),
-        ];
+    for (name, seed) in &status_seeds {
         status_backgrounds.insert(
             *name,
-            search.fit_state_request(
-                status_seeds[name],
-                StateFitRequest::new(
-                    &status_background_contexts,
-                    ui_policy.interactions.selected.contrast,
-                    ui_policy.interactions.selected.delta_e,
-                )
-                .with_minimum_chroma(minimum_chroma)
-                .with_references(&status_references),
+            control_fills.fit(
+                seed,
+                ui_policy.interactions.selected.contrast,
+                (*name == "info").then_some(content_accent.as_str()),
             )?,
         );
     }
@@ -1882,33 +1856,11 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         OVERLAY_MAX_ALPHA,
     )?;
     let thumb_ladder = [thumb_base, thumb_hover, thumb_active];
-    let thumb_border = semantic.structural.clone();
-    let track_border = fit_bounded_color(
-        &mut search,
-        &semantic.passive,
-        &thumb_contexts,
-        ui_policy.structure.passive,
-    )?;
-
-    let wrap_guide = with_alpha(&semantic.structural, 0x0d as f64 / 255.0)?;
-    let active_wrap_guide = with_alpha(&semantic.structural, 0x1a as f64 / 255.0)?;
     let editor_invisible = fit_bounded_color(
         &mut search,
         color(palette, "muted"),
         std::slice::from_ref(&canvas),
         ui_policy.structure.normal,
-    )?;
-    let editor_indent_guide = fit_bounded_color(
-        &mut search,
-        &semantic.passive,
-        std::slice::from_ref(&canvas),
-        ui_policy.structure.passive,
-    )?;
-    let editor_indent_guide_active = fit_bounded_color(
-        &mut search,
-        &semantic.structural,
-        std::slice::from_ref(&canvas),
-        ui_policy.structure.active_guide,
     )?;
 
     // Multiplayer is the final color-allocation stage so lower-priority player
@@ -2035,8 +1987,6 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
         },
         derived: DerivedTokens {
             editor_active_line: OverlayColor::new(editor_active_line.clone())?,
-            wrap_guide: OverlayColor::new(wrap_guide.clone())?,
-            active_wrap_guide: OverlayColor::new(active_wrap_guide.clone())?,
             document_read: OverlayColor::new(document_read.clone())?,
         },
     };
@@ -2052,11 +2002,8 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
             fixed.insert_overlay($name, $value)?;
         };
     }
-    put!("border", semantic.structural.clone());
-    put!("border.variant", semantic.passive.clone());
     put!("border.focused", focus_border.clone());
     put!("border.selected", focus_border.clone());
-    put!("border.disabled", semantic.passive.clone());
     put!("element.background", surface.clone());
     put_overlay!("element.selection_background", element_selection);
     put_overlay!("drop_target.background", drop_target);
@@ -2074,16 +2021,12 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     put!("panel.overlay_background", panel_overlay);
     put!("panel.overlay_hover", panel_overlay_hover);
     put!("pane.focused_border", focus_border);
-    put!("pane_group.border", semantic.structural.clone());
     put_overlay!("scrollbar.thumb.background", thumb_ladder[0].clone());
     put_overlay!("scrollbar.thumb.hover_background", thumb_ladder[1].clone());
     put_overlay!("scrollbar.thumb.active_background", thumb_ladder[2].clone());
-    put!("scrollbar.thumb.border", thumb_border.clone());
-    put!("scrollbar.track.border", track_border);
     put_overlay!("minimap.thumb.background", thumb_ladder[0].clone());
     put_overlay!("minimap.thumb.hover_background", thumb_ladder[1].clone());
     put_overlay!("minimap.thumb.active_background", thumb_ladder[2].clone());
-    put!("minimap.thumb.border", thumb_border);
     put!("editor.subheader.background", chrome);
     put_overlay!("editor.debugger_active_line.background", debugger_active);
     put!("editor.line_number", editor_line_number.output);
@@ -2093,8 +2036,6 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     );
     put!("editor.hover_line_number", editor_hover_line_number.output);
     put!("editor.invisible", editor_invisible);
-    put!("editor.indent_guide", editor_indent_guide);
-    put!("editor.indent_guide_active", editor_indent_guide_active);
     put_overlay!("editor.document_highlight.write_background", document_write);
     put_overlay!(
         "editor.document_highlight.bracket_background",
@@ -2145,6 +2086,21 @@ fn build_theme_from_validated_palette(palette: &ResolvedPalette) -> Result<Value
     style.insert("background.appearance".into(), "opaque".into());
     status_roles.append_to(&mut style);
     fixed.append_to(&mut style);
+
+    let mut boundary_roles = StyleBuilder::default();
+    for (role, color) in
+        boundary_scenes::derive(&style, &ui_policy.structure, is_dark_mode(&palette.mode))?
+    {
+        if matches!(
+            role.as_str(),
+            "editor.wrap_guide" | "editor.active_wrap_guide"
+        ) {
+            boundary_roles.insert_overlay(role, color)?;
+        } else {
+            boundary_roles.insert_opaque(role, color)?;
+        }
+    }
+    boundary_roles.append_to(&mut style);
 
     style.insert(
         "accents".into(),

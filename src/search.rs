@@ -263,6 +263,7 @@ impl<'a> StateFitRequest<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn with_minimum_chroma(mut self, minimum_chroma: f64) -> Self {
         self.minimum_chroma = minimum_chroma;
         self

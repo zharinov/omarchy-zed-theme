@@ -1,6 +1,5 @@
 use omarchy_zed_theme::color::{
-    apply_opacity, contrast_ratio, delta_e, lab, oklab_to_oklch, parse_hex, relative_luminance,
-    render_layers,
+    apply_opacity, contrast_ratio, delta_e, lab, oklab_to_oklch, parse_hex, render_layers,
 };
 use omarchy_zed_theme::constants::{
     CHROME_FIELDS, DARK_DIFF_BORDER_OPACITY, DARK_DIFF_HOLLOW_OPACITY, DARK_DIFF_LINE_OPACITY,
@@ -33,6 +32,217 @@ fn assert_metric_between(label: &str, metric: f64, minimum: f64, maximum: f64) {
         (minimum - 1e-9..=maximum + 1e-9).contains(&metric),
         "{label}: expected {minimum:.3}..={maximum:.3}, got {metric:.4}"
     );
+}
+
+// Reconstruct HSL through hue sectors so this oracle does not reuse the fill solver.
+fn tinted_hover(fill: &str, dark: bool) -> String {
+    let [red, green, blue] = [1, 3, 5]
+        .map(|index| f64::from(u8::from_str_radix(&fill[index..index + 2], 16).unwrap()) / 255.0);
+    let high = red.max(green).max(blue);
+    let low = red.min(green).min(blue);
+    let difference = high - low;
+    let lightness = (high + low) / 2.0;
+    let saturation = if difference == 0.0 {
+        0.0
+    } else {
+        difference / (1.0 - (2.0 * lightness - 1.0).abs())
+    };
+    let hue = if difference == 0.0 {
+        0.0
+    } else if high == red {
+        ((green - blue) / difference).rem_euclid(6.0)
+    } else if high == green {
+        (blue - red) / difference + 2.0
+    } else {
+        (red - green) / difference + 4.0
+    };
+    let lightness = (lightness - if dark { 0.20 } else { 0.05 }).max(0.0);
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let secondary = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+    let [r, g, b] = match hue as u8 {
+        0 => [chroma, secondary, 0.0],
+        1 => [secondary, chroma, 0.0],
+        2 => [0.0, chroma, secondary],
+        3 => [0.0, secondary, chroma],
+        4 => [secondary, 0.0, chroma],
+        _ => [chroma, 0.0, secondary],
+    };
+    let offset = lightness - chroma / 2.0;
+    let [r, g, b] = [r, g, b].map(|channel| ((channel + offset) * 255.0).round() as u8);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+pub fn assert_control_fill_contract(label: &str, palette: &ResolvedPalette, document: &Value) {
+    let style = style(document);
+    let accent = oklab_to_oklch(lab(&palette.colors["accent"]).unwrap());
+    if accent[1] >= 0.035 {
+        let selected = oklab_to_oklch(lab(role(style, "info.background")).unwrap());
+        let difference = (accent[2] - selected[2]).abs();
+        assert!(
+            selected[1] >= 0.030 - 1e-9,
+            "{label}: selected fill lost its tint"
+        );
+        assert!(
+            difference.min(std::f64::consts::TAU - difference) <= 0.08 + 1e-9,
+            "{label}: selected fill changed its source hue"
+        );
+    }
+    for status in [
+        "created",
+        "deleted",
+        "warning",
+        "info",
+        "predictive",
+        "hint",
+        "hidden",
+        "ignored",
+        "unreachable",
+    ] {
+        let fill = role(style, &format!("{status}.background"));
+        let hover = tinted_hover(fill, palette.mode == "dark");
+        for foreground in std::iter::once("text").chain((status == "info").then_some("text.accent"))
+        {
+            for state in [fill, hover.as_str()] {
+                assert!(
+                    contrast_ratio(role(style, foreground), state).unwrap()
+                        >= HARD_TEXT_CONTRAST - 1e-9,
+                    "{label}: {foreground} is unreadable on {status} fill {state}"
+                );
+            }
+        }
+        for host in [
+            "background",
+            "panel.background",
+            "surface.background",
+            "elevated_surface.background",
+            "title_bar.background",
+        ] {
+            let base = role(style, host);
+            assert!(
+                delta_e(fill, base).unwrap() >= 0.025 - 1e-9,
+                "{label}: {status} fill disappeared on {host}"
+            );
+            for state in [fill, hover.as_str()] {
+                assert_metric_between(
+                    &format!("{label} {status} fill {state} on {host}"),
+                    contrast_ratio(state, base).unwrap(),
+                    1.0,
+                    2.0,
+                );
+            }
+        }
+    }
+}
+
+pub fn assert_control_stroke_contract(label: &str, document: &Value) {
+    let style = style(document);
+    let host = role(style, "elevated_surface.background");
+    let selected = render_layers(host, &[role(style, "info.background")]).unwrap();
+    let dark = document["themes"][0]["appearance"].as_str().unwrap() == "dark";
+    let states = [
+        ("popup", host.to_owned()),
+        (
+            "ghost idle",
+            render_layers(host, &[role(style, "ghost_element.background")]).unwrap(),
+        ),
+        (
+            "ghost hover",
+            render_layers(host, &[role(style, "ghost_element.hover")]).unwrap(),
+        ),
+        ("selected hover", tinted_hover(&selected, dark)),
+        ("selected idle", selected),
+    ];
+    // The fill-less frame paints over the ancestor, alongside the child fills.
+    let outline = apply_opacity(role(style, "border"), 0.60).unwrap();
+    let stroke = render_layers(host, &[&outline]).unwrap();
+    for (state, fill) in states {
+        let contrast = contrast_ratio(&stroke, &fill).unwrap();
+        assert!(
+            contrast >= 1.50 - 1e-9,
+            "{label}: control stroke against {state} has contrast {contrast}, below 1.50"
+        );
+    }
+}
+
+pub fn assert_rendered_border_contract(label: &str, document: &Value) {
+    let style = style(document);
+
+    // The passive role retains its quiet range independently of the stronger
+    // normal border required by translucent controls.
+    for base_role in [
+        "background",
+        "editor.background",
+        "panel.background",
+        "surface.background",
+        "elevated_surface.background",
+        "tab_bar.background",
+        "tab.inactive_background",
+    ] {
+        let base = role(style, base_role);
+        let focus = contrast_ratio(role(style, "border.focused"), base).unwrap();
+        let edge = render_layers(base, &[role(style, "border.variant")]).unwrap();
+        let contrast = contrast_ratio(&edge, base).unwrap();
+        assert_metric_between(
+            &format!("{label} border.variant on {base_role}"),
+            contrast,
+            1.03,
+            1.70,
+        );
+        assert!(
+            focus > contrast,
+            "{label}: focus is weaker than border.variant on {base_role}"
+        );
+    }
+
+    assert_metric_between(
+        &format!("{label} focused border"),
+        contrast_ratio(role(style, "border.focused"), role(style, "background")).unwrap(),
+        3.00,
+        4.60,
+    );
+
+    assert_control_stroke_contract(label, document);
+
+    // Disabled debugger strips and loading editor frames contain editor canvas.
+    for base_role in [
+        "background",
+        "surface.background",
+        "elevated_surface.background",
+    ] {
+        let base = role(style, base_role);
+        let fill = role(style, "editor.background");
+        let edge = render_layers(fill, &[role(style, "border.disabled")]).unwrap();
+        for adjacent in [base, fill] {
+            assert_metric_between(
+                &format!("{label} disabled editor frame on {base_role}"),
+                contrast_ratio(&edge, adjacent).unwrap(),
+                1.0,
+                1.70,
+            );
+        }
+    }
+
+    // Scrollbar outlines paint over their own translucent thumb fill, which is
+    // itself composited over the editor's scrollbar track.
+    let canvas = role(style, "editor.background");
+    let track = render_layers(canvas, &[role(style, "scrollbar.track.background")]).unwrap();
+    for fill_role in [
+        "scrollbar.thumb.background",
+        "scrollbar.thumb.hover_background",
+        "scrollbar.thumb.active_background",
+    ] {
+        let fill = render_layers(&track, &[role(style, fill_role)]).unwrap();
+        let edge = render_layers(&fill, &[role(style, "scrollbar.thumb.border")]).unwrap();
+        let ceiling = contrast_ratio(&fill, &track).unwrap().max(1.70);
+        for (side, adjacent) in [("outside", track.as_str()), ("inside", fill.as_str())] {
+            assert_metric_between(
+                &format!("{label} scrollbar {side} edge of {fill_role}"),
+                contrast_ratio(&edge, adjacent).unwrap(),
+                1.0,
+                ceiling,
+            );
+        }
+    }
 }
 
 pub fn assert_document_contract(label: &str, palette: &ResolvedPalette, document: &Value) {
@@ -418,89 +628,8 @@ fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) 
         );
     }
 
-    let structure_background_roles = [
-        "editor.background",
-        "panel.background",
-        "surface.background",
-        "elevated_surface.background",
-        "tab_bar.background",
-        "tab.inactive_background",
-    ];
-    let text_luminance = relative_luminance(role(style, "text")).unwrap();
-    let editor_luminance = relative_luminance(role(style, "editor.background")).unwrap();
-    let lighter_border = text_luminance > editor_luminance;
-
-    for background_role in structure_background_roles {
-        let background = role(style, background_role);
-        let border = contrast_ratio(role(style, "border"), background).unwrap();
-        let variant = contrast_ratio(role(style, "border.variant"), background).unwrap();
-
-        let border_floor = if background_role == "panel.background" {
-            1.15
-        } else {
-            1.0
-        };
-        let variant_floor = if background_role == "elevated_surface.background" {
-            1.09
-        } else {
-            1.0
-        };
-
-        assert_metric_between(
-            &format!("{label} border on {background_role}"),
-            border,
-            border_floor,
-            2.00,
-        );
-        assert_metric_between(
-            &format!("{label} border variant on {background_role}"),
-            variant,
-            variant_floor,
-            1.70,
-        );
-
-        for key in ["border", "border.variant"] {
-            let value = relative_luminance(role(style, key)).unwrap();
-            let base = relative_luminance(background).unwrap();
-            let direction_preserved = if lighter_border {
-                value >= base
-            } else {
-                value <= base
-            };
-
-            assert!(
-                direction_preserved,
-                "{label}: {key} changed direction on {background_role}"
-            );
-        }
-
-        assert!(
-            border >= variant + 0.005 - 1e-9,
-            "{label}: border hierarchy collapsed on {background_role}: border {border:.4}, variant {variant:.4}"
-        );
-    }
-
-    let background = role(style, "background");
-    let border = contrast_ratio(role(style, "border"), background).unwrap();
-    let focused = contrast_ratio(role(style, "border.focused"), background).unwrap();
-
-    assert_metric_between(&format!("{label} focused border"), focused, 3.00, 4.60);
-    assert!(focused > border);
-
-    let accent_lch = oklab_to_oklch(lab(&palette.colors["accent"]).unwrap());
-    if accent_lch[1] >= 0.035 {
-        let info_lch = oklab_to_oklch(lab(role(style, "info.background")).unwrap());
-        let hue_difference = (accent_lch[2] - info_lch[2]).abs();
-        let hue_distance = hue_difference.min(std::f64::consts::TAU - hue_difference);
-        assert!(
-            info_lch[1] >= 0.030 - 1e-9,
-            "{label}: accent status background lost its tint"
-        );
-        assert!(
-            hue_distance <= 0.08 + 1e-9,
-            "{label}: accent status background changed hue"
-        );
-    }
+    assert_rendered_border_contract(label, document);
+    assert_control_fill_contract(label, palette, document);
 
     let panel = role(style, "panel.background");
     let panel_overlay = role(style, "panel.overlay_background");
@@ -583,12 +712,6 @@ fn assert_ui_contract(label: &str, palette: &ResolvedPalette, document: &Value) 
         assert!(
             contrast_ratio(role(style, status), status_background).unwrap()
                 >= HARD_TEXT_CONTRAST - 1e-9
-        );
-        assert_metric_between(
-            &format!("{label} {status} background"),
-            contrast_ratio(status_background, role(style, "surface.background")).unwrap(),
-            1.18,
-            1.90,
         );
     }
 

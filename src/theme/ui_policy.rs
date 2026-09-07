@@ -42,7 +42,6 @@ pub(crate) struct InteractionPolicy {
 pub(crate) struct StructurePolicy {
     pub(crate) passive: MetricBand,
     pub(crate) normal: MetricBand,
-    pub(crate) minimum_hierarchy_step: f64,
     pub(crate) active_guide: MetricBand,
     pub(crate) focus: MetricBand,
     pub(crate) status_border: MetricBand,
@@ -172,7 +171,6 @@ impl UiPolicy {
         let structure = StructurePolicy {
             passive: MetricBand::bounded(1.10, passive_structure, 1.45),
             normal: MetricBand::bounded(1.16, normal_structure, 1.95),
-            minimum_hierarchy_step: 0.01,
             active_guide: MetricBand::bounded(
                 1.30,
                 projected_contrast(source_surface_contrast, 0.90).clamp(1.40, 1.90),
